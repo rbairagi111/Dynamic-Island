@@ -1,0 +1,10 @@
+.tmp/
+default.profraw
+*.profraw
+.DS_Store
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xcresult
+Design/AppIcon/LiveDockPreview.app/
