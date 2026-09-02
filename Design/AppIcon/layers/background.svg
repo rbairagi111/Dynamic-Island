@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="plate" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#140C1C"/>
+      <stop offset="1" stop-color="#030206"/>
+    </linearGradient>
+    <radialGradient id="bloom" cx="50%" cy="48%" r="50.16%">
+      <stop stop-color="#7A3BB8" stop-opacity="0.648"/>
+      <stop offset="0.45" stop-color="#7A3BB8" stop-opacity="0.252"/>
+      <stop offset="1" stop-color="#030206" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" fill="url(#plate)"/>
+  <rect width="1024" height="1024" fill="url(#bloom)"/>
+</svg>

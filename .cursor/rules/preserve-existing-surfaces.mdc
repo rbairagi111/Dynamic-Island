@@ -1,0 +1,26 @@
+---
+description: Do not regress working Dynamic Island surfaces when adding features
+alwaysApply: true
+---
+
+# Preserve existing island surfaces
+
+Chat banners (Claude / ChatGPT / Gemini), Now Playing, charging, volume, AirDrop, and screen-recording already work. New work (lock screen, helpers, window tags) must not reuse or mutate those paths.
+
+## Desktop island window
+
+- Keep `IslandPanel` a floating panel (`isFloatingPanel = true`).
+- Do not apply loginwindow / shielding tags or `canBecomeVisibleWithoutLogin` to the desktop island.
+- Hide that window only via `IslandSurfacePolicy.shouldHideDesktopIsland` — never `orderOut` while a transient overlay is active.
+- Lock-screen UI must be a **separate** window, created after lock. Do not restyle the desktop island into lock UI.
+
+## Chat notifications
+
+- Do not skip AppleScript polling because the Chrome helper is connected (`shouldPollChromeTabs` ignores helper).
+- Do not suppress a banner from `document.visibility` / `tabActive` alone. Chrome must be frontmost **and** that tab visible.
+- Claude `data-is-streaming="false"` is idle. Only `"true"` means generating.
+- Gemini fingerprint / snooze rules stay Gemini-only. Do not apply them to Claude as a “cleanup.”
+
+## Tests
+
+If you change overlay suppression, polling, streaming detection, or window hiding, update and run `Dynamic_IslandTests` for `IslandSurfacePolicy` and Claude tracker cases. A lock-screen or helper change that cannot explain how Claude still banners is incomplete.
