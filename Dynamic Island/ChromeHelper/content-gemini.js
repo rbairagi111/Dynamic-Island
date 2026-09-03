@@ -4,6 +4,52 @@
   if (globalThis.__islandGeminiWatch) return;
   globalThis.__islandGeminiWatch = true;
 
+  function editableText(target) {
+    if (!target) return "";
+    return String(target.value || target.innerText || target.textContent || "").trim();
+  }
+
+  function signalPromptSubmitted(target) {
+    let prompt = editableText(target);
+    if (!prompt) {
+      const editor = document.querySelector(
+        'rich-textarea [contenteditable="true"], textarea, [contenteditable="true"]'
+      );
+      prompt = editableText(editor);
+    }
+    try {
+      chrome.runtime.sendMessage({ type: "geminiPromptSubmitted", prompt });
+    } catch (e) {}
+  }
+
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
+      const target = event.target;
+      if (
+        target &&
+        (target.tagName === "TEXTAREA" ||
+          target.tagName === "INPUT" ||
+          target.isContentEditable ||
+          target.closest('[contenteditable="true"]'))
+      ) {
+        signalPromptSubmitted(target);
+      }
+    },
+    true
+  );
+  document.addEventListener(
+    "click",
+    (event) => {
+      const button = event.target && event.target.closest("button");
+      if (!button) return;
+      const label = String(button.getAttribute("aria-label") || button.textContent || "");
+      if (/\b(send|submit)\b/i.test(label)) signalPromptSubmitted(null);
+    },
+    true
+  );
+
   let pageNet = { pending: 0, token: "", preview: "" };
   let havePageNet = false;
   let onPageNet = null;
@@ -243,7 +289,10 @@
     const netPreview = havePageNet ? pageNet.preview : ((net && net.preview) || "");
     const netToken = havePageNet ? pageNet.token : ((net && net.token) || "");
     const netPending = havePageNet ? (pageNet.pending || 0) : ((net && net.pending) || 0);
-    if (netPreview && (netToken || netPending > 0)) {
+    // A response node after the latest user prompt is authoritative. Network
+    // parsing exists only for frozen background DOM and must never replace a
+    // valid rendered answer with Gemini RPC metadata.
+    if (!assistantEntries.length && netPreview && (netToken || netPending > 0)) {
       const fromNet = AI.previewWords(netPreview);
       const netHead = fromNet ? fromNet.slice(0, Math.min(40, fromNet.length)) : "";
       const domHasNet = !!(preview && netHead && preview.indexOf(netHead) !== -1);
@@ -269,7 +318,8 @@
         ? AI.makeFingerprint(latestUser.text)
         : "",
       replyFingerprint: text ? AI.makeFingerprint(text) : "",
-      replyAnchoredToLatestUser: !!(latestUser && preview && (assistantEntries.length || netToken))
+      replyAnchoredToLatestUser: !!(latestUser && preview && (assistantEntries.length || netToken)),
+      networkCompletionToken: netToken
     };
   });
   onPageNet = typeof tickGemini === "function" ? tickGemini : null;

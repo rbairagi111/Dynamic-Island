@@ -19,6 +19,9 @@ function extractStreamText(body){
     t=cleanText(t);
     if(t.length<=best.length)return;
     if(t.indexOf('http')===0)return;
+    if(/^(null|undefined)$/i.test(t))return;
+    if(/type\.googleapis\.com|wrb\.fr|boq_assistant|rpcids=/i.test(t))return;
+    if(/^[A-Za-z0-9+/_=-]{48,}$/.test(t))return;
     if(t.charAt(0)==='{'||t.charAt(0)==='[')return;
     if(isProcessOnly(t))return;
     var words=t.split(/\s+/).filter(Boolean);
@@ -28,12 +31,15 @@ function extractStreamText(body){
   function walk(v,depth){
     if(depth>8||v==null)return;
     if(typeof v==='string'){
+      if(v.length>12&&(v.charAt(0)==='['||v.charAt(0)==='{')){
+        try{walk(JSON.parse(v),depth+1);return;}catch(e){}
+      }
       consider(v);
-      if(v.length>12&&(v.charAt(0)==='['||v.charAt(0)==='{')){try{walk(JSON.parse(v),depth+1);}catch(e){}}
       return;
     }
     if(typeof v!=='object')return;
     if(Array.isArray(v)){for(var i=0;i<v.length;i++)walk(v[i],depth+1);}
+    else{for(var k in v){if(Object.prototype.hasOwnProperty.call(v,k))walk(v[k],depth+1);}}
   }
   try{
     var rest=s.replace(/^\)\]\}'\s*/,'');
@@ -51,15 +57,26 @@ function extractStreamText(body){
     }
   }catch(e1){}
   if(!best){
-    var re=/"((?:\\.|[^"\\]){32,})"/g;
+    var re=/"text"\s*:\s*"((?:\\.|[^"\\]){8,})"/g;
     var m;
-    while((m=re.exec(s)))consider(m[1]);
-    re=/"text"\s*:\s*"((?:\\.|[^"\\]){8,})"/g;
     while((m=re.exec(s)))consider(m[1]);
   }
   return best.slice(0,800);
 }
 function isStreamURL(u){u=String(u||'').toLowerCase();return u.indexOf('streamgenerate')!==-1||u.indexOf('bardfrontendservice')!==-1||u.indexOf('assistant.lamda')!==-1||u.indexOf('batchexecute')!==-1||u.indexOf('bardchatui')!==-1||u.indexOf('/_/bard')!==-1||u.indexOf('generatefreeformstreamed')!==-1||u.indexOf('generatecontent')!==-1;}
+function isCompletionStreamURL(u){u=String(u||'').toLowerCase();return u.indexOf('streamgenerate')!==-1||u.indexOf('generatefreeformstreamed')!==-1||u.indexOf('generatecontent')!==-1;}
+function latestCompletedStreamToken(){
+  try{
+    var entries=performance.getEntriesByType('resource');
+    for(var i=entries.length-1;i>=0;i--){
+      var e=entries[i];
+      if(!isCompletionStreamURL(e.name))continue;
+      if(!(e.responseEnd>0||e.duration>0))continue;
+      return Math.round(e.startTime*1000)+':'+Math.round((e.responseEnd||e.duration)*1000)+':'+String(e.name).slice(-96);
+    }
+  }catch(e){}
+  return '';
+}
 window.__islandGeminiIsStreamURL=isStreamURL;
 function matchesGeminiStream(u){var fn=window.__islandGeminiIsStreamURL;return typeof fn==='function'?fn(u):isStreamURL(u);}
 function installStreamCapture(){
@@ -136,7 +153,8 @@ var texts=assistantEntries.map(function(entry){return entry.text;});
 var text=texts.length?texts[texts.length-1]:'';
 var words=text?text.split(/\s+/).filter(Boolean).slice(0,40).join(' '):'';
 var preview=!isProcessOnly(words)&&words.length>=8?words:'';
-if(net.preview&&(net.token||net.pending>0)){
+var networkToken=net.token||latestCompletedStreamToken();
+if(!assistantEntries.length&&net.preview&&(net.token||net.pending>0)){
   var netWords=net.preview.split(/\s+/).filter(Boolean).slice(0,40).join(' ');
   var netP=!isProcessOnly(netWords)&&netWords.length>=8?netWords:'';
   var netHead=netP?netP.slice(0,Math.min(40,netP.length)):'';
@@ -147,8 +165,27 @@ if(net.preview&&(net.token||net.pending>0)){
     preview=netP;
   }
 }
+var completionState=window.__islandGeminiCompletionState;
+if(!completionState){
+  completionState={token:networkToken,firstSeen:0,armed:false,fallback:false};
+  window.__islandGeminiCompletionState=completionState;
+}else if(networkToken&&networkToken!==completionState.token){
+  completionState.token=networkToken;
+  completionState.firstSeen=Date.now();
+  completionState.armed=true;
+  completionState.fallback=false;
+}
+if(completionState.armed&&completionState.token===networkToken&&!preview&&latestUser&&Date.now()-completionState.firstSeen>=4000){
+  completionState.fallback=true;
+}
+if(completionState.fallback&&completionState.token===networkToken){
+  text='Gemini response ready';
+  words=text;
+  preview=text;
+}
 var generating=scanGenerating(document,0)||(net.pending>0&&!net.token)||(words.length>0&&isProcessOnly(words)&&!preview);
-var anchored=!!((latestUser&&assistantEntries.length&&preview)||(latestUser&&preview&&net.token));
-return JSON.stringify({isGenerating:generating,preview:preview,foundDOM:foundDOM||!!preview,textLength:text.length,assistantCount:Math.max(texts.length,preview?1:0),latestUserPrompt:latestUser?latestUser.text:'',latestUserFingerprint:latestUser?makeFingerprint(latestUser.text):'',replyFingerprint:makeFingerprint(text),replyAnchoredToLatestUser:anchored,networkCompletionToken:net.token||'',captureVersion:installInfo.captureVersion,visibilitySpoofVersion:installInfo.spoofVersion,visibilitySpoofed:installInfo.spoofed,networkPending:net.pending});
+var anchored=!!((latestUser&&assistantEntries.length&&preview)||(latestUser&&preview&&networkToken));
+var replyFP=completionState.fallback&&completionState.token===networkToken?'completion#'+networkToken:makeFingerprint(text);
+return JSON.stringify({isGenerating:generating,preview:preview,foundDOM:foundDOM||!!preview,textLength:text.length,assistantCount:Math.max(texts.length,preview?1:0),latestUserPrompt:latestUser?latestUser.text:'',latestUserFingerprint:latestUser?makeFingerprint(latestUser.text):'',replyFingerprint:replyFP,replyAnchoredToLatestUser:anchored,networkCompletionToken:networkToken,captureVersion:installInfo.captureVersion,visibilitySpoofVersion:installInfo.spoofVersion,visibilitySpoofed:installInfo.spoofed,networkPending:net.pending});
 """#
 }

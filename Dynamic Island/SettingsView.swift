@@ -171,15 +171,12 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Screen recording & AirDrop") {
-                Text("Screen Recording: red dot while capturing, hover to expand and stop. AirDrop uses the same shallow banner as Sound while the file is sending (radar + progress). When it finishes the island grows into the complete card.")
+            Section("Screen recording") {
+                Text("Screen Recording: red dot while capturing, hover to expand and stop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Preview Screen Recording") {
                     NotificationCenter.default.post(name: .previewScreenRecording, object: nil)
-                }
-                Button("Preview AirDrop") {
-                    NotificationCenter.default.post(name: .previewAirDrop, object: nil)
                 }
             }
             }

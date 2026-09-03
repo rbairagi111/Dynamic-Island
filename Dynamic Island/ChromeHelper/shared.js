@@ -110,6 +110,7 @@
         latestUserFingerprint: payload.latestUserFingerprint || "",
         replyFingerprint: payload.replyFingerprint || makeFingerprint(preview),
         replyAnchoredToLatestUser: !!payload.replyAnchoredToLatestUser,
+        networkCompletionToken: payload.networkCompletionToken || "",
         pageVisible: document.visibilityState === "visible" && document.hidden === false
       });
     } catch (e) {}
@@ -206,7 +207,8 @@
         latestUserPrompt: state.latestUserPrompt || "",
         latestUserFingerprint: state.latestUserFingerprint || "",
         replyFingerprint: emitFp,
-        replyAnchoredToLatestUser: !!state.replyAnchoredToLatestUser
+        replyAnchoredToLatestUser: !!state.replyAnchoredToLatestUser,
+        networkCompletionToken: state.networkCompletionToken || ""
       });
     }
 

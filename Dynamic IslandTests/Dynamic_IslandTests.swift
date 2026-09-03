@@ -695,6 +695,21 @@ struct Dynamic_IslandTests {
         #expect(gemini.networkCompletionToken == "80:4200")
     }
 
+    @Test func batchInspectOutputDoesNotAppendFollowingTabRowsToProbeJSON() throws {
+        let geminiJSON = #"{"isGenerating":false,"preview":"Background reply","foundDOM":true,"textLength":16,"assistantCount":1}"#
+        let output = """
+        ACTIVE<<<ISLAND_TAB>>>1<<<ISLAND_TAB>>>2<<<ISLAND_TAB>>>303
+        1<<<ISLAND_TAB>>>2<<<ISLAND_TAB>>>303<<<ISLAND_TAB>>>gemini<<<ISLAND_TAB>>>https://gemini.google.com/app/test
+        <<<ISLAND_PROBE>>>303<<<ISLAND_PROBE>>>\(geminiJSON)
+        1<<<ISLAND_TAB>>>3<<<ISLAND_TAB>>>404<<<ISLAND_TAB>>>none<<<ISLAND_TAB>>>https://example.com
+        """
+
+        let rawByTab = ChromeTabMonitor.parseBatchInspectOutput(output)
+        #expect(rawByTab[303] == geminiJSON)
+        let parsed = try #require(ChromeTabMonitor.parseProbeJSON(rawByTab[303] ?? ""))
+        #expect(parsed.preview == "Background reply")
+    }
+
     @Test func geminiProbeTracksCurrentFrontendRpcAndCustomElements() {
         let body = GeminiProbeScript.body
         #expect(body.contains("batchexecute"))
@@ -704,6 +719,12 @@ struct Dynamic_IslandTests {
         #expect(body.contains("model-response"))
         #expect(body.contains("net.token||net.pending"))
         #expect(body.contains("domHasNet"))
+        #expect(body.contains("performance.getEntriesByType('resource')"))
+        #expect(body.contains("isCompletionStreamURL"))
+        #expect(body.contains("Gemini response ready"))
+        #expect(body.contains("walk(JSON.parse(v),depth+1);return"))
+        #expect(body.contains("!assistantEntries.length&&net.preview"))
+        #expect(body.contains("var re=/\"text\""))
         #expect(!body.contains("data-is-streaming"))
     }
 
@@ -771,10 +792,20 @@ struct Dynamic_IslandTests {
             ChromeTabMonitor.shouldSuppressIslandOverlay(
                 tabID: 202,
                 chromeFrontmost: true,
-                visibleTabID: 101,
-                pageVisible: true
+                visibleTabID: 202,
+                pageVisible: false
             )
         )
+        #expect(
+            !ChromeTabMonitor.shouldSuppressIslandOverlay(
+                tabID: 202,
+                chromeFrontmost: true,
+                visibleTabID: 101,
+                pageVisible: false
+            )
+        )
+        #expect(ClaudeTabTracker.looksLikeGeminiWireNoise(#"],"af.httprm",181,"-3040"#))
+        #expect(!ClaudeTabTracker.looksLikeGeminiWireNoise("Friday weather in Delhi is 31 C."))
     }
 
     @Test func viewingAFinishedReplyDoesNotNotifyAfterSwitchingAway() {
@@ -1357,6 +1388,95 @@ struct Dynamic_IslandTests {
                 )
             ) == nil
         )
+    }
+
+    @Test func geminiWebRequestCompletionPushIsNotMistakenForLoadedHistory() throws {
+        var tracker = ClaudeTabTracker()
+        let tab = ClaudeTabInfo(tabID: 33, windowIndex: 1, tabIndex: 4, provider: .gemini)
+        let completed = ClaudeTabSnapshot(
+            tab: tab,
+            isGenerating: false,
+            preview: "Gemini response ready",
+            foundDOM: true,
+            textLength: 21,
+            assistantCount: 1,
+            latestUserPrompt: "Explain the result",
+            latestUserFingerprint: "18#Explain the result",
+            replyFingerprint: "gemini-request#8123",
+            replyAnchoredToLatestUser: true,
+            networkCompletionToken: "webRequest#8123"
+        )
+
+        let received = tracker.ingestPush(completed)
+        let event = try #require(received)
+        #expect(event.preview == "Gemini response ready")
+        #expect(event.networkCompletionToken == "webRequest#8123")
+        #expect(tracker.ingestPush(completed) == nil)
+    }
+
+    @Test func geminiPushWithoutUserPromptDoesNotNotify() {
+        var tracker = ClaudeTabTracker()
+        let tab = ClaudeTabInfo(tabID: 35, windowIndex: 1, tabIndex: 6, provider: .gemini)
+        #expect(
+            tracker.ingestPush(
+                ClaudeTabSnapshot(
+                    tab: tab,
+                    isGenerating: false,
+                    preview: "Friday Delhi Temperature Precipitation Wind 31 C",
+                    foundDOM: true,
+                    textLength: 52,
+                    assistantCount: 1,
+                    networkCompletionToken: "webRequest#1"
+                )
+            ) == nil
+        )
+    }
+
+    @Test func geminiPlaceholderPushDoesNotDuplicateAfterRealReply() {
+        var tracker = ClaudeTabTracker()
+        let tab = ClaudeTabInfo(tabID: 34, windowIndex: 1, tabIndex: 5, provider: .gemini)
+        let real = ClaudeTabSnapshot(
+            tab: tab,
+            isGenerating: false,
+            preview: "Thursday weather in Dindori is 27 C with light rain.",
+            foundDOM: true,
+            textLength: 52,
+            assistantCount: 1,
+            latestUserPrompt: "check weather in dindori",
+            latestUserFingerprint: "24#check weather in dindori",
+            replyFingerprint: "52#Thursday weather in Dindori is 27 C with light rain.",
+            replyAnchoredToLatestUser: true,
+            networkCompletionToken: "1788427986682:end"
+        )
+        #expect(tracker.ingestPush(real) != nil)
+
+        let placeholder = ClaudeTabSnapshot(
+            tab: tab,
+            isGenerating: false,
+            preview: "Gemini response ready",
+            foundDOM: true,
+            textLength: 21,
+            assistantCount: 1,
+            replyFingerprint: "gemini-request#148599",
+            replyAnchoredToLatestUser: true,
+            networkCompletionToken: "webRequest#148599"
+        )
+        #expect(tracker.ingestPush(placeholder) == nil)
+
+        let grown = ClaudeTabSnapshot(
+            tab: tab,
+            isGenerating: false,
+            preview: "Thursday weather in Dindori is 27 C with light rain this evening.",
+            foundDOM: true,
+            textLength: 66,
+            assistantCount: 1,
+            latestUserPrompt: "check weather in dindori",
+            latestUserFingerprint: "24#check weather in dindori",
+            replyFingerprint: "66#Thursday weather in Dindori is 27 C with light rain this evening.",
+            replyAnchoredToLatestUser: true,
+            networkCompletionToken: "297807800:304536700"
+        )
+        #expect(tracker.ingest([grown]) == nil)
     }
 
     @Test func tabAppearingAfterEmptyBaselineDoesNotNotifyOldClaude() {
@@ -1951,38 +2071,6 @@ struct Dynamic_IslandTests {
             hadRecordIntent: true
         )
         #expect(shot.phase == .idle)
-    }
-
-    @Test func airdropDetectsWhereFromsAndSharingd() {
-        #expect(AirDropDSP.isAirDropWhereFroms(["AirDrop", "Rohit's iPhone"]))
-        #expect(!AirDropDSP.isAirDropWhereFroms(["https://example.com"]))
-        #expect(AirDropDSP.isAirDropQuarantine("0083;abc;sharingd;"))
-        #expect(!AirDropDSP.isAirDropQuarantine("0083;abc;Safari;"))
-        #expect(AirDropDSP.isAirDropUIApp(bundleID: "com.apple.Sharing.AirDropUI", localizedName: nil))
-        #expect(!AirDropDSP.isAirDropUIApp(bundleID: "com.google.Chrome", localizedName: "Google Chrome"))
-        #expect(
-            AirDropDSP.windowLooksLikeIncomingAirDrop(owner: "sharingd", title: "AirDrop")
-        )
-        #expect(
-            !AirDropDSP.windowLooksLikeIncomingAirDrop(owner: "Finder", title: "AirDrop")
-        )
-        #expect(AirDropDSP.isRecent(Date().addingTimeInterval(-20)))
-        #expect(!AirDropDSP.isRecent(Date().addingTimeInterval(-400)))
-        #expect(AirDropDSP.subtitle(fileCount: 2, photoCount: 0, videoCount: 0) == "2 Files")
-        #expect(AirDropDSP.subtitle(fileCount: 2, photoCount: 2, videoCount: 0) == "2 Photos")
-        #expect(AirDropDSP.isAcceptTitle("Accept"))
-        #expect(!AirDropDSP.isAcceptTitle("AirDrop"))
-        let one = AirDropArrival(fileCount: 1, subtitle: "1 File", senderName: "AirDrop", thumbnail: nil)
-        let two = AirDropArrival(fileCount: 2, subtitle: "2 Files", senderName: "Chi", thumbnail: nil)
-        let merged = AirDropDSP.merge(one, two)
-        #expect(merged.fileCount == 2)
-        #expect(merged.subtitle == "2 Files")
-        let unique = AirDropDSP.uniqueURLs([
-            URL(fileURLWithPath: "/tmp/a.jpg"),
-            URL(fileURLWithPath: "/tmp/a.jpg"),
-            URL(fileURLWithPath: "/tmp/b.jpg")
-        ])
-        #expect(unique.count == 2)
     }
 
     @Test func accessibilitySheetIsNeverShownAutomatically() {
@@ -2983,6 +3071,76 @@ struct Dynamic_IslandTests {
                 platform: .youtube
             )
         )
+        #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 640, pixelHeight: 360))
+        #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 320, pixelHeight: 180))
+        #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 480, pixelHeight: 360))
+        #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 150, pixelHeight: 83))
+        #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 256, pixelHeight: 256))
+        #expect(MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 150, pixelHeight: 150))
+        #expect(MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 544, pixelHeight: 544))
+        #expect(!MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 64, pixelHeight: 64))
+        #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 128, pixelHeight: 128))
+        #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 0, pixelHeight: 0))
+        #expect(MediaArtworkPolicy.isYouTubePosterToken("ytimg:abc"))
+        #expect(MediaArtworkPolicy.isYouTubePosterToken("remote:ytimg:abc"))
+        #expect(!MediaArtworkPolicy.isYouTubePosterToken("remote:/9j/4AAQ"))
+        #expect(MediaClient.squareCropRect(pixelWidth: 480, pixelHeight: 360).side == 270)
+        #expect(MediaClient.squareCropRect(pixelWidth: 480, pixelHeight: 360).x == 105)
+        #expect(MediaClient.squareCropRect(pixelWidth: 480, pixelHeight: 360).y == 45)
+        #expect(MediaClient.squareCropRect(pixelWidth: 320, pixelHeight: 180).side == 180)
+        #expect(MediaClient.squareCropRect(pixelWidth: 256, pixelHeight: 256).side == 256)
+        #expect(
+            MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: nil,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: true,
+                hasRemote: true
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: nil,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtube,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtube,
+                resemblesBrowserIcon: true,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtubeMusic,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true,
+                pixelWidth: 150,
+                pixelHeight: 150
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtube,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true,
+                pixelWidth: 150,
+                pixelHeight: 150
+            )
+        )
     }
 
     @Test func browserMediaPickerOpensTheMatchingPlatformTab() {
@@ -3024,6 +3182,44 @@ struct Dynamic_IslandTests {
             platform: .youtube
         )
         #expect(ytPicked?.url.contains("youtube.com") == true)
+    }
+
+    @Test func browserMediaPickerPrefersYouTubeMusicHomeOverUnrelatedTabs() {
+        let gmail = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 1,
+            tabID: 12,
+            title: "Inbox (3) - Gmail",
+            url: "https://mail.google.com/mail/u/0/#inbox"
+        )
+        let azure = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 2,
+            tabID: 13,
+            title: "Work item 52800",
+            url: "https://dev.azure.com/org/project/_workitems/edit/52800"
+        )
+        let music = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 1,
+            tabID: 90,
+            title: "YouTube Music",
+            url: "https://music.youtube.com/"
+        )
+        #expect(
+            BrowserMediaNavigator.isLikelyPlaybackURL(
+                "https://music.youtube.com/",
+                platform: .youtubeMusic
+            )
+        )
+        let picked = BrowserMediaNavigator.pick(
+            from: [gmail, azure, music],
+            nowPlayingTitle: "Arz Kiya Hai",
+            nowPlayingArtist: "Anuv Jain",
+            preferredURL: "",
+            platform: nil
+        )
+        #expect(picked?.url.contains("music.youtube.com") == true)
     }
 
     @Test func browserMediaPickerUsesPlaybackURLWhenPageTitleIsGeneric() {
@@ -3229,6 +3425,16 @@ struct Dynamic_IslandTests {
         #expect(tabs[0].windowIndex == 1)
         #expect(tabs[0].tabIndex == 3)
         #expect(tabs[0].tabID == 44)
+    }
+
+    @Test func browserMediaActiveTabParserReadsSingleChromeRow() {
+        let tab = BrowserMediaNavigator.parseTabList(
+            "1\t2\t88\tSome video - YouTube\thttps://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ).first
+        #expect(tab?.windowIndex == 1)
+        #expect(tab?.tabIndex == 2)
+        #expect(tab?.tabID == 88)
+        #expect(YouTubeTabPicker.youtubeVideoID(from: tab?.url ?? "") == "dQw4w9WgXcQ")
     }
 
     @Test func shelfInsertsUpToCapAndDropsOldest() {

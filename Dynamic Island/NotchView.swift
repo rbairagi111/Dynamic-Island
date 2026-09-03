@@ -27,10 +27,6 @@ struct NotchView: View {
         switch model.transientOverlay {
         case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return IslandMetrics.chargingRadius
-        case .airDropTransfer:
-            return IslandMetrics.chargingRadius
-        case .airDropComplete:
-            return IslandMetrics.airDropRadius
         default:
             if model.showsRecordingExpanded {
                 return IslandMetrics.recordingRadius
@@ -92,7 +88,6 @@ struct NotchView: View {
                     .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
                 } else if model.showsCompactLiveActivity {
                     CompactLiveActivityRow(
-                        showAirDrop: model.isAirDropTransferring,
                         isRecording: model.isScreenRecording,
                         isSelectingRecord: model.isSelectingScreenToRecord
                     )
@@ -164,7 +159,6 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.transientOverlay)
         .animation(IslandMetrics.motion, value: model.isScreenRecording)
         .animation(IslandMetrics.motion, value: model.isSelectingScreenToRecord)
-        .animation(IslandMetrics.motion, value: model.isAirDropTransferring)
     }
 
     // MARK: Compact ↔ expanded now playing (same tree so text can spring in)
@@ -220,23 +214,23 @@ struct NotchView: View {
 
                         progressBar
 
-                        Text(remainingTimeLabel)
+                        Text(totalDurationLabel)
                             .font(.system(size: 11, weight: .medium).monospacedDigit())
                             .foregroundStyle(.white.opacity(0.7))
                             .frame(width: 40, alignment: .trailing)
                     }
                     .transition(IslandMetrics.contentReveal)
 
-                    HStack(spacing: 28) {
-                        controlButton(system: "backward.fill", size: 18, action: model.skipBackward)
+                    HStack(spacing: 20) {
+                        controlButton(system: "backward.fill", iconSize: 18, action: model.skipBackward)
                         controlButton(
                             system: model.isPlaying ? "pause.fill" : "play.fill",
-                            size: 24,
+                            iconSize: 24,
                             action: model.togglePlayPause
                         )
-                        controlButton(system: "forward.fill", size: 18, action: model.skipForward)
+                        controlButton(system: "forward.fill", iconSize: 18, action: model.skipForward)
                     }
-                    .frame(height: 28)
+                    .frame(height: 40)
                     .padding(.top, 8)
                     .transition(IslandMetrics.contentReveal)
 
@@ -279,16 +273,6 @@ struct NotchView: View {
                 )
                 .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
             }
-        case .airDropTransfer:
-            AirDropTransferIsland(
-                progress: model.airDropProgress,
-                onStop: model.cancelAirDrop
-            )
-            .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
-        case .airDropComplete(let arrival):
-            AirDropCompleteIsland(arrival: arrival)
-                .padding(.top, IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
-                .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
         case .chatReady, .none:
             chatOverlayView
         }
@@ -319,8 +303,8 @@ struct NotchView: View {
 
             HStack(alignment: .top, spacing: 0) {
                 musicSplitColumn
-                    .frame(width: leftWidth, alignment: .top)
-                    .frame(maxHeight: .infinity, alignment: .top)
+                    .frame(width: leftWidth)
+                    .frame(maxHeight: .infinity)
 
                 Rectangle()
                     .fill(
@@ -347,65 +331,75 @@ struct NotchView: View {
                     .frame(maxHeight: .infinity)
 
                 chatSplitColumn
-                    .frame(width: rightWidth, alignment: .topLeading)
-                    .frame(maxHeight: .infinity, alignment: .topLeading)
+                    .frame(width: rightWidth)
+                    .frame(maxHeight: .infinity)
             }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
         }
         .padding(.horizontal, IslandMetrics.chatOverlayHorizontalPadding)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private var musicSplitColumn: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 10) {
-                albumArtwork(size: 40, cornerRadius: 10)
-                    .matchedGeometryEffect(id: "artwork", in: island)
-                    .fixedSize()
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(model.songTitle)
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Text(model.artistName)
-                        .font(.system(size: 12, weight: .regular))
-                        .foregroundStyle(.white.opacity(0.55))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                waveformIndicator(
-                    barHeight: 15,
-                    barWidth: 1.5,
-                    spacing: 1.5,
-                    barCount: 6
-                )
-                    .matchedGeometryEffect(id: "waveform", in: island)
-                    .fixedSize()
+        musicSplitHeader
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .overlay(alignment: .bottom) {
+                musicSplitControls
+                    .frame(height: IslandMetrics.dualActionRowHeight)
+                    .frame(maxWidth: .infinity)
             }
+            .padding(.trailing, IslandMetrics.chatOverlayColumnSpacing)
+    }
 
-            Spacer(minLength: 8)
+    private var musicSplitHeader: some View {
+        HStack(alignment: .center, spacing: 10) {
+            albumArtwork(size: 40, cornerRadius: 10)
+                .matchedGeometryEffect(id: "artwork", in: island)
+                .fixedSize()
 
-            HStack(spacing: 30) {
-                controlButton(system: "backward.fill", size: 15, action: model.skipBackward)
-                controlButton(
-                    system: model.isPlaying ? "pause.fill" : "play.fill",
-                    size: 19,
-                    action: model.togglePlayPause
-                )
-                controlButton(system: "forward.fill", size: 15, action: model.skipForward)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.songTitle)
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Text(model.artistName)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            waveformIndicator(
+                barHeight: 15,
+                barWidth: 1.5,
+                spacing: 1.5,
+                barCount: 6
+            )
+            .matchedGeometryEffect(id: "waveform", in: island)
+            .fixedSize()
         }
-        .padding(.trailing, IslandMetrics.chatOverlayColumnSpacing)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var musicSplitControls: some View {
+        HStack(spacing: 20) {
+            controlButton(system: "backward.fill", iconSize: 15, side: 36, action: model.skipBackward)
+            controlButton(
+                system: model.isPlaying ? "pause.fill" : "play.fill",
+                iconSize: 19,
+                side: 36,
+                action: model.togglePlayPause
+            )
+            controlButton(system: "forward.fill", iconSize: 15, side: 36, action: model.skipForward)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var chatSplitColumn: some View {
         chatOverlayButton
             .padding(.leading, IslandMetrics.chatOverlayColumnSpacing)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var chatOnlyColumn: some View {
@@ -432,8 +426,10 @@ struct NotchView: View {
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer(minLength: 8)
-
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .overlay(alignment: .bottom) {
                 HStack(spacing: 6) {
                     Text("Check Now")
                         .font(.system(size: 14, weight: .bold))
@@ -443,11 +439,13 @@ struct NotchView: View {
                         .foregroundStyle(.white)
                     Spacer(minLength: 0)
                 }
+                .frame(height: IslandMetrics.dualActionRowHeight, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var chatMark: some View {
@@ -494,13 +492,13 @@ struct NotchView: View {
         return text
     }
 
-    private func controlButton(system: String, size: CGFloat, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: system)
-                .font(.system(size: size))
-                .foregroundStyle(.white)
-        }
-        .buttonStyle(.plain)
+    private func controlButton(
+        system: String,
+        iconSize: CGFloat,
+        side: CGFloat = 40,
+        action: @escaping () -> Void
+    ) -> some View {
+        IslandTransportButton(system: system, iconSize: iconSize, side: side, action: action)
     }
 
     // MARK: Album Artwork
@@ -508,9 +506,16 @@ struct NotchView: View {
     private func albumArtwork(size: CGFloat, cornerRadius: CGFloat) -> some View {
         Group {
             if let artwork = model.artwork {
-                Image(nsImage: artwork)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
+                // Color.clear owns the layout size so the image never
+                // first-layouts at its intrinsic (fit) size then jumps to fill.
+                Color.clear
+                    .overlay {
+                        Image(nsImage: artwork)
+                            .resizable()
+                            .aspectRatio(contentMode: model.usesPlatformLogo ? .fit : .fill)
+                            .transaction { $0.animation = nil }
+                    }
+                    .clipped()
             } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: cornerRadius)
@@ -596,16 +601,45 @@ struct NotchView: View {
 
     // MARK: Helpers
 
-    private var remainingTimeLabel: String {
-        guard model.duration > 0 else { return "-0:00" }
-        let remaining = max(0, model.duration - model.displayedTime)
-        return "-\(timeString(from: remaining))"
+    private var totalDurationLabel: String {
+        guard model.duration > 0 else { return "0:00" }
+        return timeString(from: model.duration)
     }
 
     private func timeString(from seconds: TimeInterval) -> String {
         let m = Int(seconds) / 60
         let s = Int(seconds) % 60
         return String(format: "%d:%02d", m, s)
+    }
+}
+
+private struct IslandTransportButton: View {
+    let system: String
+    let iconSize: CGFloat
+    var side: CGFloat = 40
+    let action: () -> Void
+    @State private var isHovered = false
+
+    private var hoverRadius: CGFloat { 8 }
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                RoundedRectangle(cornerRadius: hoverRadius, style: .continuous)
+                    .fill(isHovered ? Color.white.opacity(0.10) : Color.clear)
+                Image(systemName: system)
+                    .font(.system(size: iconSize, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: side, height: side)
+            .contentShape(RoundedRectangle(cornerRadius: hoverRadius, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        .animation(.easeOut(duration: 0.12), value: isHovered)
+        .accessibilityLabel(system)
     }
 }
 

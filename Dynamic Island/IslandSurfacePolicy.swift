@@ -3,7 +3,7 @@ import Foundation
 
 /// Hard gates so a new surface (lock screen, recording, helper, …) cannot
 /// swallow banners that already work: Claude / ChatGPT / Gemini, charging,
-/// volume, AirDrop, Focus.
+/// volume, Focus.
 enum IslandSurfacePolicy {
     /// Desktop island only — never loginwindow / shielding tags.
     ///

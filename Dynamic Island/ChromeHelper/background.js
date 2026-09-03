@@ -55,8 +55,174 @@ function postToNative(message) {
   }
 }
 
+const geminiCompletedRequests = new Set();
+const geminiCompletionAtByTab = new Map();
+const geminiArmedUntilByTab = new Map();
+const geminiPromptByTab = new Map();
+const geminiTabByRequest = new Map();
+const geminiPendingRequestsByTab = new Map();
+const geminiCompletionTimerByTab = new Map();
+
+function sendGeminiCompletion(tabId, requestId) {
+  if (geminiCompletionAtByTab.has(tabId)) return;
+  chrome.tabs.get(tabId, (tab) => {
+    if (chrome.runtime.lastError || !tab) return;
+    if (geminiCompletionAtByTab.has(tabId)) return;
+    const preview = "Gemini response ready";
+    geminiCompletionAtByTab.set(tabId, Date.now());
+    postToNative({
+      type: "replyReady",
+      provider: "gemini",
+      preview,
+      textLength: preview.length,
+      assistantCount: 1,
+      latestUserPrompt: "",
+      latestUserFingerprint: "",
+      replyFingerprint: "gemini-request#" + requestId,
+      replyAnchoredToLatestUser: true,
+      networkCompletionToken: "webRequest#" + requestId,
+      chromeTabId: tabId,
+      url: tab.url || "",
+      tabActive: !!tab.active,
+      pageVisible: false,
+      windowFocused: false,
+      ts: Date.now()
+    });
+  });
+}
+
+function isGeminiGenerationRequest(url) {
+  const value = String(url || "").toLowerCase();
+  return (
+    value.indexOf("streamgenerate") !== -1 ||
+    value.indexOf("generatefreeformstreamed") !== -1 ||
+    value.indexOf("generatecontent") !== -1
+  );
+}
+
+function isGeminiBatchRequest(url) {
+  return String(url || "").toLowerCase().indexOf("/data/batchexecute") !== -1;
+}
+
+function geminiRequestBody(details) {
+  const body = details.requestBody;
+  if (!body) return "";
+  if (body.formData) {
+    return Object.values(body.formData).flat().join(" ");
+  }
+  if (body.raw) {
+    return body.raw
+      .map((part) => {
+        try {
+          return part.bytes ? new TextDecoder().decode(part.bytes) : "";
+        } catch (e) {
+          return "";
+        }
+      })
+      .join(" ");
+  }
+  return "";
+}
+
+function trackGeminiRequest(details) {
+  const tabId = details.tabId;
+  if (tabId < 0) return;
+  const explicitlyGeneration = isGeminiGenerationRequest(details.url);
+  const submittedRecently = (geminiArmedUntilByTab.get(tabId) || 0) >= Date.now();
+  const prompt = geminiPromptByTab.get(tabId) || "";
+  const promptNeedle = prompt.slice(0, 24);
+  if (!submittedRecently && !promptNeedle) {
+    return;
+  }
+  let requestText = geminiRequestBody(details).replace(/\+/g, " ");
+  try {
+    requestText = decodeURIComponent(requestText);
+  } catch (e) {}
+  const matchesPrompt = !!promptNeedle && requestText.indexOf(promptNeedle) !== -1;
+  if (
+    !explicitlyGeneration &&
+    !(submittedRecently && isGeminiBatchRequest(details.url) && matchesPrompt)
+  ) {
+    return;
+  }
+  geminiTabByRequest.set(details.requestId, tabId);
+  let pending = geminiPendingRequestsByTab.get(tabId);
+  if (!pending) {
+    pending = new Set();
+    geminiPendingRequestsByTab.set(tabId, pending);
+  }
+  pending.add(details.requestId);
+  const timer = geminiCompletionTimerByTab.get(tabId);
+  if (timer) {
+    clearTimeout(timer);
+    geminiCompletionTimerByTab.delete(tabId);
+  }
+}
+
+function finishGeminiRequest(details) {
+  const tabId = geminiTabByRequest.get(details.requestId);
+  if (typeof tabId !== "number") return;
+  geminiTabByRequest.delete(details.requestId);
+  const pending = geminiPendingRequestsByTab.get(tabId);
+  if (!pending) return;
+  pending.delete(details.requestId);
+  if (pending.size) return;
+  geminiPendingRequestsByTab.delete(tabId);
+  geminiArmedUntilByTab.delete(tabId);
+  geminiPromptByTab.delete(tabId);
+  const timer = setTimeout(() => {
+    geminiCompletionTimerByTab.delete(tabId);
+    sendGeminiCompletion(tabId, details.requestId);
+  }, 350);
+  geminiCompletionTimerByTab.set(tabId, timer);
+}
+
+if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
+  chrome.webRequest.onBeforeRequest.addListener(
+    trackGeminiRequest,
+    { urls: ["https://gemini.google.com/*"] },
+    ["requestBody"]
+  );
+}
+
+if (chrome.webRequest && chrome.webRequest.onCompleted) {
+  chrome.webRequest.onCompleted.addListener(
+    (details) => {
+      if (!geminiTabByRequest.has(details.requestId)) return;
+      if (geminiCompletedRequests.has(details.requestId)) return;
+      geminiCompletedRequests.add(details.requestId);
+      if (geminiCompletedRequests.size > 100) {
+        const oldest = geminiCompletedRequests.values().next().value;
+        geminiCompletedRequests.delete(oldest);
+      }
+      finishGeminiRequest(details);
+    },
+    { urls: ["https://gemini.google.com/*"] }
+  );
+}
+
+if (chrome.webRequest && chrome.webRequest.onErrorOccurred) {
+  chrome.webRequest.onErrorOccurred.addListener(
+    finishGeminiRequest,
+    { urls: ["https://gemini.google.com/*"] }
+  );
+}
+
 function forwardReplyReady(message, sender, sendResponse) {
   const tab = sender.tab;
+  if (
+    message.provider === "gemini" &&
+    tab &&
+    geminiCompletionAtByTab.has(tab.id)
+  ) {
+    try {
+      sendResponse({ ok: true, deduplicated: true });
+    } catch (e) {}
+    return false;
+  }
+  if (message.provider === "gemini" && tab && typeof tab.id === "number") {
+    geminiCompletionAtByTab.set(tab.id, Date.now());
+  }
   const base = {
     type: "replyReady",
     provider: message.provider || "claude",
@@ -67,6 +233,7 @@ function forwardReplyReady(message, sender, sendResponse) {
     latestUserFingerprint: message.latestUserFingerprint || "",
     replyFingerprint: message.replyFingerprint || "",
     replyAnchoredToLatestUser: !!message.replyAnchoredToLatestUser,
+    networkCompletionToken: message.networkCompletionToken || "",
     chromeTabId: tab && typeof tab.id === "number" ? tab.id : -1,
     url: (tab && tab.url) || "",
     tabActive: !!(tab && tab.active),
@@ -108,7 +275,20 @@ function forwardReplyReady(message, sender, sendResponse) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.type !== "replyReady") {
+  if (!message) return false;
+  if (message.type === "geminiPromptSubmitted") {
+    const tabId = sender.tab && sender.tab.id;
+    if (typeof tabId === "number") {
+      geminiArmedUntilByTab.set(tabId, Date.now() + 5000);
+      geminiPromptByTab.set(tabId, String(message.prompt || "").trim());
+      geminiCompletionAtByTab.delete(tabId);
+    }
+    try {
+      sendResponse({ ok: true });
+    } catch (e) {}
+    return false;
+  }
+  if (message.type !== "replyReady") {
     return false;
   }
   return forwardReplyReady(message, sender, sendResponse);
@@ -181,7 +361,7 @@ setInterval(() => {
 }, 15000);
 
 function republishGeminiNetwork(tab) {
-  if (!tab || typeof tab.id !== "number" || tab.active) return;
+  if (!tab || typeof tab.id !== "number") return;
   if (!chrome.scripting) return;
   chrome.scripting.executeScript(
     {

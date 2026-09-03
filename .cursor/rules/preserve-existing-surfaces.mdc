@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Preserve existing island surfaces
 
-Chat banners (Claude / ChatGPT / Gemini), Now Playing, charging, volume, AirDrop, and screen-recording already work. New work (lock screen, helpers, window tags) must not reuse or mutate those paths.
+Chat banners (Claude / ChatGPT / Gemini), Now Playing, charging, volume, and screen-recording already work. New work (lock screen, helpers, window tags) must not reuse or mutate those paths.
 
 ## Desktop island window
 

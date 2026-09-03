@@ -319,6 +319,7 @@ final class NotchWindowController: NSWindowController {
         // Start click-through so Chrome tabs / menu bar stay usable under the
         // large transparent frame. Tracking turns this off only over the island.
         window.ignoresMouseEvents = true
+        window.acceptsMouseMovedEvents = true
         return window
     }
 

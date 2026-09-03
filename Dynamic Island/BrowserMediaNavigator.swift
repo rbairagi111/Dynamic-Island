@@ -57,8 +57,10 @@ enum BrowserMediaNavigator {
     ) -> Int {
         var value = 0
         let tabPlatform = StreamingPlatform.from(url: tab.url)
-        if YouTubeTabPicker.titlesMatch(tab.title, nowPlayingTitle)
-            || YouTubeTabPicker.titlesMatch(tab.url, nowPlayingTitle) {
+        if YouTubeTabPicker.titlesMatch(tab.title, nowPlayingTitle) {
+            value += 100
+        } else if tabPlatform != nil,
+                  YouTubeTabPicker.titlesMatch(tab.url, nowPlayingTitle) {
             value += 100
         }
         if YouTubeTabPicker.titlesMatch(tab.title, nowPlayingArtist) {
@@ -96,6 +98,11 @@ enum BrowserMediaNavigator {
             return path.contains("/watch") || path.contains("/play")
                 || path.contains("/movies/") || path.contains("/shows/")
         case .youtube, .youtubeMusic:
+            // YouTube Music keeps `https://music.youtube.com/` while a track
+            // plays in the SPA player; that is still the playback surface.
+            if platform == .youtubeMusic {
+                return true
+            }
             return path.contains("/watch") || path.contains("/shorts/")
                 || query.contains("v=")
         case .spotify, .appleMusic, .appleTV, .twitch, .jioSaavn, .soundcloud, .vimeo, .plex:
@@ -150,6 +157,78 @@ enum BrowserMediaNavigator {
         let tabs = parseTabList(result.stringValue ?? "")
         NSLog("[BrowserMedia] scanned app=%@ tabs=%d", appName, tabs.count)
         return tabs
+    }
+
+    /// Front window's selected tab only — used to load a YouTube poster without
+    /// waiting for a full tab listing.
+    static func activeTab(bundleID: String) -> Tab? {
+        let appName = appleScriptName(for: bundleID)
+        if appName == "Firefox" { return nil }
+        let script: String
+        if appName == "Safari" {
+            script = """
+            tell application "Safari"
+              if (count of windows) is 0 then return ""
+              set w to window 1
+              set currentTab to current tab of w
+              return "1" & "\t" & (index of currentTab as text) & "\t" & "0" & "\t" & (name of currentTab) & "\t" & (URL of currentTab)
+            end tell
+            """
+        } else {
+            script = """
+            tell application "\(appName)"
+              if (count of windows) is 0 then return ""
+              set bestIdx to 999999
+              set frontW to 1
+              set frontT to 1
+              repeat with w from 1 to count of windows
+                try
+                  set widx to index of window w
+                  if widx < bestIdx then
+                    set bestIdx to widx
+                    set frontW to w
+                    set frontT to active tab index of window w
+                  end if
+                end try
+              end repeat
+              set currentTab to tab frontT of window frontW
+              return (frontW as text) & "\t" & (frontT as text) & "\t" & ((id of currentTab) as text) & "\t" & (title of currentTab) & "\t" & (URL of currentTab)
+            end tell
+            """
+        }
+        var error: NSDictionary?
+        guard let appleScript = NSAppleScript(source: script) else { return nil }
+        let result = appleScript.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return parseTabList(result.stringValue ?? "").first
+    }
+
+    static func tab(bundleID: String, windowIndex: Int, tabIndex: Int) -> Tab? {
+        let appName = appleScriptName(for: bundleID)
+        if appName == "Firefox" { return nil }
+        let script: String
+        if appName == "Safari" {
+            script = """
+            tell application "Safari"
+              if (count of windows) < \(windowIndex) then return ""
+              set currentTab to tab \(tabIndex) of window \(windowIndex)
+              return "\(windowIndex)" & "\t" & "\(tabIndex)" & "\t" & "0" & "\t" & (name of currentTab) & "\t" & (URL of currentTab)
+            end tell
+            """
+        } else {
+            script = """
+            tell application "\(appName)"
+              if (count of windows) < \(windowIndex) then return ""
+              set currentTab to tab \(tabIndex) of window \(windowIndex)
+              return "\(windowIndex)" & "\t" & "\(tabIndex)" & "\t" & ((id of currentTab) as text) & "\t" & (title of currentTab) & "\t" & (URL of currentTab)
+            end tell
+            """
+        }
+        var error: NSDictionary?
+        guard let appleScript = NSAppleScript(source: script) else { return nil }
+        let result = appleScript.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return parseTabList(result.stringValue ?? "").first
     }
 
     static func parseTabList(_ output: String) -> [Tab] {
@@ -289,6 +368,77 @@ enum BrowserMediaNavigator {
         }
         let title = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return title == "no-title" || title.isEmpty ? nil : title
+    }
+
+    struct YouTubeMusicPlayback {
+        var videoID: String?
+        var artworkURL: String?
+    }
+
+    /// YouTube Music often leaves the tab URL at `/` while the player-bar
+    /// already has a video id and album image.
+    static func probeYouTubeMusicPlayback(on tab: Tab, bundleID: String) -> YouTubeMusicPlayback? {
+        guard tab.url.contains("music.youtube.com") else { return nil }
+        let javascript = """
+        (() => {
+          const pick = (value) => String(value || '').trim();
+          const idFrom = (raw) => {
+            const text = pick(raw);
+            if (!text) return '';
+            try {
+              const url = new URL(text, location.href);
+              const queryId = url.searchParams.get('v');
+              if (queryId) return queryId;
+              const vi = url.pathname.match(/\\/vi\\/([a-zA-Z0-9_-]{8,20})/);
+              if (vi) return vi[1];
+            } catch (e) {}
+            const m = text.match(/[?&]v=([a-zA-Z0-9_-]{8,20})/)
+              || text.match(/\\/vi\\/([a-zA-Z0-9_-]{8,20})\\//);
+            return m ? m[1] : '';
+          };
+          const img = document.querySelector(
+            'ytmusic-player-bar img, #song-image img, .thumbnail-image-wrapper img, ytmusic-player img'
+          );
+          const art = pick(img && (img.currentSrc || img.src));
+          const md = navigator.mediaSession && navigator.mediaSession.metadata;
+          const sessionArt = md && md.artwork && md.artwork.length
+            ? pick(md.artwork[md.artwork.length - 1].src)
+            : '';
+          const player = document.querySelector('ytmusic-player, ytmusic-player-bar, ytmusic-app');
+          const attrId = pick(
+            player && (
+              player.getAttribute('video-id')
+              || player.getAttribute('videoId')
+            )
+          );
+          const videoId = idFrom(location.href)
+            || attrId
+            || idFrom(art)
+            || idFrom(sessionArt)
+            || idFrom(document.querySelector('link[rel="canonical"]') && document.querySelector('link[rel="canonical"]').href);
+          return videoId + '\\t' + (art || sessionArt);
+        })()
+        """
+        guard case .success(let value) = executeJavaScript(
+            javascript,
+            on: tab,
+            bundleID: bundleID
+        ) else {
+            return nil
+        }
+        let parts = value.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+        let rawID = parts.first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let artworkURL = parts.count > 1
+            ? String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+            : ""
+        let id = rawID.isEmpty
+            ? nil
+            : YouTubeTabPicker.youtubeVideoID(from: "https://music.youtube.com/watch?v=\(rawID)")
+        let art = artworkURL.isEmpty || artworkURL.lowercased().hasPrefix("data:")
+            ? nil
+            : artworkURL
+        if id == nil, art == nil { return nil }
+        return YouTubeMusicPlayback(videoID: id, artworkURL: art)
     }
 
     /// Executes against the cached playback tab first, avoiding a full tab scan

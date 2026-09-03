@@ -70,14 +70,12 @@ enum TransientOverlay: Equatable {
     case volume(percent: Int, muted: Bool)
     case brightness(percent: Int)
     case focusMode(isOn: Bool)
-    case airDropTransfer(AirDropArrival)
-    case airDropComplete(AirDropArrival)
 
     var preview: String {
         switch self {
         case .chatReady(let preview, _):
             return preview
-        case .charging, .lowBattery, .volume, .brightness, .focusMode, .airDropTransfer, .airDropComplete:
+        case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return ""
         }
     }
@@ -86,7 +84,7 @@ enum TransientOverlay: Equatable {
         switch self {
         case .chatReady(_, let tab):
             return tab
-        case .charging, .lowBattery, .volume, .brightness, .focusMode, .airDropTransfer, .airDropComplete:
+        case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return ClaudeTabInfo(tabID: -1, windowIndex: 0, tabIndex: 0)
         }
     }
@@ -106,7 +104,7 @@ enum TransientOverlay: Equatable {
         switch self {
         case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return true
-        case .chatReady, .airDropTransfer, .airDropComplete:
+        case .chatReady:
             return false
         }
     }
@@ -121,7 +119,6 @@ extension Notification.Name {
     static let previewBrightness = Notification.Name("island.previewBrightness")
     static let previewFocusMode = Notification.Name("island.previewFocusMode")
     static let previewScreenRecording = Notification.Name("island.previewScreenRecording")
-    static let previewAirDrop = Notification.Name("island.previewAirDrop")
     static let previewShelfHold = Notification.Name("island.previewShelfHold")
     static let previewShelfDrop = Notification.Name("island.previewShelfDrop")
     static let previewShelfClear = Notification.Name("island.previewShelfClear")
@@ -266,6 +263,7 @@ struct ClaudeTabTracker {
     mutating func ingestPush(_ snap: ClaudeTabSnapshot) -> ClaudeTabSnapshot? {
         let cleaned = Self.cleanedPreview(snap.preview)
         guard cleaned.count >= 8, !Self.isProcessStage(cleaned) else { return nil }
+        guard !Self.looksLikeGeminiWireNoise(cleaned) else { return nil }
 
         let id = snap.tab.tabID
         let replyFP = snap.replyFingerprint.isEmpty
@@ -273,18 +271,30 @@ struct ClaudeTabTracker {
             : snap.replyFingerprint
         let userFP = snap.latestUserFingerprint
 
+        if snap.tab.provider == .gemini, userFP.isEmpty {
+            return nil
+        }
+
+        let isPlaceholderReply = cleaned.caseInsensitiveCompare("Gemini response ready") == .orderedSame
+            || replyFP.hasPrefix("gemini-request#")
+
         if let until = snoozeUntil[id], until > Date() {
             // User already opened / we already announced this tab's reply.
             // Only a brand-new user prompt should reopen the island during snooze.
+            // A later webRequest token must not bypass this — it was double-bannering
+            // the same Gemini turn (DOM push, then "Gemini response ready").
             let lastPrompt = lastNotifiedGeminiPromptFingerprint[id] ?? ""
             let isNewUserTurn = !userFP.isEmpty && userFP != lastPrompt
             if !isNewUserTurn {
-                if !replyFP.isEmpty {
+                if !replyFP.isEmpty && !replyFP.hasPrefix("gemini-request#") {
                     lastObservedGeminiReplyFingerprint[id] = replyFP
                 }
-                lastNotifiedPreview[id] = cleaned
                 return nil
             }
+        }
+
+        if isPlaceholderReply, lastNotifiedPreview[id] != nil {
+            return nil
         }
 
         if let lastReply = lastObservedGeminiReplyFingerprint[id], !lastReply.isEmpty, lastReply == replyFP {
@@ -299,6 +309,7 @@ struct ClaudeTabTracker {
         if snap.tab.provider == .gemini,
            wasGenerating[id] != true,
            !generationStartedFromEmpty.contains(id),
+           snap.networkCompletionToken.isEmpty,
            lastNotifiedPreview[id] == nil,
            (lastObservedGeminiReplyFingerprint[id] ?? "").isEmpty {
             shownFingerprint[id] = Self.fingerprint(snap)
@@ -336,6 +347,10 @@ struct ClaudeTabTracker {
         }
         if !replyFP.isEmpty {
             lastObservedGeminiReplyFingerprint[id] = replyFP
+        }
+        if !finished.networkCompletionToken.isEmpty {
+            lastObservedNetworkCompletion[id] = finished.networkCompletionToken
+            notifiedNetworkToken[id] = finished.networkCompletionToken
         }
         fingerprintWhenGeneratingStarted[id] = nil
         wasGenerating[id] = false
@@ -469,6 +484,7 @@ struct ClaudeTabTracker {
                     && !snap.replyFingerprint.isEmpty
                     && cleaned.count >= 8
                     && !Self.isProcessStage(cleaned)
+                    && !Self.looksLikeGeminiWireNoise(cleaned)
                     && !staleReplyOnNewPrompt
                 let sameTurnAsLastObserved = !snap.latestUserFingerprint.isEmpty
                     && snap.latestUserFingerprint == priorGeminiPromptFingerprint
@@ -505,7 +521,7 @@ struct ClaudeTabTracker {
                     continue
                 }
 
-                if alreadyNotifiedPrompt && !replyChanged {
+                if alreadyNotifiedPrompt {
                     shownFingerprint[id] = fp.isEmpty ? previous : fp
                     wasGenerating[id] = false
                     candidateSnapshotDuringGeneration[id] = nil
@@ -923,6 +939,16 @@ struct ClaudeTabTracker {
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return text
+    }
+
+    /// RPC / batchexecute fragments scraped from Gemini's homepage widgets.
+    static func looksLikeGeminiWireNoise(_ preview: String) -> Bool {
+        let text = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.hasPrefix("]") || text.hasPrefix("[[") || text.hasPrefix(",\"") {
+            return true
+        }
+        let lowered = text.lowercased()
+        return lowered.contains("af.httprm") || lowered.contains("batchexecute")
     }
 
     /// Claude status chips / thinking labels — not the final answer.

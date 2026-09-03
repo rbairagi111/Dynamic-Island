@@ -50,11 +50,13 @@ enum IslandMetrics {
     static let chatOverlayHorizontalPadding: CGFloat = 20
     /// Inner gap between music and chat columns in the dual layout.
     static let chatOverlayColumnSpacing: CGFloat = 16
-    /// Bottom inset below chat overlay content (52px @2x).
-    static let chatOverlayBottomPadding: CGFloat = 26
+    /// Bottom inset below chat overlay content.
+    static let chatOverlayBottomPadding: CGFloat = 12
     /// Media | chat column share of the dual island (after the 1pt divider).
     static let dualLeftRatio: CGFloat = 0.35
     static let dualRightRatio: CGFloat = 0.65
+    /// Bottom action row in the dual overlay (transport + Check Now).
+    static let dualActionRowHeight: CGFloat = 36
     static let dualDivider = Color(red: 0.62, green: 0.86, blue: 1.0)
     /// Charging, low battery, sound, brightness: 800px @2x → 400pt
     static let batteryBannerWidth: CGFloat = 400
@@ -72,14 +74,7 @@ enum IslandMetrics {
 
     /// Charging is a shallow hang, not the music-player radius.
     static let chargingRadius: CGFloat = 18
-    static let airDropRadius: CGFloat = 28
     static let recordingRadius: CGFloat = 32
-    static let airDropTimeout: TimeInterval = 8
-    static let airDropCompactLeadIn: TimeInterval = 1.2
-
-    static func airDropBannerHeight(notchHeight: CGFloat) -> CGFloat {
-        max(notchHeight, 28) + 68
-    }
 
     static func recordingBannerHeight(notchHeight: CGFloat) -> CGFloat {
         max(notchHeight, 28) + 66
@@ -151,15 +146,12 @@ final class NotchViewModel: ObservableObject {
     /// Cmd+Shift+5 record tool / click-to-choose display, before recording starts.
     @Published var isSelectingScreenToRecord = false
     @Published var recordingElapsed: TimeInterval = 0
-    @Published var isAirDropTransferring = false
-    @Published var airDropProgress: Double = 0
 
     private let nowPlaying = NowPlayingService()
     private let chromeMonitor = ChromeTabMonitor.shared
     private let powerMonitor = PowerMonitor.shared
     private let levelMonitor = VolumeBrightnessMonitor.shared
     private let recordingMonitor = ScreenRecordingMonitor.shared
-    private let airDropMonitor = AirDropMonitor.shared
     private let focusMonitor = FocusMonitor.shared
     private let settings = AppSettings.shared
     private var cancellables = Set<AnyCancellable>()
@@ -167,8 +159,6 @@ final class NotchViewModel: ObservableObject {
     private var overlayHovering = false
     private var recordingTick: Timer?
     private var recordingStartedAt: Date?
-    private var airDropLeadIn: Timer?
-    private var airDropProgressTimer: Timer?
     private let artworkTintQueue = DispatchQueue(label: "island.artwork-tint", qos: .userInitiated)
     private var lastTintedArtwork: ObjectIdentifier?
     /// Temporary holding area for dropped files. References only — never deletes.
@@ -211,7 +201,7 @@ final class NotchViewModel: ObservableObject {
     var showsCompactLiveActivity: Bool {
         transientOverlay == nil
             && !isExpanded
-            && (isScreenRecording || isSelectingScreenToRecord || isAirDropTransferring)
+            && (isScreenRecording || isSelectingScreenToRecord)
     }
 
     var showsRecordingExpanded: Bool {
@@ -220,7 +210,7 @@ final class NotchViewModel: ObservableObject {
 
     var islandShapeWidth: CGFloat {
         switch transientOverlay {
-        case .charging, .lowBattery, .volume, .brightness, .focusMode, .airDropTransfer, .airDropComplete:
+        case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return IslandMetrics.batteryBannerWidth
         case .chatReady where persistentState == .musicPlaying:
             return IslandMetrics.dualWidthFixed
@@ -240,10 +230,8 @@ final class NotchViewModel: ObservableObject {
 
     var islandShapeHeight: CGFloat {
         switch transientOverlay {
-        case .charging, .lowBattery, .volume, .brightness, .focusMode, .airDropTransfer:
+        case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return IslandMetrics.chargingBannerHeight(notchHeight: notchHeight)
-        case .airDropComplete:
-            return IslandMetrics.airDropBannerHeight(notchHeight: notchHeight)
         case .chatReady:
             return IslandMetrics.dualHeight(notchHeight: notchHeight)
         case .none:
@@ -498,7 +486,9 @@ final class NotchViewModel: ObservableObject {
                     )
                     self.cachedTitle = displayTitle.isEmpty ? "Now Playing" : displayTitle
                     self.cachedArtist = snap.artist.isEmpty ? "—" : snap.artist
-                    self.cachedArtwork = snap.artwork
+                    if snap.artwork != nil {
+                        self.cachedArtwork = snap.artwork
+                    }
                     self.cachedMediaPlatform = platform
                     self.cachedUsesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
                     self.cachedDuration = snap.duration
@@ -576,7 +566,12 @@ final class NotchViewModel: ObservableObject {
             currentTime = snap.elapsed
         }
         duration = snap.duration
-        artwork = snap.artwork
+        let pendingArtwork = snap.artworkToken.hasPrefix("pending:")
+        if let image = snap.artwork {
+            artwork = image
+        } else if !pendingArtwork {
+            artwork = nil
+        }
         mediaPlatform = platform
         usesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
         refreshWaveformTint(from: snap.artwork)
@@ -659,29 +654,10 @@ final class NotchViewModel: ObservableObject {
         }
         recordingMonitor.start()
 
-        airDropMonitor.onArrival = { [weak self] arrival in
-            DispatchQueue.main.async {
-                self?.presentAirDrop(arrival)
-            }
-        }
-        airDropMonitor.onTransferring = { [weak self] active in
-            DispatchQueue.main.async {
-                self?.noteAirDropTransferring(active)
-            }
-        }
-        airDropMonitor.start()
-
         NotificationCenter.default.publisher(for: .previewScreenRecording)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.recordingMonitor.setPreview(true)
-            }
-            .store(in: &cancellables)
-
-        NotificationCenter.default.publisher(for: .previewAirDrop)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.presentAirDrop(AirDropMonitor.shared.previewArrival())
             }
             .store(in: &cancellables)
     }
@@ -787,96 +763,6 @@ final class NotchViewModel: ObservableObject {
         setScreenRecording(false)
     }
 
-    private func noteAirDropTransferring(_ active: Bool) {
-        if active {
-            switch transientOverlay {
-            case .airDropTransfer, .airDropComplete:
-                return
-            default:
-                presentAirDrop(.receiving)
-            }
-            return
-        }
-        guard case .airDropTransfer(let arrival) = transientOverlay, arrival.isReceivingPlaceholder else {
-            return
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-            guard let self,
-                  case .airDropTransfer(let current) = self.transientOverlay,
-                  current.isReceivingPlaceholder
-            else { return }
-            self.cancelAirDrop()
-        }
-    }
-
-    private func presentAirDrop(_ arrival: AirDropArrival) {
-        if case .airDropTransfer = transientOverlay, arrival.isReceivingPlaceholder {
-            return
-        }
-        airDropLeadIn?.invalidate()
-        airDropLeadIn = nil
-        isAirDropTransferring = false
-        airDropMonitor.suppressSystemProgressUI()
-
-        switch transientOverlay {
-        case .airDropTransfer(let current):
-            let merged = AirDropDSP.merge(current, arrival)
-            transientOverlay = .airDropTransfer(merged)
-            return
-        case .airDropComplete(let current):
-            presentOverlay(.airDropComplete(AirDropDSP.merge(current, arrival)))
-            return
-        default:
-            break
-        }
-
-        airDropProgress = 0.2
-        presentOverlay(.airDropTransfer(arrival))
-        startAirDropProgress()
-    }
-
-    private func startAirDropProgress() {
-        airDropProgressTimer?.invalidate()
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] timer in
-            guard let self else { return }
-            if case .airDropTransfer(let item) = self.transientOverlay, item.isReceivingPlaceholder {
-                self.airDropProgress = min(self.airDropProgress + 0.008, 0.72)
-                return
-            }
-            let next = min(self.airDropProgress + 0.014, 1)
-            self.airDropProgress = next
-            if next >= 1 {
-                timer.invalidate()
-                self.airDropProgressTimer = nil
-                self.airDropProgress = 1
-                let arrival: AirDropArrival? = {
-                    if case .airDropTransfer(let item) = self.transientOverlay { return item }
-                    return nil
-                }()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { [weak self] in
-                    guard let self, let arrival,
-                          case .airDropTransfer = self.transientOverlay
-                    else { return }
-                    self.presentOverlay(.airDropComplete(arrival))
-                }
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        airDropProgressTimer = timer
-    }
-
-    func cancelAirDrop() {
-        airDropLeadIn?.invalidate()
-        airDropLeadIn = nil
-        airDropProgressTimer?.invalidate()
-        airDropProgressTimer = nil
-        isAirDropTransferring = false
-        airDropProgress = 0
-        if case .airDropTransfer = transientOverlay {
-            clearTransientOverlay(collapseIfNeeded: true)
-        }
-    }
-
     private func presentLevelHUD(_ event: LevelHUDEvent) {
         switch event.kind {
         case .volume:
@@ -916,10 +802,14 @@ final class NotchViewModel: ObservableObject {
             self?.presentChatReady(snapshot)
         }
 
-        ChromePushBridge.shared.onReplyReady = { [weak self] snapshot, pageVisible in
+        ChromePushBridge.shared.onReplyReady = { [weak self] snapshot, pageVisible, tabActive in
             guard let self else { return }
             // Deduplicate via tracker, then present.
-            self.chromeMonitor.handlePushReply(snapshot, pageVisible: pageVisible)
+            self.chromeMonitor.handlePushReply(
+                snapshot,
+                pageVisible: pageVisible,
+                tabActive: tabActive
+            )
         }
 
         NotificationCenter.default.publisher(for: .previewClaudeReady)
@@ -1003,8 +893,13 @@ final class NotchViewModel: ObservableObject {
     }
 
     private func shouldSuppressChatReopen(for tabID: Int) -> Bool {
-        if suppressHoverExpand, tabID == lastOpenedChatTabID { return true }
-        if let until = suppressExpandUntil, until > Date(), tabID == lastOpenedChatTabID {
+        // Only the 2.5s Check Now grace window suppresses same-tab reopens.
+        // `suppressHoverExpand` is a hover-to-player guard (see `expand()`);
+        // it can stay `true` indefinitely if the cursor never re-enters the
+        // island after activation, which was swallowing every follow-up
+        // reply on the same chat tab.
+        guard tabID == lastOpenedChatTabID else { return false }
+        if let until = suppressExpandUntil, until > Date() {
             return true
         }
         return false
@@ -1013,9 +908,6 @@ final class NotchViewModel: ObservableObject {
     func clearTransientOverlay(collapseIfNeeded: Bool = true) {
         overlayTimeout?.invalidate()
         overlayTimeout = nil
-        airDropProgressTimer?.invalidate()
-        airDropProgressTimer = nil
-        airDropProgress = 0
         transientOverlay = nil
         NotificationCenter.default.post(name: .overlayCleared, object: nil)
         if collapseIfNeeded {
@@ -1093,10 +985,6 @@ final class NotchViewModel: ObservableObject {
         switch transientOverlay {
         case .charging:
             duration = IslandMetrics.chargingOverlayTimeout
-        case .airDropTransfer:
-            duration = 30
-        case .airDropComplete:
-            duration = IslandMetrics.airDropTimeout
         case .volume, .brightness:
             duration = IslandMetrics.levelHUDTimeout
         case .focusMode:
@@ -1117,8 +1005,6 @@ final class NotchViewModel: ObservableObject {
     deinit {
         overlayTimeout?.invalidate()
         recordingTick?.invalidate()
-        airDropLeadIn?.invalidate()
-        airDropProgressTimer?.invalidate()
         shelfExpireTimer?.invalidate()
         shelfDropPreviewTimer?.invalidate()
     }

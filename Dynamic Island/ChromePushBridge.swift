@@ -6,7 +6,7 @@ final class ChromePushBridge {
     static let shared = ChromePushBridge()
 
     /// Called on the main queue when a reply finishes in a watched tab.
-    var onReplyReady: ((ClaudeTabSnapshot, Bool) -> Void)?
+    var onReplyReady: ((ClaudeTabSnapshot, Bool, Bool) -> Void)?
     /// True when the extension has said hello recently.
     private(set) var isHelperConnected = false {
         didSet {
@@ -202,6 +202,7 @@ final class ChromePushBridge {
 
         let chromeTabId = obj["chromeTabId"] as? Int ?? -1
         let pageVisible = (obj["pageVisible"] as? Bool) ?? false
+        let tabActive = (obj["tabActive"] as? Bool) ?? false
         let textLength = obj["textLength"] as? Int ?? preview.count
         let assistantCount = obj["assistantCount"] as? Int ?? 1
 
@@ -222,13 +223,14 @@ final class ChromePushBridge {
             latestUserFingerprint: (obj["latestUserFingerprint"] as? String) ?? "",
             replyFingerprint: (obj["replyFingerprint"] as? String) ?? "",
             replyAnchoredToLatestUser: (obj["replyAnchoredToLatestUser"] as? Bool) ?? true,
+            networkCompletionToken: (obj["networkCompletionToken"] as? String) ?? "",
             // Only the extension's "looking at this tab" flag — never tabActive
             // alone, or a background Claude tab is treated as already viewed.
             pageVisible: pageVisible
         )
 
         DispatchQueue.main.async { [weak self] in
-            self?.onReplyReady?(snapshot, pageVisible)
+            self?.onReplyReady?(snapshot, pageVisible, tabActive)
         }
     }
 }

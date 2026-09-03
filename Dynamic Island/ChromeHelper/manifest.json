@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Dynamic Island AI Helper",
-  "version": "1.0.5",
+  "version": "1.0.9",
   "description": "Pushes Claude, ChatGPT, and Gemini reply-complete events to Dynamic Island with no polling lag.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3Q+bDcj/wsekGaWjB0JXnEO2siWXp02HdfJvtF6aG60NCyDyEkoIfD/W5UcNnIl9Afk2VXJeFnjZZitX2QE21iFzL03loEexnK4/tr0VVRif6jlAo9veCnOZbVYeF5WfxEIIgyDhbcoQ/80oRtuWLMCrdeMBQaF9CqN76WrK+iA3XspWSWf++B8RfMoPMabpzHEk9plEpL9hYwXO/HOGpKc55N5xM1nUECIW2m5wiXtOM68Hpx0/x+tuKlco30mSjx1GrrHz7TzopZcmHHyQ3I5BgAnXYQzwkqej6OSFT9Au7JAGYBs9F0mOMebpmYsQD9EKJL1LCiPbZnIR3mjO5wIDAQAB",
-  "permissions": ["nativeMessaging", "tabs", "windows", "scripting"],
+  "permissions": ["nativeMessaging", "tabs", "windows", "scripting", "webRequest"],
   "host_permissions": [
     "https://claude.ai/*",
     "https://*.claude.ai/*",

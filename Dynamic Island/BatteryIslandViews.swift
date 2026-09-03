@@ -226,7 +226,7 @@ struct BatteryIslandOverlay: View {
                 }
                 .padding(.horizontal, 16)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .chatReady, .airDropTransfer, .airDropComplete:
+            case .chatReady:
                 EmptyView()
             }
         }
