@@ -18,11 +18,65 @@ enum MediaClient {
     }
 
     static func longestPixelSide(of image: NSImage?) -> Int {
-        guard let image else { return 0 }
-        let fromReps = image.representations.map { max($0.pixelsWide, $0.pixelsHigh) }.max() ?? 0
-        if fromReps > 0 { return fromReps }
-        let scale = image.recommendedLayerContentsScale(0)
-        return Int(max(image.size.width, image.size.height) * max(scale, 1))
+        let size = pixelSize(of: image)
+        return max(size.width, size.height)
+    }
+
+    static func pixelSize(of image: NSImage?) -> (width: Int, height: Int) {
+        guard let image else { return (0, 0) }
+        let wide = image.representations.map(\.pixelsWide).max() ?? 0
+        let high = image.representations.map(\.pixelsHigh).max() ?? 0
+        if wide > 0, high > 0 { return (wide, high) }
+        let scale = max(image.recommendedLayerContentsScale(0), 1)
+        return (
+            Int(image.size.width * scale),
+            Int(image.size.height * scale)
+        )
+    }
+
+    /// Pixel crop for island artwork. YouTube `hqdefault` is 4:3 with 16:9
+    /// letterbox; strip that, then take a center square so the first frame fills.
+    static func squareCropRect(pixelWidth: Int, pixelHeight: Int) -> (x: Int, y: Int, side: Int) {
+        var x = 0
+        var y = 0
+        var width = max(pixelWidth, 0)
+        var height = max(pixelHeight, 0)
+        guard width > 0, height > 0 else { return (0, 0, 0) }
+        let aspect = Double(width) / Double(height)
+        if aspect >= 1.25 && aspect <= 1.45 {
+            let contentHeight = Int((Double(width) * 9.0 / 16.0).rounded())
+            if contentHeight > 0 && contentHeight < height {
+                y = (height - contentHeight) / 2
+                height = contentHeight
+            }
+        }
+        let side = min(width, height)
+        x += (width - side) / 2
+        y += (height - side) / 2
+        return (x, y, side)
+    }
+
+    static func filledSquareThumbnail(_ image: NSImage) -> NSImage {
+        let px = pixelSize(of: image)
+        let crop = squareCropRect(pixelWidth: px.width, pixelHeight: px.height)
+        guard crop.side > 0 else { return image }
+        if crop.x == 0, crop.y == 0, crop.side == px.width, crop.side == px.height {
+            return image
+        }
+        var proposed = NSRect(origin: .zero, size: image.size)
+        guard let cg = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
+            return image
+        }
+        let scaleX = CGFloat(cg.width) / CGFloat(max(px.width, 1))
+        let scaleY = CGFloat(cg.height) / CGFloat(max(px.height, 1))
+        let rect = CGRect(
+            x: CGFloat(crop.x) * scaleX,
+            y: CGFloat(crop.y) * scaleY,
+            width: CGFloat(crop.side) * scaleX,
+            height: CGFloat(crop.side) * scaleY
+        ).integral
+        guard let sliced = cg.cropping(to: rect) else { return image }
+        return NSImage(cgImage: sliced, size: NSSize(width: crop.side, height: crop.side))
     }
 
     static func resembles(_ a: NSImage, _ b: NSImage, meanAbsDelta: Float = 0.14) -> Bool {
@@ -382,6 +436,44 @@ enum MediaArtworkPolicy {
         if !hasArtwork { return true }
         if resemblesBrowserIcon { return true }
         _ = longestPixelSide
+        return false
+    }
+
+    /// Chrome's Now Playing artwork is a square app/favicon JPEG, or a tiny
+    /// 16:9 preview (≈150×83). YouTube posters are wider and much larger.
+    static func isLikelyVideoThumbnail(pixelWidth: Int, pixelHeight: Int) -> Bool {
+        guard pixelWidth >= 240, pixelHeight >= 140 else { return false }
+        let aspect = Double(pixelWidth) / Double(pixelHeight)
+        return aspect >= 1.25 && aspect <= 2.4
+    }
+
+    static func isYouTubePosterToken(_ token: String) -> Bool {
+        token.contains("ytimg:")
+    }
+
+    /// YouTube Music publishes square album covers (MediaRemote and the
+    /// player-bar image), not 16:9 watch posters.
+    static func isLikelyAlbumArtwork(pixelWidth: Int, pixelHeight: Int) -> Bool {
+        guard pixelWidth >= 120, pixelHeight >= 120 else { return false }
+        let aspect = Double(pixelWidth) / Double(pixelHeight)
+        return aspect >= 0.8 && aspect <= 1.25
+    }
+
+    /// Show MediaRemote art immediately when it is already a poster. Hold
+    /// square browser icons until YouTube's thumbnail (or tab URL) arrives.
+    static func shouldShowBrowserRemoteArtwork(
+        platform: StreamingPlatform?,
+        resemblesBrowserIcon: Bool,
+        isLikelyVideoThumbnail: Bool,
+        hasRemote: Bool,
+        pixelWidth: Int = 0,
+        pixelHeight: Int = 0
+    ) -> Bool {
+        guard hasRemote, !resemblesBrowserIcon else { return false }
+        if isLikelyVideoThumbnail { return true }
+        if platform == .youtubeMusic {
+            return isLikelyAlbumArtwork(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+        }
         return false
     }
 }

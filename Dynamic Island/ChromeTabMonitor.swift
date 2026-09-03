@@ -128,14 +128,16 @@ final class ChromeTabMonitor {
     }
 
     /// Instant reply from the Chrome extension (no poll / no stale candidate text).
-    func handlePushReply(_ snapshot: ClaudeTabSnapshot, pageVisible: Bool) {
+    func handlePushReply(_ snapshot: ClaudeTabSnapshot, pageVisible: Bool, tabActive: Bool = false) {
         if let event = tracker.ingestPush(snapshot) {
             let chromeFront = Self.chromeIsFrontmost()
-            // Same rule for every provider: only skip when the user is actually
-            // looking at this chat (Chrome frontmost + tab visible/active).
-            // Claude/ChatGPT used to suppress on document.visibility alone, which
-            // stays true when focus is on another Mac app — Gemini already worked.
-            let viewingThisTab = chromeFront && (pageVisible || event.pageVisible)
+            // Gemini spoofs document.visibility so background tabs keep streaming.
+            // Never use that flag as "user is looking." Use Chrome's active tab
+            // (helper tabActive / last AppleScript visible tab) plus frontmost.
+            let thisTabVisible = event.tab.provider == .gemini
+                ? (tabActive || lastVisibleTabID == event.tab.tabID)
+                : (pageVisible || event.pageVisible)
+            let viewingThisTab = chromeFront && thisTabVisible
             if viewingThisTab {
                 tracker.noteUserIsViewing(event)
                 NSLog(
@@ -250,6 +252,7 @@ final class ChromeTabMonitor {
 
     private var snapshotCache: [Int: ClaudeTabSnapshot] = [:]
     private var pollTick = 0
+    private var lastVisibleTabID: Int?
     private var lastInFlightTabIDs: Set<Int> = []
     private var fastPolling = false
 
@@ -422,9 +425,11 @@ final class ChromeTabMonitor {
                 )
             }
             let chromeFront = Self.chromeIsFrontmost()
+            lastVisibleTabID = visibleTabID
             // document.visibility stays true for the selected Chrome tab even
             // when Cursor / another app is frontmost. Only treat as "viewing"
-            // when Chrome actually has focus.
+            // when Chrome actually has focus. Gemini spoofs visibility — skip
+            // that flag and match the AppleScript active tab only.
             for snap in snapshots where chromeFront && (snap.pageVisible || snap.tab.tabID == visibleTabID) {
                 if snap.tab.provider == .gemini { continue }
                 tracker.noteUserIsViewing(snap)
@@ -438,13 +443,13 @@ final class ChromeTabMonitor {
                 installTimerIfNeeded()
             }
             if let event {
-                if event.tab.provider != .gemini,
-                   Self.shouldSuppressIslandOverlay(
+                let suppress = Self.shouldSuppressIslandOverlay(
                     tabID: event.tab.tabID,
                     chromeFrontmost: chromeFront,
                     visibleTabID: visibleTabID,
-                    pageVisible: event.pageVisible
-                ) {
+                    pageVisible: event.tab.provider == .gemini ? false : event.pageVisible
+                )
+                if suppress {
                     NSLog(
                         "[ChatTabs] skipped overlay; already viewing %@ tab %d",
                         event.tab.provider.rawValue,
@@ -762,23 +767,22 @@ final class ChromeTabMonitor {
     static func parseBatchInspectOutput(_ output: String) -> [Int: String] {
         let sep = inspectRecordSeparator
         var map: [Int: String] = [:]
-        var remaining = output
-        while let start = remaining.range(of: sep) {
-            remaining = String(remaining[start.upperBound...])
-            guard let idEnd = remaining.range(of: sep) else { break }
-            let idText = remaining[remaining.startIndex..<idEnd.lowerBound]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            remaining = String(remaining[idEnd.upperBound...])
-            guard let tabID = Int(idText) else { continue }
-            let payload: String
-            if let next = remaining.range(of: sep) {
-                payload = String(remaining[..<next.lowerBound])
-                remaining = String(remaining[next.lowerBound...])
-            } else {
-                payload = remaining
-                remaining = ""
+        for line in output.split(whereSeparator: \.isNewline) {
+            let record = String(line)
+            guard record.hasPrefix(sep) else { continue }
+            let fields = record.components(separatedBy: sep)
+            guard fields.count >= 3,
+                  let tabID = Int(fields[1].trimmingCharacters(in: .whitespaces)) else {
+                continue
             }
-            map[tabID] = payload.trimmingCharacters(in: .whitespacesAndNewlines)
+            // JSON.stringify escapes embedded newlines, so every probe is one
+            // physical line. Reading through to the next record separator used
+            // to append all intervening Chrome tab-list rows to this payload,
+            // making every poll result invalid JSON unless another AI tab
+            // happened to follow immediately.
+            map[tabID] = fields.dropFirst(2)
+                .joined(separator: sep)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return map
     }

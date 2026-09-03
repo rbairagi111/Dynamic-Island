@@ -26,9 +26,9 @@ Use this file as the only product source for a **2-page marketing site**: **Prod
 **Name:** Dynamic Island  
 **What it is:** A native macOS menu-bar app that puts a live island in the hardware notch — the same idea as iPhone Dynamic Island, for Mac.
 
-**One line:** Media, charging, volume, AirDrop, screen recording, and “your AI reply is ready” — in the notch, not in the middle of the screen.
+**One line:** Media, charging, volume, screen recording, and “your AI reply is ready” — in the notch, not in the middle of the screen.
 
-**Slightly longer:** Dynamic Island sits in the MacBook notch. Compact, it shows what’s playing. Hover and it expands into a player. Plug in, turn Focus on, change volume, start a recording, or get an AirDrop — the island is the HUD. Keep Claude, ChatGPT, or Gemini open in Chrome and it banners when a reply finishes, then one click jumps you to that tab.
+**Slightly longer:** Dynamic Island sits in the MacBook notch. Compact, it shows what’s playing. Hover and it expands into a player. Plug in, turn Focus on, change volume, or start a recording — the island is the HUD. Keep Claude, ChatGPT, or Gemini open in Chrome and it banners when a reply finishes, then one click jumps you to that tab.
 
 **Who it’s for:** MacBook Pro (notched) users who keep music or a show running and wait on AI chats in Chrome.
 
@@ -50,7 +50,7 @@ Use this file as the only product source for a **2-page marketing site**: **Prod
 
 1. **It lives in the notch.** A black island, aligned with the camera housing. The menu-bar strip is tinted black so the island reads as part of the display, not a floating widget.
 2. **Hover to expand.** Compact: artwork + waveform. Expanded: title, artist, scrubber, play / pause / skip. Drop a file on the notch to hold it.
-3. **Banners when something finishes.** Charging, low battery, volume, brightness, Focus, AirDrop, screen recording, and AI replies in Chrome. Click a chat banner to open that tab.
+3. **Banners when something finishes.** Charging, low battery, volume, brightness, Focus, screen recording, and AI replies in Chrome. Click a chat banner to open that tab.
 
 ### Features (use these, not extras)
 
@@ -94,11 +94,6 @@ Use this file as the only product source for a **2-page marketing site**: **Prod
 
 - Red pulse on the compact island while macOS is capturing (or while the user is picking a screen).
 - Hover to expand: elapsed time + **Stop**.
-
-#### AirDrop
-
-- While a transfer is in progress: shallow banner with radar + progress (same height family as volume).
-- When it finishes: the island grows into a completion card (sender / files).
 
 #### Spaces and lock
 
@@ -154,7 +149,7 @@ Only then split. Suggested (still placeholder — **not how the app works today*
 | | **Island** | **Island + AI** |
 |---|---|---|
 | Price | `PLACEHOLDER` | `PLACEHOLDER` |
-| Now Playing, HUDs, shelf, AirDrop, recording | Yes | Yes |
+| Now Playing, HUDs, shelf, recording | Yes | Yes |
 | Claude / ChatGPT / Gemini banners | No | Yes |
 | Chrome helper | — | Yes |
 
@@ -166,7 +161,7 @@ Do not invent a “Team” or “Enterprise” plan.
 - Subhead: Every island surface included. No account. No subscription unless you replace this sentence.
 - Fine print: `PLACEHOLDER` — tax, currency, “macOS only,” “notch required.”
 - FAQ (keep to 4):
-  1. **Does it need Chrome?** Only for AI banners. Music, volume, charging, AirDrop, recording, and the shelf work without it.
+  1. **Does it need Chrome?** Only for AI banners. Music, volume, charging, recording, and the shelf work without it.
   2. **Does it send my chats anywhere?** No. It reads the tab on this Mac. It does not call Claude, OpenAI, or Gemini APIs.
   3. **Will it cover the menu bar?** The island sits in the notch. Menu items stay clickable. A black wallpaper band makes the notch and island look like one piece.
   4. **What if I deny Accessibility?** The island still runs. Volume/brightness will keep using the system HUD until you grant it in Settings.
@@ -186,10 +181,10 @@ Do not invent a “Team” or “Enterprise” plan.
 ## Design notes for the builder
 
 - Product page length: one screen of hero + a tight feature list. No 12-section storytelling.
-- Show 4–6 island states as stills or a short loop if assets exist; otherwise use simple black pills with labels: Now Playing, Claude ready, Charging, Volume, Recording, AirDrop.
+- Show 4–6 island states as stills or a short loop if assets exist; otherwise use simple black pills with labels: Now Playing, Claude ready, Charging, Volume, Recording.
 - Feature section: name + one sentence each. No icons-for-the-sake-of-icons grid of 20.
 - Pricing page: one card, one CTA, short FAQ. That’s the whole page.
-- Type: SF Pro or a close system sans. Dark background `#000` / `#0A0A0A`. Island fill black, hairline `#191919`. Accent only where the product uses it (recording red, AirDrop blue, charging green, Focus `#5853D7`).
+- Type: SF Pro or a close system sans. Dark background `#000` / `#0A0A0A`. Island fill black, hairline `#191919`. Accent only where the product uses it (recording red, charging green, Focus `#5853D7`).
 - Motion: if any, match a notch expand — short, no bounce.
 
 ---

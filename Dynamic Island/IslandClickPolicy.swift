@@ -6,7 +6,7 @@ import Foundation
 /// clicks often never reach SwiftUI — the same reason recording Stop is AppKit.
 enum IslandClickPolicy {
     enum Action: Equatable {
-        /// Progress, transport, shelf, charging, AirDrop — leave for existing views.
+        /// Progress, transport, shelf, charging — leave for existing views.
         case passthrough
         case revealNowPlaying
         case openChat
@@ -52,7 +52,7 @@ enum IslandClickPolicy {
                 )
             }
             return .openChat
-        case .charging, .volume, .brightness, .focusMode, .airDropTransfer, .airDropComplete:
+        case .charging, .volume, .brightness, .focusMode:
             return .passthrough
         case .none:
             break

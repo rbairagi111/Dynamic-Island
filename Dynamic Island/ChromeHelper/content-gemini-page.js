@@ -91,6 +91,9 @@
     t = cleanText(t);
     if (t.length <= best.length) return best;
     if (t.indexOf("http") === 0) return best;
+    if (/^(null|undefined)$/i.test(t)) return best;
+    if (/type\.googleapis\.com|wrb\.fr|boq_assistant|rpcids=/i.test(t)) return best;
+    if (/^[A-Za-z0-9+/_=-]{48,}$/.test(t)) return best;
     if (t.charAt(0) === "{" || t.charAt(0) === "[") return best;
     if (isProcessOnly(t)) return best;
     const words = t.split(/\s+/).filter(Boolean);
@@ -101,12 +104,12 @@
   function walkStrings(value, best, depth) {
     if (depth > 8 || value == null) return best;
     if (typeof value === "string") {
-      best = considerProse(value, best);
       if (value.length > 12 && (value.charAt(0) === "[" || value.charAt(0) === "{")) {
         try {
-          best = walkStrings(JSON.parse(value), best, depth + 1);
+          return walkStrings(JSON.parse(value), best, depth + 1);
         } catch (e) {}
       }
+      best = considerProse(value, best);
       return best;
     }
     if (typeof value !== "object") return best;
@@ -115,6 +118,11 @@
         best = walkStrings(value[i], best, depth + 1);
       }
       return best;
+    }
+    for (const key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        best = walkStrings(value[key], best, depth + 1);
+      }
     }
     return best;
   }
@@ -151,11 +159,9 @@
       }
     } catch (e1) {}
     if (!best) {
-      const quoted = /"((?:\\.|[^"\\]){32,})"/g;
+      const quoted = /"text"\s*:\s*"((?:\\.|[^"\\]){8,})"/g;
       let m;
       while ((m = quoted.exec(s))) best = considerProse(m[1], best);
-      const textField = /"text"\s*:\s*"((?:\\.|[^"\\]){8,})"/g;
-      while ((m = textField.exec(s))) best = considerProse(m[1], best);
     }
     return best.slice(0, 800);
   }

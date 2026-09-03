@@ -73,6 +73,8 @@ final class NowPlayingService: ObservableObject {
     private var lastMediaSourceTab: BrowserMediaNavigator.Tab?
     private var lastListedIdentity: String = ""
     private var lastBrowserScanAt: TimeInterval = 0
+    private var lastYouTubePosterID: String = ""
+    private var lastYouTubePosterImage: NSImage?
     /// In-tab HTML5 pause/play. Chrome MediaRemote often never sends pause for
     /// browser video, so the simulated waveform kept running.
     private var htmlPlaybackOverride: Bool?
@@ -568,6 +570,8 @@ final class NowPlayingService: ObservableObject {
         lastMediaSourceTab = nil
         lastListedIdentity = ""
         lastBrowserScanAt = 0
+        lastYouTubePosterID = ""
+        lastYouTubePosterImage = nil
         htmlPlaybackOverride = nil
         lastHTMLPlaybackProbeAt = 0
     }
@@ -623,6 +627,7 @@ final class NowPlayingService: ObservableObject {
         lastElapsedWallTime = Date().timeIntervalSince1970
 
         let identity = "\(bundleID)|\(title)|\(artist)"
+        let identityChanged = identity != lastListedIdentity
         let now = Date().timeIntervalSince1970
         let currentPlatform = StreamingPlatform.resolve(
             bundleID: bundleID,
@@ -645,11 +650,10 @@ final class NowPlayingService: ObservableObject {
                             && now - lastBrowserScanAt >= 2
                     )
             )
-        if identity != lastListedIdentity {
+        if identityChanged {
             lastListedIdentity = identity
             lastMediaSourceURL = ""
             lastMediaSourcePageTitle = ""
-            lastMediaSourceTab = nil
         }
         if shouldScanBrowser {
             lastBrowserScanAt = now
@@ -667,15 +671,23 @@ final class NowPlayingService: ObservableObject {
             }
         }
 
-        let prepared = preparedArtwork(
+        let artworkURL = lastMediaSourceURL.isEmpty ? lastYouTubeControlURL : lastMediaSourceURL
+        var prepared = preparedArtwork(
             remote: artwork,
             artKey: artKey,
             bundleID: bundleID,
             appName: appName,
             artist: artist,
             title: title,
-            url: lastMediaSourceURL
+            url: artworkURL
         )
+        if prepared.image == nil, let held = snapshot.artwork, !snapshot.artworkToken.isEmpty {
+            prepared = (held, snapshot.artworkToken)
+        } else if MediaArtworkPolicy.isYouTubePosterToken(snapshot.artworkToken),
+                  !MediaArtworkPolicy.isYouTubePosterToken(prepared.token) {
+            prepared = (snapshot.artwork, snapshot.artworkToken)
+        }
+        prepared = islandDisplayArtwork(prepared)
 
         let next = Snapshot(
             title: title,
@@ -688,7 +700,7 @@ final class NowPlayingService: ObservableObject {
             duration: max(0, duration),
             artwork: prepared.image,
             hasMedia: true,
-            sourceURL: lastMediaSourceURL.isEmpty ? lastYouTubeControlURL : lastMediaSourceURL,
+            sourceURL: artworkURL.isEmpty ? lastYouTubeControlURL : artworkURL,
             sourcePageTitle: lastMediaSourcePageTitle,
             sourceTab: lastMediaSourceTab,
             artworkToken: prepared.token
@@ -720,13 +732,34 @@ final class NowPlayingService: ObservableObject {
         if isBrowser, let remote {
             resemblesBrowser = artworkResemblesBrowserIcon(remote, bundleID: bundleID)
         }
+        let pixels = MediaClient.pixelSize(of: remote)
+        let longest = max(pixels.width, pixels.height)
         let useLogo = MediaArtworkPolicy.shouldUsePlatformLogo(
             hasArtwork: remote != nil,
-            longestPixelSide: MediaClient.longestPixelSide(of: remote),
+            longestPixelSide: longest,
             resemblesBrowserIcon: resemblesBrowser,
             isBrowser: isBrowser,
             platform: platform
         )
+        let youtubeFamily = platform == .youtube || platform == .youtubeMusic
+        let likelyThumb = MediaArtworkPolicy.isLikelyVideoThumbnail(
+            pixelWidth: pixels.width,
+            pixelHeight: pixels.height
+        )
+        let showRemote = MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+            platform: platform,
+            resemblesBrowserIcon: resemblesBrowser,
+            isLikelyVideoThumbnail: likelyThumb,
+            hasRemote: remote != nil,
+            pixelWidth: pixels.width,
+            pixelHeight: pixels.height
+        )
+        if isBrowser, platform == nil || youtubeFamily {
+            if showRemote {
+                return (remote, artKey.isEmpty ? "remote:none" : "remote:\(artKey)")
+            }
+            return (nil, youtubeFamily ? "pending:youtube" : "pending:browser")
+        }
         if useLogo, let platform,
            let officialLogo = StreamingPlatformArtwork.image(for: platform) {
             return (officialLogo, "platform:\(platform.rawValue)")
@@ -748,6 +781,116 @@ final class NowPlayingService: ObservableObject {
         return false
     }
 
+    private func youtubePosterImage(videoID: String) -> NSImage? {
+        let id = videoID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return nil }
+        if id == lastYouTubePosterID, let cached = lastYouTubePosterImage {
+            return cached
+        }
+        let files = ["mqdefault.jpg", "hq720.jpg", "hqdefault.jpg"]
+        for file in files {
+            guard let url = URL(string: "https://i.ytimg.com/vi/\(id)/\(file)"),
+                  let data = try? Data(contentsOf: url),
+                  let image = NSImage(data: data) else {
+                continue
+            }
+            let px = MediaClient.pixelSize(of: image)
+            guard px.width >= 240, px.height >= 140 else { continue }
+            lastYouTubePosterID = id
+            lastYouTubePosterImage = image
+            return image
+        }
+        return nil
+    }
+
+    private func imageFromRemoteArtworkURL(_ raw: String) -> NSImage? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), url.scheme?.lowercased() == "https" else {
+            return nil
+        }
+        let host = (url.host ?? "").lowercased()
+        let allowed = host.contains("ytimg.com")
+            || host.contains("ggpht.com")
+            || host.contains("googleusercontent.com")
+            || host.contains("youtube.com")
+        guard allowed, let data = try? Data(contentsOf: url), let image = NSImage(data: data) else {
+            return nil
+        }
+        return image
+    }
+
+    private func islandDisplayArtwork(
+        _ prepared: (image: NSImage?, token: String)
+    ) -> (image: NSImage?, token: String) {
+        guard let image = prepared.image else { return prepared }
+        guard MediaArtworkPolicy.isYouTubePosterToken(prepared.token) else { return prepared }
+        return (MediaClient.filledSquareThumbnail(image), prepared.token)
+    }
+
+    @discardableResult
+    private func applyYouTubePoster(
+        from url: String,
+        title: String,
+        bundleID: String,
+        appName: String,
+        artist: String,
+        tab: BrowserMediaNavigator.Tab
+    ) -> Bool {
+        var videoID = YouTubeTabPicker.youtubeVideoID(from: url)
+        var poster = videoID.flatMap { youtubePosterImage(videoID: $0) }
+        var artKey = videoID.map { "ytimg:\($0)" } ?? ""
+        if poster == nil, url.contains("music.youtube.com") {
+            let probe = BrowserMediaNavigator.probeYouTubeMusicPlayback(
+                on: tab,
+                bundleID: bundleID
+            )
+            if videoID == nil { videoID = probe?.videoID }
+            if poster == nil, let id = videoID {
+                poster = youtubePosterImage(videoID: id)
+                artKey = "ytimg:\(id)"
+            }
+            if poster == nil, let artURL = probe?.artworkURL {
+                poster = imageFromRemoteArtworkURL(artURL)
+                if artKey.isEmpty { artKey = "ytmimg:\(artURL.prefix(64))" }
+            }
+        }
+        guard let poster else {
+            return false
+        }
+        let sourceURL: String
+        if let id = videoID, url.contains("music.youtube.com") {
+            sourceURL = "https://music.youtube.com/watch?v=\(id)"
+        } else {
+            sourceURL = url
+        }
+        let prepared = preparedArtwork(
+            remote: poster,
+            artKey: artKey.isEmpty ? "ytmimg:probed" : artKey,
+            bundleID: bundleID,
+            appName: appName,
+            artist: artist,
+            title: title,
+            url: sourceURL
+        )
+        guard prepared.image != nil else {
+            return false
+        }
+        let display = islandDisplayArtwork(prepared)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var snap = self.snapshot
+            guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+            snap.sourceURL = sourceURL
+            snap.sourcePageTitle = tab.title
+            snap.sourceTab = tab
+            snap.artwork = display.image
+            snap.artworkToken = display.token
+            snap.isPlaying = self.activeIsPlaying
+            self.snapshot = snap
+        }
+        return true
+    }
+
     private func resolveBrowserSourceIfNeeded(
         title: String,
         artist: String,
@@ -757,6 +900,38 @@ final class NowPlayingService: ObservableObject {
         artKey: String
     ) {
         // Title/artist already captured; listing tabs is AppleScript — keep it off the UI thread.
+        let candidates: [BrowserMediaNavigator.Tab] = [
+            lastMediaSourceTab.flatMap {
+                BrowserMediaNavigator.tab(
+                    bundleID: bundleID,
+                    windowIndex: $0.windowIndex,
+                    tabIndex: $0.tabIndex
+                )
+            },
+            BrowserMediaNavigator.activeTab(bundleID: bundleID)
+        ].compactMap { $0 }
+        for candidate in candidates {
+            if applyYouTubePoster(
+                from: candidate.url,
+                title: title,
+                bundleID: bundleID,
+                appName: appName,
+                artist: artist,
+                tab: candidate
+            ) {
+                lastMediaSourceURL = candidate.url.contains("music.youtube.com")
+                    ? (YouTubeTabPicker.youtubeVideoID(from: candidate.url).map {
+                        "https://music.youtube.com/watch?v=\($0)"
+                    } ?? candidate.url)
+                    : candidate.url
+                lastMediaSourcePageTitle = candidate.title
+                lastMediaSourceTab = candidate
+                if candidate.url.contains("youtube.com") || candidate.url.contains("youtu.be") {
+                    lastYouTubeControlURL = candidate.url
+                }
+                break
+            }
+        }
         let tabs = BrowserMediaNavigator.listTabs(bundleID: bundleID)
         let hinted = StreamingPlatform.resolve(
             bundleID: bundleID,
@@ -806,15 +981,52 @@ final class NowPlayingService: ObservableObject {
         if tab.url.contains("youtube.com") || tab.url.contains("youtu.be") {
             lastYouTubeControlURL = tab.url
         }
+        var remote = remoteArtwork
+        var key = artKey
+        var videoID = YouTubeTabPicker.youtubeVideoID(from: tab.url)
+        var musicProbe: BrowserMediaNavigator.YouTubeMusicPlayback?
+        if videoID == nil, tab.url.contains("music.youtube.com") {
+            musicProbe = BrowserMediaNavigator.probeYouTubeMusicPlayback(
+                on: tab,
+                bundleID: bundleID
+            )
+            videoID = musicProbe?.videoID
+        }
+        if let videoID {
+            lastMediaSourceURL = tab.url.contains("music.youtube.com")
+                ? "https://music.youtube.com/watch?v=\(videoID)"
+                : tab.url
+            lastYouTubeControlURL = lastMediaSourceURL
+        }
+        let pixels = MediaClient.pixelSize(of: remote)
+        let alreadyThumb = MediaArtworkPolicy.isLikelyVideoThumbnail(
+            pixelWidth: pixels.width,
+            pixelHeight: pixels.height
+        ) || (
+            StreamingPlatform.from(url: tab.url) == .youtubeMusic
+                && MediaArtworkPolicy.isLikelyAlbumArtwork(
+                    pixelWidth: pixels.width,
+                    pixelHeight: pixels.height
+                )
+        )
+        if !alreadyThumb, let videoID, let poster = youtubePosterImage(videoID: videoID) {
+            remote = poster
+            key = "ytimg:\(videoID)"
+        } else if !alreadyThumb, let artURL = musicProbe?.artworkURL,
+                  let image = imageFromRemoteArtworkURL(artURL) {
+            remote = image
+            key = "ytmimg:\(artURL.prefix(64))"
+        }
         let prepared = preparedArtwork(
-            remote: remoteArtwork,
-            artKey: artKey,
+            remote: remote,
+            artKey: key,
             bundleID: bundleID,
             appName: appName,
             artist: artist,
             title: title,
             url: tab.url
         )
+        let display = islandDisplayArtwork(prepared)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             var snap = self.snapshot
@@ -822,8 +1034,11 @@ final class NowPlayingService: ObservableObject {
             snap.sourceURL = tab.url
             snap.sourcePageTitle = sourcePageTitle
             snap.sourceTab = tab
-            snap.artwork = prepared.image
-            snap.artworkToken = prepared.token
+            if !(MediaArtworkPolicy.isYouTubePosterToken(snap.artworkToken)
+                    && !MediaArtworkPolicy.isYouTubePosterToken(display.token)) {
+                snap.artwork = display.image
+                snap.artworkToken = display.token
+            }
             snap.isPlaying = self.activeIsPlaying
             self.snapshot = snap
         }
