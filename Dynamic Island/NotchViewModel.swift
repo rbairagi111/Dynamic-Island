@@ -41,6 +41,7 @@ enum IslandMetrics {
         .combined(with: .opacity)
     static let overlayTimeout: TimeInterval = 12
     static let chargingOverlayTimeout: TimeInterval = 4
+    static let lowBatteryOverlayTimeout: TimeInterval = 3
     static let levelHUDTimeout: TimeInterval = 2
     /// Wide split layout when music and a chat reply share the island.
     static let dualWidthFixed: CGFloat = 560
@@ -584,6 +585,9 @@ final class NotchViewModel: ObservableObject {
                 self?.presentPowerEvent(event)
             }
         }
+        powerMonitor.onLowBatteryProximity = {
+            SystemHUDSuppressor.shared.suppressNativeLowBatteryAlert()
+        }
         powerMonitor.start()
 
         NotificationCenter.default.publisher(for: .previewCharging)
@@ -791,6 +795,9 @@ final class NotchViewModel: ObservableObject {
         if overlay.replacesSystemHUD {
             SystemHUDSuppressor.shared.suppressNativeHUD()
         }
+        if case .lowBattery = overlay {
+            SystemHUDSuppressor.shared.suppressNativeLowBatteryAlert()
+        }
         transientOverlay = overlay
         isExpanded = true
         NotificationCenter.default.post(name: .overlayActivated, object: nil)
@@ -985,11 +992,13 @@ final class NotchViewModel: ObservableObject {
         switch transientOverlay {
         case .charging:
             duration = IslandMetrics.chargingOverlayTimeout
+        case .lowBattery:
+            duration = IslandMetrics.lowBatteryOverlayTimeout
         case .volume, .brightness:
             duration = IslandMetrics.levelHUDTimeout
         case .focusMode:
             duration = IslandMetrics.chargingOverlayTimeout
-        case .lowBattery, .chatReady, .none:
+        case .chatReady, .none:
             duration = IslandMetrics.overlayTimeout
         }
         overlayTimeout = Timer.scheduledTimer(

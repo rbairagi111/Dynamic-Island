@@ -57,6 +57,44 @@ enum YouTubeTabPicker {
         return hits >= need
     }
 
+    /// Same track, not a leftover YouTube watch tab. Fuzzy `titlesMatch` treats
+    /// short words ("too"/"good") as hits and bound Music to the wrong poster.
+    static func titlesMatchSameTrack(_ a: String, _ b: String) -> Bool {
+        let x = normalize(a)
+        let y = normalize(b)
+        guard x.count >= 3, y.count >= 3 else { return false }
+        if x == y { return true }
+        let shorter = x.count < y.count ? x : y
+        let longer = x.count < y.count ? y : x
+        if shorter.count >= 12, longer.contains(shorter) { return true }
+        let wx = Set(significantWords(x))
+        let wy = Set(significantWords(y))
+        let exact = wx.intersection(wy)
+        if exact.contains(where: { $0.count >= 6 }) { return true }
+        return exact.filter { $0.count >= 4 }.count >= 2
+    }
+
+    private static func significantWords(_ s: String) -> [String] {
+        s.split(separator: " ").map(String.init).filter { word in
+            word.count >= 4 && word.rangeOfCharacter(from: .letters) != nil
+        }
+    }
+
+    /// True when this browser tab's *title* is the Now Playing item.
+    static func tabMatchesNowPlaying(
+        tabTitle: String,
+        nowPlayingTitle: String,
+        nowPlayingArtist: String,
+        tabURL: String = "",
+        nowPlayingHint: StreamingPlatform? = nil
+    ) -> Bool {
+        _ = nowPlayingArtist
+        if !StreamingPlatform.sourceURLCompatible(tabURL, withTitleHint: nowPlayingHint) {
+            return false
+        }
+        return titlesMatchSameTrack(tabTitle, nowPlayingTitle)
+    }
+
     private static func wordsClose(_ a: String, _ b: String) -> Bool {
         if a == b || a.contains(b) || b.contains(a) { return true }
         guard min(a.count, b.count) >= 3 else { return false }

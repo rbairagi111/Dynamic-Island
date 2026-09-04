@@ -141,18 +141,10 @@ struct NotchView: View {
         .contentShape(islandShape)
         .modifier(IslandFileDrop())
         .onHover { hovering in
-            if hovering {
-                if model.isOverlayActive {
-                    model.noteOverlayHover(true)
-                    return
-                }
-                model.expand()
-                return
-            }
-            model.noteOverlayHover(false)
-            if !model.isOverlayActive {
-                model.collapse()
-            }
+            // Overlay hover is SwiftUI-only. Music expand/collapse is AppKit
+            // (`updateClickThrough`) so a control hover cannot collapse the island.
+            guard model.isOverlayActive else { return }
+            model.noteOverlayHover(hovering)
         }
         .animation(IslandMetrics.motion, value: model.isExpanded)
         .animation(IslandMetrics.motion, value: model.isOverlayActive)
@@ -185,10 +177,12 @@ struct NotchView: View {
                                 .font(.system(size: 15, weight: .semibold))
                                 .foregroundStyle(.white)
                                 .lineLimit(1)
+                                .allowsHitTesting(false)
                             Text(model.artistName)
                                 .font(.system(size: 12))
                                 .foregroundStyle(.white.opacity(0.6))
                                 .lineLimit(1)
+                                .allowsHitTesting(false)
                         }
                         .transition(IslandMetrics.contentReveal)
                     }
@@ -211,6 +205,7 @@ struct NotchView: View {
                             .font(.system(size: 11, weight: .medium).monospacedDigit())
                             .foregroundStyle(.white.opacity(0.7))
                             .frame(width: 34, alignment: .leading)
+                            .allowsHitTesting(false)
 
                         progressBar
 
@@ -218,6 +213,7 @@ struct NotchView: View {
                             .font(.system(size: 11, weight: .medium).monospacedDigit())
                             .foregroundStyle(.white.opacity(0.7))
                             .frame(width: 40, alignment: .trailing)
+                            .allowsHitTesting(false)
                     }
                     .transition(IslandMetrics.contentReveal)
 
@@ -363,11 +359,13 @@ struct NotchView: View {
                     .foregroundStyle(.white)
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .allowsHitTesting(false)
                 Text(model.artistName)
                     .font(.system(size: 12, weight: .regular))
                     .foregroundStyle(.white.opacity(0.55))
                     .lineLimit(1)
                     .truncationMode(.tail)
+                    .allowsHitTesting(false)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 

@@ -169,4 +169,56 @@ enum SystemHUDDSP {
         if let localizedName, osdOwnerNames.contains(localizedName) { return true }
         return false
     }
+
+    static let batteryAlertOwnerNames: Set<String> = [
+        "BatteryUI",
+        "Battery UI",
+        "PowerUIAgent"
+    ]
+
+    static let batteryAlertBundleIDs: Set<String> = [
+        "com.apple.batteryui",
+        "com.apple.PowerUIAgent"
+    ]
+
+    static func isBatteryAlertHelper(bundleID: String?, localizedName: String?) -> Bool {
+        if let bundleID {
+            if batteryAlertBundleIDs.contains(bundleID) { return true }
+            if bundleID.lowercased().contains("batteryui") { return true }
+        }
+        if let localizedName, batteryAlertOwnerNames.contains(localizedName) { return true }
+        return false
+    }
+
+    static func titleLooksLikeLowBattery(_ title: String) -> Bool {
+        let value = title.lowercased()
+        guard !value.isEmpty else { return false }
+        return value.contains("battery")
+            || value.contains("batterie")
+            || value.contains("batterij")
+            || value.contains("batteria")
+            || value.contains("batería")
+            || value.contains("bateria")
+    }
+
+    /// BatteryUI alerts, titled Low Battery banners, or untitled system banners
+    /// (Notification Center / Window Manager) that use the same pill geometry as
+    /// the volume HUD. Other titled notifications stay visible.
+    static func looksLikeNativeLowBatteryAlert(owner: String, title: String, bounds: CGRect) -> Bool {
+        if titleLooksLikeLowBattery(title) { return true }
+        if !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return false
+        }
+        guard bounds.width > 40, bounds.height > 20 else { return false }
+        if batteryAlertOwnerNames.contains(owner)
+            || owner.localizedCaseInsensitiveContains("battery")
+            || owner.localizedCaseInsensitiveContains("powerui") {
+            return true
+        }
+        let systemBannerHost = owner == "Notification Center"
+            || owner == "Notification Centre"
+            || owner == "UserNotificationCenter"
+            || bannerOwnerNames.contains(owner)
+        return systemBannerHost && looksLikeControlCenterBanner(bounds)
+    }
 }

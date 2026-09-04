@@ -86,7 +86,7 @@ struct SettingsView: View {
             }
 
             Section("Battery") {
-                Text("Plug in to show Charging; at 20% and 10% unplugged the island shows Low Battery. Use these to preview the banners.")
+                Text("Plug in to show Charging. Unplugged at 10%, the island shows Low Battery and hides the Mac’s own low-battery alert. Use these to preview the banners.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Preview Charging") {

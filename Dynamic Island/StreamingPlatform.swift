@@ -224,6 +224,37 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
         return from(text: [appName, artist, title].joined(separator: " "))
     }
 
+    /// YouTube watch and YouTube Music share a catalog. Prime, Netflix, etc. do not.
+    static func isSameFamily(_ a: StreamingPlatform, _ b: StreamingPlatform) -> Bool {
+        if a == b { return true }
+        switch (a, b) {
+        case (.youtube, .youtubeMusic), (.youtubeMusic, .youtube):
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Now Playing title/artist (ignore a stale cached URL).
+    static func titleHint(
+        bundleID: String = "",
+        appName: String = "",
+        artist: String = "",
+        title: String = ""
+    ) -> StreamingPlatform? {
+        resolve(bundleID: bundleID, appName: appName, artist: artist, title: title, url: "")
+    }
+
+    /// A cached or listed tab must not stay bound when Now Playing moved to another service.
+    static func sourceURLCompatible(_ url: String, withTitleHint hint: StreamingPlatform?) -> Bool {
+        guard let fromURL = from(url: url) else { return true }
+        guard let hint else {
+            // YouTube MediaRemote titles usually omit "YouTube". Keep only that family.
+            return fromURL == .youtube || fromURL == .youtubeMusic
+        }
+        return isSameFamily(hint, fromURL)
+    }
+
     /// Removes browser/service chrome from the title shown in the island.
     /// The untouched MediaRemote title is still retained for tab matching.
     static func displayTitle(
@@ -457,6 +488,24 @@ enum MediaArtworkPolicy {
         guard pixelWidth >= 120, pixelHeight >= 120 else { return false }
         let aspect = Double(pixelWidth) / Double(pixelHeight)
         return aspect >= 0.8 && aspect <= 1.25
+    }
+
+    /// Chrome JPEGs the policy already rejected (`pending:browser` / `pending:youtube`).
+    static func allowsRemoteArtworkFallback(isBrowser: Bool, policyToken: String) -> Bool {
+        guard isBrowser else { return true }
+        return !policyToken.hasPrefix("pending:")
+    }
+
+    /// Keep the last real mark/poster while YouTube's thumbnail downloads.
+    /// Do not keep a Chrome favicon or 150×83 MediaRemote preview.
+    static func shouldHoldArtworkWhilePosterLoads(previousToken: String, policyToken: String) -> Bool {
+        guard policyToken.hasPrefix("pending:") else { return false }
+        guard !previousToken.isEmpty else { return false }
+        if previousToken.hasPrefix("pending:") { return false }
+        if previousToken.hasPrefix("remote:"), !isYouTubePosterToken(previousToken) {
+            return false
+        }
+        return true
     }
 
     /// Show MediaRemote art immediately when it is already a poster. Hold

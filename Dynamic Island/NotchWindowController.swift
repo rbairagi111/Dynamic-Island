@@ -56,6 +56,24 @@ private final class ClearHostingView<Content: View>: NSHostingView<Content> {
         true
     }
 
+    override func resetCursorRects() {
+        discardCursorRects()
+        let rect = islandHitRect()
+        guard !rect.isNull, !rect.isEmpty else { return }
+        addCursorRect(rect, cursor: .arrow)
+    }
+
+    /// SwiftUI `Text` registers an I-beam. Keep the arrow over the island for
+    /// every Now Playing client, not only YouTube.
+    override func cursorUpdate(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        if islandHitRect().contains(local) {
+            NSCursor.arrow.set()
+            return
+        }
+        super.cursorUpdate(with: event)
+    }
+
     private func applyClearBackground() {
         wantsLayer = true
         layer?.isOpaque = false
@@ -263,6 +281,9 @@ final class NotchWindowController: NSWindowController {
     /// invisible until drop-in briefly joins all Spaces, then pins here.
     private var awaitingSpaceReattach = false
     private var pinWaitGeneration = 0
+    /// Ignore a one-frame “outside” glitch so the island cannot collapse
+    /// under the pointer while a control is still hovered.
+    private var outsideClickThroughStreak = 0
 
     convenience init() {
         let window = NotchWindowController.makeWindow()
@@ -936,12 +957,16 @@ final class NotchWindowController: NSWindowController {
         localMouseMonitor = NSEvent.addLocalMonitorForEvents(
             matching: [.mouseMoved, .leftMouseDragged, .leftMouseDown, .leftMouseUp]
         ) { [weak self] event in
-            self?.handlePointerEvent(event)
+            guard let self else { return event }
+            if self.handlePointerEvent(event) {
+                return nil
+            }
             return event
         }
     }
 
-    private func handlePointerEvent(_ event: NSEvent) {
+    @discardableResult
+    private func handlePointerEvent(_ event: NSEvent) -> Bool {
         let screenPoint = NSEvent.mouseLocation
         if event.type == .leftMouseDown,
            viewModel.isScreenRecording,
@@ -949,23 +974,29 @@ final class NotchWindowController: NSWindowController {
            recordingStopHitRect.contains(screenPoint) {
             viewModel.stopScreenRecording()
             updateClickThrough(withScreenPoint: screenPoint)
-            return
+            return true
         }
         if event.type == .leftMouseDown {
-            handleIslandClick(at: screenPoint)
+            if handleIslandClick(at: screenPoint) {
+                NSCursor.arrow.set()
+                updateClickThrough(withScreenPoint: screenPoint)
+                return true
+            }
         }
         updateClickThrough(withScreenPoint: screenPoint)
+        return false
     }
 
     /// SwiftUI buttons inside this nonactivating panel often never fire.
-    /// Artwork / title / chat / battery clicks are handled here; play/pause
-    /// and the shelf stay in their existing views.
-    private func handleIslandClick(at screenPoint: NSPoint) {
-        guard let window, let hosting = hostingView else { return }
+    /// Transport, artwork, chat, and battery clicks are handled here; the
+    /// progress bar and file shelf stay in their existing views.
+    @discardableResult
+    private func handleIslandClick(at screenPoint: NSPoint) -> Bool {
+        guard let window, let hosting = hostingView else { return false }
         let islandInView = islandRect(in: hosting)
         let inWindow = hosting.convert(islandInView, to: nil)
         let inScreen = window.convertToScreen(inWindow)
-        guard inScreen.contains(screenPoint) else { return }
+        guard inScreen.contains(screenPoint) else { return false }
 
         let fromTopLeft = CGPoint(
             x: screenPoint.x - inScreen.minX,
@@ -983,7 +1014,7 @@ final class NotchWindowController: NSWindowController {
         )
         switch action {
         case .passthrough:
-            break
+            return false
         case .revealNowPlaying:
             NSLog("[NotchWindow] island click reveal now playing")
             viewModel.openNowPlayingSource()
@@ -993,7 +1024,14 @@ final class NotchWindowController: NSWindowController {
         case .openBatterySettings:
             NSLog("[NotchWindow] island click battery settings")
             viewModel.openBatterySettingsFromOverlay()
+        case .playPause:
+            viewModel.togglePlayPause()
+        case .skipBack:
+            viewModel.skipBackward()
+        case .skipForward:
+            viewModel.skipForward()
         }
+        return true
     }
 
     /// Mirrors RecordingStopControl's 32pt frame in screen coordinates, with
@@ -1034,25 +1072,34 @@ final class NotchWindowController: NSWindowController {
         }
 
         let islandInView = islandRect(in: hosting)
-        // A little padding so hover/expand still feels easy at the edge.
-        // While a Finder drag is in progress, keep a slightly larger pad so
-        // the compact island can become a drop target.
-        let pad: CGFloat = NSEvent.pressedMouseButtons != 0 ? 16 : 6
+        // Exact island bounds so the arrow cursor does not appear over the
+        // transparent window around the notch. A larger pad while dragging
+        // still lets the compact island become a drop target.
+        let pad: CGFloat = NSEvent.pressedMouseButtons != 0 ? 16 : 0
         let paddedInView = islandInView.insetBy(dx: -pad, dy: -pad)
         let inWindow = hosting.convert(paddedInView, to: nil)
         let inScreen = window.convertToScreen(inWindow)
         let inside = inScreen.contains(screenPoint)
 
         if inside || viewModel.isDropTargeted || viewModel.isDraggingShelfItem {
+            outsideClickThroughStreak = 0
+            NSCursor.arrow.set()
             if window.ignoresMouseEvents {
                 window.ignoresMouseEvents = false
+                window.enableCursorRects()
+                window.invalidateCursorRects(for: hosting)
+            }
+            if !viewModel.isOverlayActive {
+                viewModel.expand()
             }
             if needsLiveActivityElevation {
                 window.level = Self.liveActivityWindowLevel
                 window.orderFrontRegardless()
             }
         } else {
-            if !window.ignoresMouseEvents {
+            outsideClickThroughStreak += 1
+            if outsideClickThroughStreak >= 2, !window.ignoresMouseEvents {
+                window.disableCursorRects()
                 window.ignoresMouseEvents = true
                 // SwiftUI onHover may not fire once we go click-through.
                 if viewModel.isExpanded && !viewModel.isOverlayActive {

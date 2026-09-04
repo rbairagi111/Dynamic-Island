@@ -8,11 +8,14 @@ struct PowerAlertState: Equatable {
         case lowBattery(percent: Int)
     }
 
+    /// macOS's own Low Battery alert is 10%. The island matches that and
+    /// does not also fire at 20%.
+    static let lowBatteryPercent = 10
+
     var didBaseline = false
     var lastPercent = 100
     var wasCharging = false
-    var didWarn20 = false
-    var didWarn10 = false
+    var didWarnLowBattery = false
 
     mutating func ingest(percent: Int, isCharging: Bool) -> Event? {
         let clamped = min(max(percent, 0), 100)
@@ -24,27 +27,18 @@ struct PowerAlertState: Equatable {
 
         if isCharging {
             if didBaseline, !wasCharging {
-                didWarn10 = false
-                didWarn20 = false
+                didWarnLowBattery = false
                 return .chargingStarted(percent: clamped)
             }
             return nil
         }
 
-        if clamped <= 10, !didWarn10 {
-            didWarn10 = true
-            didWarn20 = true
+        if clamped <= Self.lowBatteryPercent, !didWarnLowBattery {
+            didWarnLowBattery = true
             return .lowBattery(percent: clamped)
         }
-        if clamped <= 20, !didWarn20 {
-            didWarn20 = true
-            return .lowBattery(percent: clamped)
-        }
-        if clamped > 20 {
-            didWarn10 = false
-            didWarn20 = false
-        } else if clamped > 10 {
-            didWarn10 = false
+        if clamped > Self.lowBatteryPercent {
+            didWarnLowBattery = false
         }
         return nil
     }
@@ -55,6 +49,9 @@ final class PowerMonitor {
     static let shared = PowerMonitor()
 
     var onEvent: ((PowerAlertState.Event) -> Void)?
+    /// Unplugged and at or below 10%. Used to hide the Mac alert immediately,
+    /// including on later polls after the island already warned.
+    var onLowBatteryProximity: (() -> Void)?
 
     private(set) var percent: Int = 100
     private(set) var isCharging = false
@@ -95,6 +92,9 @@ final class PowerMonitor {
         isCharging = snapshot.isCharging
         if let event = alertState.ingest(percent: snapshot.percent, isCharging: snapshot.isCharging) {
             onEvent?(event)
+        }
+        if !snapshot.isCharging, snapshot.percent <= PowerAlertState.lowBatteryPercent {
+            onLowBatteryProximity?()
         }
     }
 
