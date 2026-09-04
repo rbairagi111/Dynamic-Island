@@ -4,15 +4,19 @@ import Foundation
 
 /// Chrome's `execute javascript` needs a CFRunLoop, but **not** the UI run loop.
 /// GCD has no run loop (empty JS results). Main thread hitchs the island.
+///
+/// Chat-tab polling and Now Playing transport each get their own thread so a
+/// 1s Claude/Gemini poll cannot stall play/pause/skip.
 final class AppleScriptRunLoop: @unchecked Sendable {
-    static let shared = AppleScriptRunLoop()
+    static let shared = AppleScriptRunLoop(threadName: "island.chrome-applescript")
+    static let media = AppleScriptRunLoop(threadName: "island.media-applescript")
     private let loop: CFRunLoop
 
-    private init() {
+    private init(threadName: String) {
         let ready = DispatchSemaphore(value: 0)
         var captured: CFRunLoop!
         let thread = Thread {
-            Thread.current.name = "island.chrome-applescript"
+            Thread.current.name = threadName
             RunLoop.current.add(NSMachPort(), forMode: .default)
             captured = CFRunLoopGetCurrent()
             ready.signal()

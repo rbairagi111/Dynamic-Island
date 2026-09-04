@@ -44,8 +44,24 @@ enum BrowserMediaNavigator {
         }
         .sorted { $0.score > $1.score }
 
-        guard let best = ranked.first, best.score >= 20 else { return nil }
-        return best.tab
+        guard ranked.contains(where: { $0.score >= 20 }) else { return nil }
+        if let titled = ranked.first(where: {
+            $0.score >= 20
+                && YouTubeTabPicker.titlesMatchSameTrack($0.tab.title, nowPlayingTitle)
+                && StreamingPlatform.sourceURLCompatible($0.tab.url, withTitleHint: platform)
+        }) {
+            return titled.tab
+        }
+        // Stale youtube.com/watch preferredURL must not beat a Music tab
+        // whose document title is still the generic "YouTube Music".
+        if let music = ranked.first(where: {
+            $0.score >= 20
+                && StreamingPlatform.from(url: $0.tab.url) == .youtubeMusic
+                && StreamingPlatform.sourceURLCompatible($0.tab.url, withTitleHint: platform)
+        }) {
+            return music.tab
+        }
+        return ranked.first { $0.score >= 20 }?.tab
     }
 
     static func score(
@@ -57,6 +73,9 @@ enum BrowserMediaNavigator {
     ) -> Int {
         var value = 0
         let tabPlatform = StreamingPlatform.from(url: tab.url)
+        if let platform, let tabPlatform, !StreamingPlatform.isSameFamily(platform, tabPlatform) {
+            return 0
+        }
         if YouTubeTabPicker.titlesMatch(tab.title, nowPlayingTitle) {
             value += 100
         } else if tabPlatform != nil,
@@ -66,7 +85,13 @@ enum BrowserMediaNavigator {
         if YouTubeTabPicker.titlesMatch(tab.title, nowPlayingArtist) {
             value += 15
         }
-        if !preferredURL.isEmpty, YouTubeTabPicker.urlsMatch(tab.url, preferredURL) {
+        if !preferredURL.isEmpty,
+           YouTubeTabPicker.urlsMatch(tab.url, preferredURL),
+           YouTubeTabPicker.tabMatchesNowPlaying(
+            tabTitle: tab.title,
+            nowPlayingTitle: nowPlayingTitle,
+            nowPlayingArtist: nowPlayingArtist
+           ) {
             value += 80
         }
         if let platform, tabPlatform == platform {
@@ -313,6 +338,87 @@ enum BrowserMediaNavigator {
     })()
     """
 
+    /// Pause/play any in-tab player (Netflix, Prime, Spotify Web, etc.)
+    /// without activating the browser. Walks same-origin iframes like the probe.
+    static let playPauseJavaScript = """
+    (() => {
+      const seen = [];
+      const addMedia = (root) => {
+        if (!root) return;
+        try {
+          const list = root.querySelectorAll('video, audio');
+          for (let i = 0; i < list.length; i++) seen.push(list[i]);
+        } catch (e) {}
+        let frames;
+        try { frames = root.querySelectorAll('iframe'); } catch (e) { return; }
+        for (let i = 0; i < frames.length; i++) {
+          try {
+            const doc = frames[i].contentDocument;
+            if (doc) addMedia(doc);
+          } catch (e) {}
+        }
+      };
+      addMedia(document);
+      const player = seen.find(m => m && !m.paused && !m.ended)
+        || seen.find(m => m && m.readyState > 0)
+        || seen[0];
+      if (player) {
+        if (player.paused) {
+          const request = player.play();
+          if (request && typeof request.catch === 'function') request.catch(function(){});
+          return 'played';
+        }
+        player.pause();
+        return 'paused';
+      }
+      const selectors = [
+        '[data-uia="control-play-pause-pause"]',
+        '[data-uia="control-play-pause-play"]',
+        '[data-testid="control-button-playpause"]',
+        'button[aria-label*="Pause" i]',
+        'button[aria-label*="Play" i]'
+      ];
+      for (let i = 0; i < selectors.length; i++) {
+        const el = document.querySelector(selectors[i]);
+        if (el) { el.click(); return 'clicked'; }
+      }
+      return 'no-player';
+    })()
+    """
+
+    static func seekJavaScript(to seconds: TimeInterval) -> String {
+        let safe = String(format: "%.3f", seconds)
+        return """
+        (() => {
+          const seconds = \(safe);
+          const seen = [];
+          const addMedia = (root) => {
+            if (!root) return;
+            try {
+              const list = root.querySelectorAll('video, audio');
+              for (let i = 0; i < list.length; i++) seen.push(list[i]);
+            } catch (e) {}
+            let frames;
+            try { frames = root.querySelectorAll('iframe'); } catch (e) { return; }
+            for (let i = 0; i < frames.length; i++) {
+              try {
+                const doc = frames[i].contentDocument;
+                if (doc) addMedia(doc);
+              } catch (e) {}
+            }
+          };
+          addMedia(document);
+          const player = seen.find(m => m && !m.paused && !m.ended)
+            || seen.find(m => m && m.readyState > 0)
+            || seen[0];
+          if (!player) return 'no-player';
+          const duration = Number.isFinite(player.duration) ? player.duration : seconds;
+          player.currentTime = Math.min(Math.max(0, seconds), Math.max(duration - 0.05, 0));
+          return 'seeked';
+        })()
+        """
+    }
+
     /// Netflix and some other OTT players publish only the provider name to
     /// MediaRemote. Read the actual programme title from the already-matched
     /// playback tab without activating it.
@@ -451,7 +557,6 @@ enum BrowserMediaNavigator {
         let appName = appleScriptName(for: bundleID)
         guard appName != "Firefox" else { return .failed }
         let escapedJS = appleScriptEscape(javascript)
-        let escapedURL = appleScriptEscape(tab.url)
         let windowIndex = max(tab.windowIndex, 1)
         let tabIndex = max(tab.tabIndex, 1)
         let script: String
@@ -468,28 +573,18 @@ enum BrowserMediaNavigator {
                   end try
                 end if
               end if
-              repeat with w from 1 to count of windows
-                repeat with t from 1 to count of tabs of window w
-                  if (URL of tab t of window w) is "\(escapedURL)" then
-                    try
-                      return do JavaScript "\(escapedJS)" in tab t of window w
-                    on error errMsg
-                      return "err:" & errMsg
-                    end try
-                  end if
-                end repeat
-              end repeat
               return "no-tab"
             end tell
             """
         } else {
+            let tabID = tab.tabID
             script = """
             tell application "\(appName)"
               if \(windowIndex) is less than or equal to count of windows then
                 if \(tabIndex) is less than or equal to count of tabs of window \(windowIndex) then
                   set directTab to tab \(tabIndex) of window \(windowIndex)
                   set directID to (id of directTab) as text
-                  if "\(tab.tabID)" is "0" or directID is "\(tab.tabID)" or (URL of directTab) is "\(escapedURL)" then
+                  if "\(tabID)" is "0" or directID is "\(tabID)" then
                     try
                       return execute directTab javascript "\(escapedJS)"
                     on error errMsg
@@ -498,17 +593,19 @@ enum BrowserMediaNavigator {
                   end if
                 end if
               end if
-              repeat with w from 1 to count of windows
-                repeat with t from 1 to count of tabs of window w
-                  if (URL of tab t of window w) is "\(escapedURL)" then
-                    try
-                      return execute tab t of window w javascript "\(escapedJS)"
-                    on error errMsg
-                      return "err:" & errMsg
-                    end try
-                  end if
+              if "\(tabID)" is not "0" then
+                repeat with w from 1 to count of windows
+                  repeat with t from 1 to count of tabs of window w
+                    if ((id of tab t of window w) as text) is "\(tabID)" then
+                      try
+                        return execute tab t of window w javascript "\(escapedJS)"
+                      on error errMsg
+                        return "err:" & errMsg
+                      end try
+                    end if
+                  end repeat
                 end repeat
-              end repeat
+              end if
               return "no-tab"
             end tell
             """
@@ -554,66 +651,7 @@ enum BrowserMediaNavigator {
     @discardableResult
     static func activateTab(_ tab: Tab, bundleID: String) -> Bool {
         let appName = appleScriptName(for: bundleID)
-        let escapedURL = appleScriptEscape(tab.url)
-        let escapedVideoID = appleScriptEscape(YouTubeTabPicker.youtubeVideoID(from: tab.url) ?? "")
-        let script: String
-        if appName == "Safari" {
-            script = """
-            tell application "Safari"
-              activate
-              set targetURL to "\(escapedURL)"
-              set targetVideo to "\(escapedVideoID)"
-              set found to false
-              repeat with w from 1 to count of windows
-                repeat with t from 1 to count of tabs of window w
-                  try
-                    set u to URL of tab t of window w
-                    if u is targetURL or (targetVideo is not "" and (u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo))) then
-                      set index of window w to 1
-                      tell window 1 to set current tab to tab t of window 1
-                      set found to true
-                      exit repeat
-                    end if
-                  end try
-                end repeat
-                if found then exit repeat
-              end repeat
-              return found
-            end tell
-            """
-        } else if appName == "Firefox" {
-            script = """
-            tell application "Firefox" to activate
-            return true
-            """
-        } else {
-            script = """
-            tell application "\(appName)"
-              activate
-              set targetURL to "\(escapedURL)"
-              set targetID to "\(tab.tabID)"
-              set targetVideo to "\(escapedVideoID)"
-              set found to false
-              repeat with w from 1 to count of windows
-                repeat with t from 1 to count of tabs of window w
-                  try
-                    set candidate to tab t of window w
-                    set candidateID to (id of candidate) as text
-                    set u to URL of candidate
-                    if (targetID is not "0" and candidateID is targetID) or u is targetURL or (targetVideo is not "" and (u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo))) then
-                      set index of window w to 1
-                      set active tab index of window 1 to t
-                      set found to true
-                      exit repeat
-                    end if
-                  end try
-                end repeat
-                if found then exit repeat
-              end repeat
-              return found
-            end tell
-            """
-        }
+        let script = activationAppleScript(tab: tab, bundleID: bundleID)
         var error: NSDictionary?
         let result = NSAppleScript(source: script)?.executeAndReturnError(&error)
         if let error {
@@ -628,6 +666,81 @@ enum BrowserMediaNavigator {
             NSLog("[BrowserMedia] activated app=%@ url=%@", appName, tab.url)
             return result?.booleanValue ?? true
         }
+    }
+
+    /// Locate the tab with a read-only scan, then retarget by stable window id.
+    /// Integer `window w` becomes stale after a tab change, and `window 1` is
+    /// not Chrome's frontmost window. `activate` last can restore the previous
+    /// window, so raise the matched window again after it.
+    static func activationAppleScript(tab: Tab, bundleID: String) -> String {
+        let appName = appleScriptName(for: bundleID)
+        let escapedURL = appleScriptEscape(tab.url)
+        let escapedVideoID = appleScriptEscape(YouTubeTabPicker.youtubeVideoID(from: tab.url) ?? "")
+        if appName == "Safari" {
+            return """
+            tell application "Safari"
+              set targetURL to "\(escapedURL)"
+              set targetVideo to "\(escapedVideoID)"
+              set winID to 0
+              set tabIdx to 0
+              repeat with w from 1 to count of windows
+                repeat with t from 1 to count of tabs of window w
+                  try
+                    set u to URL of tab t of window w
+                    if u is targetURL or (targetVideo is not "" and (u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo))) then
+                      set winID to id of window w
+                      set tabIdx to t
+                      exit repeat
+                    end if
+                  end try
+                end repeat
+                if winID is not 0 then exit repeat
+              end repeat
+              if winID is 0 then return false
+              tell window id winID to set current tab to tab tabIdx
+              set index of window id winID to 1
+              activate
+              set index of window id winID to 1
+              return true
+            end tell
+            """
+        }
+        if appName == "Firefox" {
+            return """
+            tell application "Firefox" to activate
+            return true
+            """
+        }
+        return """
+        tell application "\(appName)"
+          set targetURL to "\(escapedURL)"
+          set targetID to "\(tab.tabID)"
+          set targetVideo to "\(escapedVideoID)"
+          set winID to 0
+          set tabIdx to 0
+          repeat with w from 1 to count of windows
+            repeat with t from 1 to count of tabs of window w
+              try
+                set candidate to tab t of window w
+                set candidateID to (id of candidate) as text
+                set u to URL of candidate
+                if (targetID is not "0" and candidateID is targetID) or u is targetURL or (targetVideo is not "" and (u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo))) then
+                  set winID to id of window w
+                  set tabIdx to t
+                  exit repeat
+                end if
+              end try
+            end repeat
+            if winID is not 0 then exit repeat
+          end repeat
+          if winID is 0 then return false
+          set active tab index of window id winID to tabIdx
+          set index of window id winID to 1
+          activate
+          set index of window id winID to 1
+          return true
+        end tell
+        """
     }
 
     static func activateApplication(bundleID: String) {

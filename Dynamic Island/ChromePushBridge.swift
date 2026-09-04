@@ -205,7 +205,6 @@ final class ChromePushBridge {
         let tabActive = (obj["tabActive"] as? Bool) ?? false
         let textLength = obj["textLength"] as? Int ?? preview.count
         let assistantCount = obj["assistantCount"] as? Int ?? 1
-
         let snapshot = ClaudeTabSnapshot(
             tab: ClaudeTabInfo(
                 tabID: chromeTabId >= 0 ? chromeTabId : Int(Date().timeIntervalSince1970),

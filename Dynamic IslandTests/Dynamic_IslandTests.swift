@@ -1582,20 +1582,27 @@ struct Dynamic_IslandTests {
         #expect(state.ingest(percent: 45, isCharging: true) == nil)
     }
 
-    @Test func lowBatteryWarnsAtTwentyThenTen() {
+    @Test func lowBatteryWarnsAtTenOnly() {
         var state = PowerAlertState()
         #expect(state.ingest(percent: 40, isCharging: false) == nil)
-        #expect(state.ingest(percent: 20, isCharging: false) == .lowBattery(percent: 20))
+        #expect(state.ingest(percent: 20, isCharging: false) == nil)
         #expect(state.ingest(percent: 18, isCharging: false) == nil)
         #expect(state.ingest(percent: 10, isCharging: false) == .lowBattery(percent: 10))
         #expect(state.ingest(percent: 8, isCharging: false) == nil)
     }
 
+    @Test func lowBatteryBannerDismissesAfterThreeSeconds() {
+        #expect(IslandMetrics.lowBatteryOverlayTimeout == 3)
+        #expect(IslandMetrics.overlayTimeout == 12)
+        #expect(IslandMetrics.chargingOverlayTimeout == 4)
+        #expect(IslandMetrics.levelHUDTimeout == 2)
+    }
+
     @Test func chargingClearsLowBatteryWarnings() {
         var state = PowerAlertState()
-        _ = state.ingest(percent: 15, isCharging: false)
+        _ = state.ingest(percent: 10, isCharging: false)
         #expect(state.ingest(percent: 16, isCharging: true) == .chargingStarted(percent: 16))
-        #expect(state.ingest(percent: 16, isCharging: false) == .lowBattery(percent: 16))
+        #expect(state.ingest(percent: 10, isCharging: false) == .lowBattery(percent: 10))
     }
 
     @Test func launchAlreadyLowShowsLowBattery() {
@@ -2146,6 +2153,50 @@ struct Dynamic_IslandTests {
             )
         )
         #expect(SystemHUDDSP.isOSDHelper(bundleID: "com.apple.OSDUIHelper", localizedName: nil))
+    }
+
+    @Test func nativeLowBatteryAlertsAreBatteryUIOrTitledBanners() {
+        #expect(
+            SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                owner: "BatteryUI",
+                title: "",
+                bounds: CGRect(x: 400, y: 200, width: 360, height: 140)
+            )
+        )
+        #expect(
+            SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                owner: "Notification Center",
+                title: "Low Battery",
+                bounds: CGRect(x: 1400, y: 40, width: 360, height: 88)
+            )
+        )
+        #expect(
+            !SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                owner: "Notification Center",
+                title: "Claude replied",
+                bounds: CGRect(x: 1400, y: 40, width: 360, height: 88)
+            )
+        )
+        #expect(
+            SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                owner: "Notification Center",
+                title: "",
+                bounds: CGRect(x: 1400, y: 40, width: 360, height: 88)
+            )
+        )
+        #expect(
+            !SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                owner: "Notification Center",
+                title: "",
+                bounds: CGRect(x: 1200, y: 28, width: 380, height: 540)
+            )
+        )
+        #expect(
+            SystemHUDDSP.isBatteryAlertHelper(
+                bundleID: "com.apple.batteryui",
+                localizedName: nil
+            )
+        )
     }
 
     @Test func hidRedirectMapsVolumeKeysToUnusedFunctionKeysAndLeavesOthers() {
@@ -3143,6 +3194,39 @@ struct Dynamic_IslandTests {
         )
     }
 
+    @Test func pendingBrowserArtworkDoesNotFallBackToChromeJPEG() {
+        #expect(
+            !MediaArtworkPolicy.allowsRemoteArtworkFallback(
+                isBrowser: true,
+                policyToken: "pending:browser"
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.allowsRemoteArtworkFallback(
+                isBrowser: false,
+                policyToken: "pending:browser"
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
+                previousToken: "platform:primeVideo",
+                policyToken: "pending:browser"
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
+                previousToken: "remote:/9j/4AAQ",
+                policyToken: "pending:browser"
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
+                previousToken: "remote:ytimg:5YBHLwNuM9Y",
+                policyToken: "pending:youtube"
+            )
+        )
+    }
+
     @Test func browserMediaPickerOpensTheMatchingPlatformTab() {
         let prime = BrowserMediaNavigator.Tab(
             windowIndex: 1,
@@ -3184,6 +3268,99 @@ struct Dynamic_IslandTests {
         #expect(ytPicked?.url.contains("youtube.com") == true)
     }
 
+    @Test func browserMediaPickerDoesNotBindPrimeTitleToYouTubeTabWithSharedWords() {
+        let youtube = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 1,
+            tabID: 11,
+            title: "TRAITORS LEAKED FOOTAGE?!?!",
+            url: "https://www.youtube.com/watch?v=traitorsClip"
+        )
+        let prime = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 4,
+            tabID: 71,
+            title: "Prime Video: The Traitors - Season 2",
+            url: "https://www.primevideo.com/detail/0NPUDV12CFZ3EA8Z5WJZFNIDIS"
+        )
+        #expect(
+            YouTubeTabPicker.titlesMatchSameTrack(youtube.title, prime.title)
+        )
+        #expect(
+            !StreamingPlatform.sourceURLCompatible(
+                youtube.url,
+                withTitleHint: .primeVideo
+            )
+        )
+        let pickedPrime = BrowserMediaNavigator.pick(
+            from: [youtube, prime],
+            nowPlayingTitle: "Prime Video: The Traitors - Season 2",
+            nowPlayingArtist: "Tanmay Bhat",
+            preferredURL: youtube.url,
+            platform: .primeVideo
+        )
+        #expect(pickedPrime?.url.contains("primevideo.com") == true)
+
+        let pickedYouTube = BrowserMediaNavigator.pick(
+            from: [youtube, prime],
+            nowPlayingTitle: "TRAITORS LEAKED FOOTAGE?!?!",
+            nowPlayingArtist: "Tanmay Bhat",
+            preferredURL: prime.url,
+            platform: .youtube
+        )
+        #expect(pickedYouTube?.url.contains("youtube.com/watch") == true)
+    }
+
+    @Test func streamingPlatformFamiliesDoNotCrossServices() {
+        #expect(StreamingPlatform.isSameFamily(.youtube, .youtubeMusic))
+        #expect(StreamingPlatform.isSameFamily(.primeVideo, .primeVideo))
+        #expect(!StreamingPlatform.isSameFamily(.primeVideo, .youtube))
+        #expect(!StreamingPlatform.isSameFamily(.netflix, .primeVideo))
+        #expect(
+            StreamingPlatform.titleHint(title: "Prime Video: The Traitors - Season 2")
+                == .primeVideo
+        )
+        #expect(
+            StreamingPlatform.titleHint(title: "TRAITORS LEAKED FOOTAGE?!?!") == nil
+        )
+        #expect(
+            StreamingPlatform.sourceURLCompatible(
+                "https://www.youtube.com/watch?v=abc",
+                withTitleHint: nil
+            )
+        )
+        #expect(
+            !StreamingPlatform.sourceURLCompatible(
+                "https://www.primevideo.com/detail/0NPUDV12CFZ3EA8Z5WJZFNIDIS",
+                withTitleHint: nil
+            )
+        )
+    }
+
+    @Test func browserActivationSelectsTheMatchedWindowNotWindowListPositionOne() {
+        let tab = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 4,
+            tabID: 1530773650,
+            title: "Prime Video: The Traitors - Season 2",
+            url: "https://www.primevideo.com/detail/0NPUDV12CFZ3EA8Z5WJZFNIDIS"
+        )
+        let chrome = BrowserMediaNavigator.activationAppleScript(
+            tab: tab,
+            bundleID: "com.google.Chrome"
+        )
+        #expect(chrome.contains("set active tab index of window id winID to tabIdx"))
+        #expect(chrome.contains("set index of window id winID to 1"))
+        #expect(!chrome.contains("set active tab index of window 1 to t"))
+        #expect(!chrome.contains("set active tab index of window w to t"))
+        let safari = BrowserMediaNavigator.activationAppleScript(
+            tab: tab,
+            bundleID: "com.apple.Safari"
+        )
+        #expect(safari.contains("tell window id winID to set current tab to tab tabIdx"))
+        #expect(!safari.contains("tell window 1 to set current tab"))
+    }
+
     @Test func browserMediaPickerPrefersYouTubeMusicHomeOverUnrelatedTabs() {
         let gmail = BrowserMediaNavigator.Tab(
             windowIndex: 1,
@@ -3220,6 +3397,52 @@ struct Dynamic_IslandTests {
             platform: nil
         )
         #expect(picked?.url.contains("music.youtube.com") == true)
+    }
+
+    @Test func browserMediaPickerDropsStaleYouTubeWatchWhenMusicStarts() {
+        let watch = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 1,
+            tabID: 11,
+            title: "(14128) HE'S TOO GOOD! | Zhao Xintong vs Michael Holt",
+            url: "https://www.youtube.com/watch?v=MyHUI_r79Ws"
+        )
+        let music = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 1,
+            tabID: 90,
+            title: "YouTube Music",
+            url: "https://music.youtube.com/"
+        )
+        let picked = BrowserMediaNavigator.pick(
+            from: [watch, music],
+            nowPlayingTitle: "Sanson Ki Mala Pe Rock/Metal Remix",
+            nowPlayingArtist: "The Introvert Boy",
+            preferredURL: watch.url,
+            platform: .youtube
+        )
+        #expect(picked?.url.contains("music.youtube.com") == true)
+
+        let stillWatching = BrowserMediaNavigator.pick(
+            from: [watch, music],
+            nowPlayingTitle: "HE'S TOO GOOD!",
+            nowPlayingArtist: "WST",
+            preferredURL: watch.url,
+            platform: .youtube
+        )
+        #expect(stillWatching?.url.contains("watch?v=MyHUI_r79Ws") == true)
+    }
+
+    @Test func youtubeSameTrackDoesNotBindMusicTitleToUnrelatedWatchTab() {
+        let watch = "(14128) HE'S TOO GOOD! 🔥 | Zhao Xintong vs Michael Holt"
+        let music = "Sanson Ki Mala Pe Rock/Metal Remix Legendary Ust"
+        #expect(!YouTubeTabPicker.titlesMatchSameTrack(watch, music))
+        #expect(
+            YouTubeTabPicker.titlesMatchSameTrack(
+                watch,
+                "HE'S TOO GOOD! 🔥 | Zhao Xintong vs Michael Holt"
+            )
+        )
     }
 
     @Test func browserMediaPickerUsesPlaybackURLWhenPageTitleIsGeneric() {
@@ -3323,6 +3546,50 @@ struct Dynamic_IslandTests {
         #expect(
             IslandClickPolicy.action(
                 pointFromTopLeft: CGPoint(x: 168, y: 160),
+                islandSize: expanded,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true
+            ) == .playPause
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 168, y: 118),
+                islandSize: expanded,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true
+            ) == .playPause
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 100, y: 160),
+                islandSize: expanded,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true
+            ) == .skipBack
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 230, y: 160),
+                islandSize: expanded,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true
+            ) == .skipForward
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 168, y: 110),
                 islandSize: expanded,
                 notchHeight: 32,
                 isExpanded: true,

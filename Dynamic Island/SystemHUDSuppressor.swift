@@ -4,12 +4,14 @@ import CoreGraphics
 import Foundation
 
 /// Hides the native macOS volume / brightness / Focus bezel while the island
-/// is announcing the same event. Does not hide Notification Center or chat.
+/// is announcing the same event. Low Battery also hides the Mac's own
+/// battery alert. Chat and unrelated Notification Center banners stay.
 final class SystemHUDSuppressor {
     static let shared = SystemHUDSuppressor()
 
     private var started = false
     private var launchObserver: NSObjectProtocol?
+    private var lowBatteryHideTimer: Timer?
 
     private init() {}
 
@@ -38,6 +40,21 @@ final class SystemHUDSuppressor {
                 self?.hideNativeHUD()
             }
         }
+    }
+
+    func suppressNativeLowBatteryAlert() {
+        hideNativeLowBatteryAlert()
+        lowBatteryHideTimer?.invalidate()
+        var ticks = 0
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] timer in
+            ticks += 1
+            self?.hideNativeLowBatteryAlert()
+            if ticks >= 24 {
+                timer.invalidate()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        lowBatteryHideTimer = timer
     }
 
     func hideNativeHUD() {
@@ -83,6 +100,107 @@ final class SystemHUDSuppressor {
         for pid in pids {
             hideBannerWindows(pid: pid)
         }
+    }
+
+    private func hideNativeLowBatteryAlert() {
+        hideBatteryAlertApps()
+        hideMatchingLowBatteryWindows()
+    }
+
+    private func hideBatteryAlertApps() {
+        for app in NSWorkspace.shared.runningApplications {
+            guard SystemHUDDSP.isBatteryAlertHelper(
+                bundleID: app.bundleIdentifier,
+                localizedName: app.localizedName
+            ) else { continue }
+            app.hide()
+            AXUIElementSetAttributeValue(
+                AXUIElementCreateApplication(app.processIdentifier),
+                kAXHiddenAttribute as CFString,
+                kCFBooleanTrue
+            )
+        }
+    }
+
+    private func hideMatchingLowBatteryWindows() {
+        var pids = Set<pid_t>()
+        if let info = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] {
+            for window in info {
+                let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+                let title = window[kCGWindowName as String] as? String ?? ""
+                let boundsDict = window[kCGWindowBounds as String] as? [String: CGFloat]
+                let bounds = CGRect(
+                    x: boundsDict?["X"] ?? 0,
+                    y: boundsDict?["Y"] ?? 0,
+                    width: boundsDict?["Width"] ?? 0,
+                    height: boundsDict?["Height"] ?? 0
+                )
+                guard SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                    owner: owner,
+                    title: title,
+                    bounds: bounds
+                ) else { continue }
+                if let pid = window[kCGWindowOwnerPID as String] as? pid_t {
+                    pids.insert(pid)
+                }
+            }
+        }
+        for app in NSWorkspace.shared.runningApplications {
+            if SystemHUDDSP.isBatteryAlertHelper(
+                bundleID: app.bundleIdentifier,
+                localizedName: app.localizedName
+            ) {
+                pids.insert(app.processIdentifier)
+                continue
+            }
+            let id = (app.bundleIdentifier ?? "").lowercased()
+            let name = (app.localizedName ?? "").lowercased()
+            if id.contains("notificationcenter") || name.contains("notification center")
+                || name.contains("notification centre") {
+                pids.insert(app.processIdentifier)
+            }
+        }
+        guard AXIsProcessTrusted() else { return }
+        for pid in pids {
+            hideLowBatteryWindows(pid: pid)
+        }
+    }
+
+    private func hideLowBatteryWindows(pid: pid_t) {
+        let app = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement]
+        else { return }
+
+        for window in windows {
+            let title = axString(window, kAXTitleAttribute as CFString)
+                ?? axString(window, kAXDescriptionAttribute as CFString)
+                ?? ""
+            let bounds = axFrame(window)
+            let running = NSRunningApplication(processIdentifier: pid)
+            let ownerIsBattery = SystemHUDDSP.isBatteryAlertHelper(
+                bundleID: running?.bundleIdentifier,
+                localizedName: running?.localizedName
+            )
+            let matches = ownerIsBattery
+                || SystemHUDDSP.looksLikeNativeLowBatteryAlert(
+                    owner: running?.localizedName ?? "",
+                    title: title,
+                    bounds: bounds
+                )
+            guard matches else { continue }
+            AXUIElementSetAttributeValue(window, kAXHiddenAttribute as CFString, kCFBooleanTrue)
+            closeWindowIfPossible(window)
+        }
+    }
+
+    private func axString(_ element: AXUIElement, _ attribute: CFString) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else {
+            return nil
+        }
+        return value as? String
     }
 
     private func hideBannerWindows(pid: pid_t) {
