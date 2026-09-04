@@ -1776,6 +1776,19 @@ struct Dynamic_IslandTests {
         #expect(BrowserMediaNavigator.parsePlaybackProbe("1") == true)
         #expect(BrowserMediaNavigator.parsePlaybackProbe("unknown") == nil)
         #expect(BrowserMediaNavigator.parsePlaybackProbe("no-media") == nil)
+        #expect(
+            BrowserMediaNavigator.classifyJavaScriptReturn("no-tab") == .missingTab
+        )
+        #expect(
+            BrowserMediaNavigator.classifyJavaScriptReturn("paused") == .success("paused")
+        )
+        #expect(
+            BrowserMediaNavigator.classifyJavaScriptReturn("no-player") == .failed
+        )
+        #expect(
+            BrowserMediaNavigator.classifyJavaScriptReturn("err:JavaScript from Apple Events")
+                == .needsPermission
+        )
     }
 
     @Test func audioAmplitudeRMSOfSilenceIsZero() {
@@ -3441,6 +3454,30 @@ struct Dynamic_IslandTests {
             YouTubeTabPicker.titlesMatchSameTrack(
                 watch,
                 "HE'S TOO GOOD! 🔥 | Zhao Xintong vs Michael Holt"
+            )
+        )
+        #expect(YouTubeTabPicker.isGenericYouTubeDocumentTitle("(14135) YouTube"))
+        #expect(YouTubeTabPicker.isGenericYouTubeDocumentTitle("(1) YouTube Music"))
+        #expect(
+            YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: "(14135) YouTube",
+                tabURL: "https://www.youtube.com/watch?v=sYWpPlR6Cd8",
+                nowPlayingTitle: "THAT'S WHY HE'LL BE NUMBER ONE! | Zhao X"
+            )
+        )
+        #expect(
+            YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: "WHO HOLDS THEIR NERVE? Chris Wakelin vs Ronnie",
+                tabURL: "https://www.youtube.com/watch?v=6p179tTNPxQ",
+                nowPlayingTitle: "WINNING IS HARD! Wu Yize vs Liu Hongyu",
+                allowStaleDocumentTitle: true
+            )
+        )
+        #expect(
+            !YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: "WHO HOLDS THEIR NERVE? Chris Wakelin vs Ronnie",
+                tabURL: "https://www.youtube.com/watch?v=6p179tTNPxQ",
+                nowPlayingTitle: "WINNING IS HARD! Wu Yize vs Liu Hongyu"
             )
         )
     }
