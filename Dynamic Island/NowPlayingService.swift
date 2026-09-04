@@ -53,7 +53,12 @@ final class NowPlayingService: ObservableObject {
 
     @Published private(set) var snapshot = Snapshot()
 
-    private let mediaQueue = DispatchQueue(label: "island.mediaremote", qos: .userInitiated)
+    private static let mediaQueueKey = DispatchSpecificKey<UInt8>()
+    private let mediaQueue: DispatchQueue = {
+        let queue = DispatchQueue(label: "island.mediaremote", qos: .userInitiated)
+        queue.setSpecific(key: NowPlayingService.mediaQueueKey, value: 1)
+        return queue
+    }()
     private var lastArtworkKey: String = ""
     private var lastArtwork: NSImage?
 
@@ -84,6 +89,10 @@ final class NowPlayingService: ObservableObject {
     private var lastHTMLPlaybackProbeAt: TimeInterval = 0
     private var ignoreHTMLProbeUntil: TimeInterval = 0
     private var htmlProbeInFlight = false
+    private let probeGate = NSLock()
+    private var sourceResolveDepth = 0
+    /// MediaRemote keeps the closed tab's title; ignore it until a live tab binds.
+    private var staleClosedBrowserSessionKey: String = ""
     private var transportGeneration = 0
     private var lastSpotifyProbeAt: TimeInterval = 0
     private var preferSpotifyUntil: TimeInterval = 0
@@ -91,7 +100,7 @@ final class NowPlayingService: ObservableObject {
     private var lastBrowserPlayAt: TimeInterval = 0
     private var spotifyProbeWasPlaying = false
     private let spotifyProbeQueue = DispatchQueue(label: "island.spotify-probe")
-    private static let htmlPlaybackProbeInterval: TimeInterval = 1.0
+    private static let htmlPlaybackProbeInterval: TimeInterval = 0.35
     private static let spotifyBundleID = "com.spotify.client"
 
     private var listenerProcess: Process?
@@ -101,6 +110,8 @@ final class NowPlayingService: ObservableObject {
     private var lastElapsedWallTime: TimeInterval?
     private var listenerRestartScheduled = false
     private var revealInFlight = false
+    private let posterQueue = DispatchQueue(label: "island.youtube-poster")
+    private var posterFetchGeneration = 0
 
     private static let ignoreSIGPIPE: Void = {
         signal(SIGPIPE, SIG_IGN)
@@ -658,6 +669,16 @@ final class NowPlayingService: ObservableObject {
         lastBoundWatchTitle = ""
     }
 
+    private func browserSessionKey(bundleID: String, title: String) -> String {
+        "\(bundleID)|\(title)"
+    }
+
+    private func clearIslandBecauseSourceTabClosed() {
+        let key = browserSessionKey(bundleID: activeBundleID, title: activeTitle)
+        staleClosedBrowserSessionKey = key
+        clearNowPlaying()
+    }
+
     /// Chrome MediaRemote keeps broadcasting a still-playing youtube.com/watch
     /// tab after the user started YouTube Music. Stay on Music until it pauses.
     private func shouldIgnoreStaleYouTubeWatchNowPlaying(title: String, bundleID: String) -> Bool {
@@ -679,6 +700,16 @@ final class NowPlayingService: ObservableObject {
         let album = payload.album ?? ""
         let appName = payload.applicationName ?? ""
         let bundleID = payload.bundleIdentifier ?? ""
+        let sessionKey = browserSessionKey(bundleID: bundleID, title: title)
+        if isBrowserBundle(bundleID),
+           !staleClosedBrowserSessionKey.isEmpty,
+           staleClosedBrowserSessionKey == sessionKey,
+           lastMediaSourceTab == nil {
+            return
+        }
+        if !staleClosedBrowserSessionKey.isEmpty, staleClosedBrowserSessionKey != sessionKey {
+            staleClosedBrowserSessionKey = ""
+        }
         if Date().timeIntervalSince1970 < preferSpotifyUntil,
            isBrowserBundle(bundleID),
            bundleID != Self.spotifyBundleID {
@@ -721,10 +752,7 @@ final class NowPlayingService: ObservableObject {
 
         if !isBrowserBundle(bundleID) {
             htmlPlaybackOverride = nil
-            lastMediaSourceTab = nil
-            lastYouTubeControlURL = ""
-            lastMediaSourceURL = ""
-            lastMediaSourcePageTitle = ""
+            clearBrowserSource()
         }
 
         let previousBundleID = activeBundleID
@@ -746,23 +774,26 @@ final class NowPlayingService: ObservableObject {
             artist: artist,
             title: title
         )
+        let cachedStillMatches = YouTubeTabPicker.tabMatchesNowPlaying(
+            tabTitle: lastMediaSourceTab?.title ?? lastMediaSourcePageTitle,
+            nowPlayingTitle: title,
+            nowPlayingArtist: artist,
+            tabURL: lastMediaSourceURL,
+            nowPlayingHint: incomingHint
+        )
+        let platformChanged = !StreamingPlatform.sourceURLCompatible(
+            lastMediaSourceURL,
+            withTitleHint: incomingHint
+        )
         if identityChanged {
             lastListedIdentity = identity
-            let cachedStillMatches = YouTubeTabPicker.tabMatchesNowPlaying(
-                tabTitle: lastMediaSourceTab?.title ?? lastMediaSourcePageTitle,
-                nowPlayingTitle: title,
-                nowPlayingArtist: artist,
-                tabURL: lastMediaSourceURL,
-                nowPlayingHint: incomingHint
-            )
-            let platformChanged = !StreamingPlatform.sourceURLCompatible(
-                lastMediaSourceURL,
-                withTitleHint: incomingHint
-            )
-            if bundleID != previousBundleID || !cachedStillMatches || platformChanged {
+            if bundleID != previousBundleID || platformChanged {
+                clearBrowserSource()
+            } else if !cachedStillMatches {
+                // Same tab, new video — keep window/tab indices so we can
+                // re-read location.href instead of waiting on activeTab.
                 lastMediaSourceURL = ""
                 lastMediaSourcePageTitle = ""
-                lastMediaSourceTab = nil
                 lastYouTubeControlURL = ""
             }
         }
@@ -779,23 +810,33 @@ final class NowPlayingService: ObservableObject {
             metadataTitle: album,
             platform: currentPlatform
         )
+        let needsRescanForNewIdentity = identityChanged && (
+            lastMediaSourceURL.isEmpty
+                || !cachedStillMatches
+                || platformChanged
+                || bundleID != previousBundleID
+        )
         let shouldScanBrowser = isBrowserBundle(bundleID)
             && (
-                identityChanged
+                needsRescanForNewIdentity
                     || (
-                        (lastMediaSourceURL.isEmpty || needsOTTContentTitle)
+                        !identityChanged
+                            && (lastMediaSourceURL.isEmpty || needsOTTContentTitle)
                             && now - lastBrowserScanAt >= 2
                     )
             )
-        if shouldScanBrowser {
+        if shouldScanBrowser, !isSourceResolveInFlight() {
             lastBrowserScanAt = now
             let remote = artwork
             let key = artKey
             let cachedTab = lastMediaSourceTab
+                ?? (snapshot.bundleIdentifier == bundleID ? snapshot.sourceTab : nil)
+            beginSourceResolve()
             // Tab listing and poster downloads must not sit on mediaQueue —
             // play/pause/skip wait there and stall for seconds. Keep this off
             // the chat AppleScript thread too — listTabs contends with polling.
             AppleScriptRunLoop.media.async { [weak self] in
+                defer { self?.endSourceResolve() }
                 self?.resolveBrowserSourceIfNeeded(
                     title: title,
                     artist: artist,
@@ -854,13 +895,31 @@ final class NowPlayingService: ObservableObject {
             duration: max(0, duration),
             artwork: prepared.image,
             hasMedia: true,
-            sourceURL: artworkURL.isEmpty ? lastYouTubeControlURL : artworkURL,
-            sourcePageTitle: lastMediaSourcePageTitle,
-            sourceTab: lastMediaSourceTab,
+            sourceURL: artworkURL.isEmpty
+                ? (lastYouTubeControlURL.isEmpty && snapshot.bundleIdentifier == bundleID
+                    ? snapshot.sourceURL
+                    : lastYouTubeControlURL)
+                : artworkURL,
+            sourcePageTitle: lastMediaSourcePageTitle.isEmpty && snapshot.bundleIdentifier == bundleID
+                ? snapshot.sourcePageTitle
+                : lastMediaSourcePageTitle,
+            sourceTab: lastMediaSourceTab
+                ?? (snapshot.bundleIdentifier == bundleID ? snapshot.sourceTab : nil),
             artworkToken: prepared.token
         )
         DispatchQueue.main.async {
-            self.snapshot = next
+            var merged = next
+            if merged.sourceTab == nil,
+               self.snapshot.bundleIdentifier == next.bundleIdentifier {
+                merged.sourceTab = self.snapshot.sourceTab
+                if merged.sourceURL.isEmpty {
+                    merged.sourceURL = self.snapshot.sourceURL
+                }
+                if merged.sourcePageTitle.isEmpty {
+                    merged.sourcePageTitle = self.snapshot.sourcePageTitle
+                }
+            }
+            self.snapshot = merged
         }
     }
 
@@ -940,18 +999,26 @@ final class NowPlayingService: ObservableObject {
         if id == lastYouTubePosterID, let cached = lastYouTubePosterImage {
             return cached
         }
-        let files = ["mqdefault.jpg", "hq720.jpg", "hqdefault.jpg"]
+        let files = ["mqdefault.jpg", "hqdefault.jpg"]
         for file in files {
-            guard let url = URL(string: "https://i.ytimg.com/vi/\(id)/\(file)"),
-                  let data = try? Data(contentsOf: url),
-                  let image = NSImage(data: data) else {
-                continue
+            guard let url = URL(string: "https://i.ytimg.com/vi/\(id)/\(file)") else { continue }
+            var request = URLRequest(url: url, timeoutInterval: 1.5)
+            request.cachePolicy = .returnCacheDataElseLoad
+            let sem = DispatchSemaphore(value: 0)
+            var image: NSImage?
+            URLSession.shared.dataTask(with: request) { data, _, _ in
+                defer { sem.signal() }
+                guard let data, let loaded = NSImage(data: data) else { return }
+                let px = MediaClient.pixelSize(of: loaded)
+                guard px.width >= 240, px.height >= 140 else { return }
+                image = loaded
+            }.resume()
+            _ = sem.wait(timeout: .now() + 1.6)
+            if let image {
+                lastYouTubePosterID = id
+                lastYouTubePosterImage = image
+                return image
             }
-            let px = MediaClient.pixelSize(of: image)
-            guard px.width >= 240, px.height >= 140 else { continue }
-            lastYouTubePosterID = id
-            lastYouTubePosterImage = image
-            return image
         }
         return nil
     }
@@ -987,7 +1054,8 @@ final class NowPlayingService: ObservableObject {
         bundleID: String,
         appName: String,
         artist: String,
-        tab: BrowserMediaNavigator.Tab
+        tab: BrowserMediaNavigator.Tab,
+        allowStaleDocumentTitle: Bool = false
     ) -> Bool {
         let titleHint = StreamingPlatform.titleHint(
             bundleID: bundleID,
@@ -1003,31 +1071,16 @@ final class NowPlayingService: ObservableObject {
             if url.contains("youtube.com") || url.contains("youtu.be") {
                 lastBoundWatchTitle = tab.title
             }
-            guard YouTubeTabPicker.titlesMatchSameTrack(tab.title, title) else {
+            guard YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: tab.title,
+                tabURL: url,
+                nowPlayingTitle: title,
+                allowStaleDocumentTitle: allowStaleDocumentTitle
+            ) else {
                 return false
             }
         }
-        var videoID = YouTubeTabPicker.youtubeVideoID(from: url)
-        var poster = videoID.flatMap { youtubePosterImage(videoID: $0) }
-        var artKey = videoID.map { "ytimg:\($0)" } ?? ""
-        if poster == nil, url.contains("music.youtube.com") {
-            let probe = BrowserMediaNavigator.probeYouTubeMusicPlayback(
-                on: tab,
-                bundleID: bundleID
-            )
-            if videoID == nil { videoID = probe?.videoID }
-            if poster == nil, let id = videoID {
-                poster = youtubePosterImage(videoID: id)
-                artKey = "ytimg:\(id)"
-            }
-            if poster == nil, let artURL = probe?.artworkURL {
-                poster = imageFromRemoteArtworkURL(artURL)
-                if artKey.isEmpty { artKey = "ytmimg:\(artURL.prefix(64))" }
-            }
-        }
-        guard let poster else {
-            return false
-        }
+        let videoID = YouTubeTabPicker.youtubeVideoID(from: url)
         if !isMusic {
             lastBoundWatchTitle = title
         } else {
@@ -1039,19 +1092,6 @@ final class NowPlayingService: ObservableObject {
         } else {
             sourceURL = url
         }
-        let prepared = preparedArtwork(
-            remote: poster,
-            artKey: artKey.isEmpty ? "ytmimg:probed" : artKey,
-            bundleID: bundleID,
-            appName: appName,
-            artist: artist,
-            title: title,
-            url: sourceURL
-        )
-        guard prepared.image != nil else {
-            return false
-        }
-        let display = islandDisplayArtwork(prepared)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             var snap = self.snapshot
@@ -1059,12 +1099,80 @@ final class NowPlayingService: ObservableObject {
             snap.sourceURL = sourceURL
             snap.sourcePageTitle = tab.title
             snap.sourceTab = tab
-            snap.artwork = display.image
-            snap.artworkToken = display.token
             snap.isPlaying = self.activeIsPlaying
             self.snapshot = snap
         }
+        requestYouTubePoster(
+            videoID: videoID,
+            url: url,
+            title: title,
+            bundleID: bundleID,
+            appName: appName,
+            artist: artist,
+            tab: tab,
+            sourceURL: sourceURL
+        )
         return true
+    }
+
+    private func requestYouTubePoster(
+        videoID: String?,
+        url: String,
+        title: String,
+        bundleID: String,
+        appName: String,
+        artist: String,
+        tab: BrowserMediaNavigator.Tab,
+        sourceURL: String
+    ) {
+        posterFetchGeneration += 1
+        let generation = posterFetchGeneration
+        posterQueue.async { [weak self] in
+            var id = videoID
+            var poster = id.flatMap { self?.youtubePosterImage(videoID: $0) }
+            var artKey = id.map { "ytimg:\($0)" } ?? ""
+            if poster == nil, url.contains("music.youtube.com"), let self {
+                let probe = BrowserMediaNavigator.probeYouTubeMusicPlayback(
+                    on: tab,
+                    bundleID: bundleID
+                )
+                if id == nil { id = probe?.videoID }
+                if poster == nil, let found = id {
+                    poster = self.youtubePosterImage(videoID: found)
+                    artKey = "ytimg:\(found)"
+                }
+                if poster == nil, let artURL = probe?.artworkURL {
+                    poster = self.imageFromRemoteArtworkURL(artURL)
+                    if artKey.isEmpty { artKey = "ytmimg:\(artURL.prefix(64))" }
+                }
+            }
+            guard let poster, let self else { return }
+            self.mediaQueue.async {
+                guard generation == self.posterFetchGeneration else { return }
+                let prepared = self.preparedArtwork(
+                    remote: poster,
+                    artKey: artKey.isEmpty ? "ytmimg:probed" : artKey,
+                    bundleID: bundleID,
+                    appName: appName,
+                    artist: artist,
+                    title: title,
+                    url: sourceURL
+                )
+                guard prepared.image != nil else { return }
+                let display = self.islandDisplayArtwork(prepared)
+                DispatchQueue.main.async {
+                    var snap = self.snapshot
+                    guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+                    snap.sourceURL = sourceURL
+                    snap.sourcePageTitle = tab.title
+                    snap.sourceTab = tab
+                    snap.artwork = display.image
+                    snap.artworkToken = display.token
+                    snap.isPlaying = self.activeIsPlaying
+                    self.snapshot = snap
+                }
+            }
+        }
     }
 
     @discardableResult
@@ -1076,7 +1184,8 @@ final class NowPlayingService: ObservableObject {
         appName: String,
         remoteArtwork: NSImage?,
         artKey: String,
-        titleHint: StreamingPlatform?
+        titleHint: StreamingPlatform?,
+        allowStaleDocumentTitle: Bool = false
     ) -> Bool {
         guard StreamingPlatform.sourceURLCompatible(candidate.url, withTitleHint: titleHint) else {
             return false
@@ -1089,7 +1198,8 @@ final class NowPlayingService: ObservableObject {
                 bundleID: bundleID,
                 appName: appName,
                 artist: artist,
-                tab: candidate
+                tab: candidate,
+                allowStaleDocumentTitle: allowStaleDocumentTitle
             ) else {
                 return false
             }
@@ -1101,6 +1211,13 @@ final class NowPlayingService: ObservableObject {
             lastMediaSourcePageTitle = candidate.title
             lastMediaSourceTab = candidate
             lastYouTubeControlURL = candidate.url
+            staleClosedBrowserSessionKey = ""
+            rememberBrowserSourceOnMediaQueue(
+                tab: candidate,
+                url: lastMediaSourceURL,
+                pageTitle: candidate.title,
+                youtubeControlURL: candidate.url
+            )
             return true
         }
         let titleHit = YouTubeTabPicker.titlesMatchSameTrack(candidate.title, title)
@@ -1112,6 +1229,13 @@ final class NowPlayingService: ObservableObject {
         lastMediaSourcePageTitle = candidate.title
         lastMediaSourceTab = candidate
         lastYouTubeControlURL = ""
+        staleClosedBrowserSessionKey = ""
+        rememberBrowserSourceOnMediaQueue(
+            tab: candidate,
+            url: candidate.url,
+            pageTitle: candidate.title,
+            youtubeControlURL: ""
+        )
         let prepared = preparedArtwork(
             remote: remoteArtwork,
             artKey: artKey,
@@ -1137,6 +1261,33 @@ final class NowPlayingService: ObservableObject {
         return true
     }
 
+    private func clearBrowserSource() {
+        lastMediaSourceURL = ""
+        lastMediaSourcePageTitle = ""
+        lastMediaSourceTab = nil
+        lastYouTubeControlURL = ""
+    }
+
+    private func rememberBrowserSourceOnMediaQueue(
+        tab: BrowserMediaNavigator.Tab,
+        url: String,
+        pageTitle: String,
+        youtubeControlURL: String
+    ) {
+        let apply = { [self] in
+            lastMediaSourceTab = tab
+            lastMediaSourceURL = url
+            lastMediaSourcePageTitle = pageTitle
+            lastYouTubeControlURL = youtubeControlURL
+            staleClosedBrowserSessionKey = ""
+        }
+        if DispatchQueue.getSpecific(key: Self.mediaQueueKey) != nil {
+            apply()
+        } else {
+            mediaQueue.sync(execute: apply)
+        }
+    }
+
     private func resolveBrowserSourceIfNeeded(
         title: String,
         artist: String,
@@ -1152,26 +1303,24 @@ final class NowPlayingService: ObservableObject {
             artist: artist,
             title: title
         )
-        if let active = BrowserMediaNavigator.activeTab(bundleID: bundleID),
-           bindFastBrowserTab(
-            active,
-            title: title,
-            artist: artist,
-            bundleID: bundleID,
-            appName: appName,
-            remoteArtwork: remoteArtwork,
-            artKey: artKey,
-            titleHint: titleHint
-           ) {
-            return
+        let tryCached: () -> BrowserMediaNavigator.Tab? = {
+            cachedTab.flatMap {
+                BrowserMediaNavigator.tab(
+                    bundleID: bundleID,
+                    windowIndex: $0.windowIndex,
+                    tabIndex: $0.tabIndex
+                )
+            }
         }
-        if let cached = cachedTab.flatMap({
-            BrowserMediaNavigator.tab(
-                bundleID: bundleID,
-                windowIndex: $0.windowIndex,
-                tabIndex: $0.tabIndex
-            )
-        }),
+        let sameTab: (BrowserMediaNavigator.Tab) -> Bool = { candidate in
+            guard let cachedTab else { return false }
+            if cachedTab.tabID != 0, candidate.tabID != 0 {
+                return cachedTab.tabID == candidate.tabID
+            }
+            return cachedTab.windowIndex == candidate.windowIndex
+                && cachedTab.tabIndex == candidate.tabIndex
+        }
+        if let cached = tryCached(),
            bindFastBrowserTab(
             cached,
             title: title,
@@ -1180,9 +1329,25 @@ final class NowPlayingService: ObservableObject {
             appName: appName,
             remoteArtwork: remoteArtwork,
             artKey: artKey,
-            titleHint: titleHint
+            titleHint: titleHint,
+            allowStaleDocumentTitle: true
            ) {
             return
+        }
+        if let active = BrowserMediaNavigator.activeTab(bundleID: bundleID) {
+            if bindFastBrowserTab(
+                active,
+                title: title,
+                artist: artist,
+                bundleID: bundleID,
+                appName: appName,
+                remoteArtwork: remoteArtwork,
+                artKey: artKey,
+                titleHint: titleHint,
+                allowStaleDocumentTitle: sameTab(active)
+            ) {
+                return
+            }
         }
         let tabs = BrowserMediaNavigator.listTabs(bundleID: bundleID)
         let hinted = titleHint ?? StreamingPlatform.from(url: lastMediaSourceURL)
@@ -1219,6 +1384,15 @@ final class NowPlayingService: ObservableObject {
         lastMediaSourceURL = tab.url
         lastMediaSourcePageTitle = sourcePageTitle
         lastMediaSourceTab = tab
+        staleClosedBrowserSessionKey = ""
+        rememberBrowserSourceOnMediaQueue(
+            tab: tab,
+            url: tab.url,
+            pageTitle: sourcePageTitle,
+            youtubeControlURL: tab.url.contains("youtube.com") || tab.url.contains("youtu.be")
+                ? tab.url
+                : ""
+        )
         if !pickedMusic, StreamingPlatform.from(url: tab.url) == .youtube {
             lastBoundWatchTitle = title
         }
@@ -1256,6 +1430,12 @@ final class NowPlayingService: ObservableObject {
                 ? "https://music.youtube.com/watch?v=\(videoID)"
                 : tab.url
             lastYouTubeControlURL = lastMediaSourceURL
+            rememberBrowserSourceOnMediaQueue(
+                tab: tab,
+                url: lastMediaSourceURL,
+                pageTitle: sourcePageTitle,
+                youtubeControlURL: lastYouTubeControlURL
+            )
         }
         let pixels = MediaClient.pixelSize(of: remote)
         let alreadyThumb = MediaArtworkPolicy.isLikelyVideoThumbnail(
@@ -1268,13 +1448,54 @@ final class NowPlayingService: ObservableObject {
                     pixelHeight: pixels.height
                 )
         )
-        if !alreadyThumb, let videoID, let poster = youtubePosterImage(videoID: videoID) {
-            remote = poster
-            key = "ytimg:\(videoID)"
-        } else if !alreadyThumb, let artURL = musicProbe?.artworkURL,
-                  let image = imageFromRemoteArtworkURL(artURL) {
-            remote = image
-            key = "ytmimg:\(artURL.prefix(64))"
+        if alreadyThumb {
+            let prepared = preparedArtwork(
+                remote: remote,
+                artKey: key,
+                bundleID: bundleID,
+                appName: appName,
+                artist: artist,
+                title: title,
+                url: tab.url
+            )
+            let display = islandDisplayArtwork(prepared)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                var snap = self.snapshot
+                guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+                snap.sourceURL = tab.url
+                snap.sourcePageTitle = sourcePageTitle
+                snap.sourceTab = tab
+                snap.artwork = display.image
+                snap.artworkToken = display.token
+                snap.isPlaying = self.activeIsPlaying
+                self.snapshot = snap
+            }
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            var snap = self.snapshot
+            guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+            snap.sourceURL = tab.url
+            snap.sourcePageTitle = sourcePageTitle
+            snap.sourceTab = tab
+            snap.isPlaying = self.activeIsPlaying
+            self.snapshot = snap
+        }
+        if StreamingPlatform.from(url: tab.url) == .youtube
+            || StreamingPlatform.from(url: tab.url) == .youtubeMusic {
+            requestYouTubePoster(
+                videoID: videoID,
+                url: tab.url,
+                title: title,
+                bundleID: bundleID,
+                appName: appName,
+                artist: artist,
+                tab: tab,
+                sourceURL: lastMediaSourceURL.isEmpty ? tab.url : lastMediaSourceURL
+            )
+            return
         }
         let prepared = preparedArtwork(
             remote: remote,
@@ -1356,7 +1577,7 @@ final class NowPlayingService: ObservableObject {
             // settings or briefly activating the browser.
             NSLog("[NowPlaying] browser JS permission unavailable; using MediaRemote")
             return false
-        case .failed:
+        case .failed, .missingTab:
             return false
         }
     }
@@ -1473,6 +1694,24 @@ final class NowPlayingService: ObservableObject {
         )
     }
 
+    private func beginSourceResolve() {
+        probeGate.lock()
+        sourceResolveDepth += 1
+        probeGate.unlock()
+    }
+
+    private func endSourceResolve() {
+        probeGate.lock()
+        sourceResolveDepth = max(0, sourceResolveDepth - 1)
+        probeGate.unlock()
+    }
+
+    private func isSourceResolveInFlight() -> Bool {
+        probeGate.lock()
+        defer { probeGate.unlock() }
+        return sourceResolveDepth > 0
+    }
+
     /// Chrome often leaves MediaRemote on "playing" after the page pauses.
     /// Sample the matched tab's real video/audio so the waveform can freeze.
     private func probeBrowserPlaybackIfNeeded() {
@@ -1481,33 +1720,45 @@ final class NowPlayingService: ObservableObject {
         guard now >= ignoreHTMLProbeUntil else { return }
         guard now - lastHTMLPlaybackProbeAt >= Self.htmlPlaybackProbeInterval else { return }
         guard !htmlProbeInFlight else { return }
+        guard !isSourceResolveInFlight() else { return }
         lastHTMLPlaybackProbeAt = now
         htmlProbeInFlight = true
         let bundleID = activeBundleID
         AppleScriptRunLoop.media.async { [weak self] in
-            let playing = BrowserMediaNavigator.probePlaybackPlaying(
+            if self?.isSourceResolveInFlight() == true {
+                self?.mediaQueue.async { self?.htmlProbeInFlight = false }
+                return
+            }
+            let probe = BrowserMediaNavigator.probePlayback(
                 on: tab,
                 bundleID: bundleID
             )
             self?.mediaQueue.async {
                 guard let self else { return }
                 self.htmlProbeInFlight = false
-                guard let playing else { return }
-                if Date().timeIntervalSince1970 < self.ignoreHTMLProbeUntil { return }
-                if playing {
-                    if !self.activeIsPlaying {
-                        self.lastBrowserPlayAt = Date().timeIntervalSince1970
+                switch probe {
+                case .missingTab:
+                    self.clearIslandBecauseSourceTabClosed()
+                    return
+                case .unknown:
+                    return
+                case .playing(let playing):
+                    if Date().timeIntervalSince1970 < self.ignoreHTMLProbeUntil { return }
+                    if playing {
+                        if !self.activeIsPlaying {
+                            self.lastBrowserPlayAt = Date().timeIntervalSince1970
+                        }
+                        self.preferSpotifyUntil = 0
                     }
-                    self.preferSpotifyUntil = 0
+                    self.htmlPlaybackOverride = playing
+                    guard playing != self.activeIsPlaying else { return }
+                    NSLog(
+                        "[NowPlaying] HTML playback %@ (MediaRemote was %@)",
+                        playing ? "playing" : "paused",
+                        self.activeIsPlaying ? "playing" : "paused"
+                    )
+                    self.publishOptimisticPlaying(playing)
                 }
-                self.htmlPlaybackOverride = playing
-                guard playing != self.activeIsPlaying else { return }
-                NSLog(
-                    "[NowPlaying] HTML playback %@ (MediaRemote was %@)",
-                    playing ? "playing" : "paused",
-                    self.activeIsPlaying ? "playing" : "paused"
-                )
-                self.publishOptimisticPlaying(playing)
             }
         }
     }
@@ -1707,7 +1958,7 @@ final class NowPlayingService: ObservableObject {
                 return .ok
             case .needsPermission:
                 return .needsPermission
-            case .failed:
+            case .failed, .missingTab:
                 break
             }
         }

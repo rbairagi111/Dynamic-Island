@@ -278,6 +278,28 @@ enum BrowserMediaNavigator {
         case success(String)
         case needsPermission
         case failed
+        case missingTab
+    }
+
+    static func classifyJavaScriptReturn(_ value: String) -> JavaScriptResult {
+        if value.hasPrefix("err:") {
+            return value.localizedCaseInsensitiveContains("javascript")
+                ? .needsPermission
+                : .failed
+        }
+        if value == "no-tab" {
+            return .missingTab
+        }
+        if value == "no-player" || value == "no-video" {
+            return .failed
+        }
+        return .success(value)
+    }
+
+    enum PlaybackProbe: Equatable {
+        case playing(Bool)
+        case unknown
+        case missingTab
     }
 
     /// True / false when the tab can see a media element or mediaSession.
@@ -296,11 +318,23 @@ enum BrowserMediaNavigator {
     /// Reads pause from the actual `<video>` / `<audio>` (and same-origin
     /// iframes). MediaRemote for Chrome often stays "playing" after the page
     /// pauses, which is what kept the island waveform animating.
-    static func probePlaybackPlaying(on tab: Tab, bundleID: String) -> Bool? {
+    static func probePlayback(on tab: Tab, bundleID: String) -> PlaybackProbe {
         switch executeJavaScript(playbackProbeJavaScript, on: tab, bundleID: bundleID) {
         case .success(let value):
-            return parsePlaybackProbe(value)
+            if let playing = parsePlaybackProbe(value) { return .playing(playing) }
+            return .unknown
         case .needsPermission, .failed:
+            return .unknown
+        case .missingTab:
+            return .missingTab
+        }
+    }
+
+    static func probePlaybackPlaying(on tab: Tab, bundleID: String) -> Bool? {
+        switch probePlayback(on: tab, bundleID: bundleID) {
+        case .playing(let playing):
+            return playing
+        case .unknown, .missingTab:
             return nil
         }
     }
@@ -620,15 +654,7 @@ enum BrowserMediaNavigator {
                 : .failed
         }
         let value = result?.stringValue ?? ""
-        if value.hasPrefix("err:") {
-            return value.localizedCaseInsensitiveContains("javascript")
-                ? .needsPermission
-                : .failed
-        }
-        if value == "no-tab" || value == "no-player" || value == "no-video" {
-            return .failed
-        }
-        return .success(value)
+        return classifyJavaScriptReturn(value)
     }
 
     private static func appleScriptEscape(_ value: String) -> String {

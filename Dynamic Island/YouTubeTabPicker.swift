@@ -136,7 +136,39 @@ enum YouTubeTabPicker {
         return x == y || x.contains(y) || y.contains(x)
     }
 
-    /// Watch, Shorts, youtu.be, and embed URLs for the same clip.
+    /// True when this Chrome YouTube tab is the Now Playing item, including a
+    /// generic "YouTube" document title on a watch/Shorts URL.
+    static func chromeTabCanBindToNowPlaying(
+        tabTitle: String,
+        tabURL: String,
+        nowPlayingTitle: String,
+        allowStaleDocumentTitle: Bool = false
+    ) -> Bool {
+        if titlesMatchSameTrack(tabTitle, nowPlayingTitle) { return true }
+        let platform = StreamingPlatform.from(url: tabURL)
+        guard platform == .youtube || platform == .youtubeMusic else { return false }
+        guard BrowserMediaNavigator.isLikelyPlaybackURL(tabURL, platform: platform) else {
+            return false
+        }
+        if allowStaleDocumentTitle { return true }
+        if titlesMatch(tabTitle, nowPlayingTitle) { return true }
+        return isGenericYouTubeDocumentTitle(tabTitle)
+    }
+
+    /// Chrome puts an unread-count badge on the tab, e.g. "(14135) YouTube".
+    static func isGenericYouTubeDocumentTitle(_ raw: String) -> Bool {
+        var t = strippingChromeNotificationBadge(raw)
+        t = normalize(t)
+        return t.isEmpty || t == "youtube" || t == "youtube music"
+    }
+
+    static func strippingChromeNotificationBadge(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("("), let end = s.firstIndex(of: ")") else { return s }
+        let inner = s[s.index(after: s.startIndex)..<end]
+        guard !inner.isEmpty, inner.allSatisfy(\.isNumber) else { return s }
+        return s[s.index(after: end)...].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
     static func youtubeVideoID(from rawURL: String) -> String? {
         let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let components = URLComponents(string: trimmed) else {
