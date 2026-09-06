@@ -119,6 +119,7 @@ extension Notification.Name {
     static let previewBrightness = Notification.Name("island.previewBrightness")
     static let previewFocusMode = Notification.Name("island.previewFocusMode")
     static let previewScreenRecording = Notification.Name("island.previewScreenRecording")
+    static let previewRecordingChat = Notification.Name("island.previewRecordingChat")
     static let previewShelfHold = Notification.Name("island.previewShelfHold")
     static let previewShelfDrop = Notification.Name("island.previewShelfDrop")
     static let previewShelfClear = Notification.Name("island.previewShelfClear")

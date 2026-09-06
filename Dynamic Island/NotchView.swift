@@ -47,6 +47,17 @@ struct NotchView: View {
         model.isScreenRecording && !model.isExpanded && !model.isOverlayActive
     }
 
+    /// Compact Now Playing + recording: artwork and waveform stay together on
+    /// the leading edge; the recording pulse stays on the trailing edge.
+    private var showsCompactRecordingMedia: Bool {
+        !model.isExpanded && model.isScreenRecording && model.persistentState == .musicPlaying
+    }
+
+    private var compactRecordingMediaSpacing: CGFloat {
+        if model.isExpanded { return 12 }
+        return showsCompactRecordingMedia ? 8 : 0
+    }
+
     private var islandStrokeColor: Color {
         showsRecordingCompactStroke
             ? IslandMetrics.recordingStroke
@@ -79,6 +90,8 @@ struct NotchView: View {
 
                 if model.isOverlayActive {
                     overlayContent
+                } else if model.showsMediaRecordingDual {
+                    mediaRecordingDual
                 } else if model.showsRecordingExpanded {
                     ScreenRecordingIsland(
                         elapsed: model.recordingElapsed,
@@ -151,6 +164,7 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.transientOverlay)
         .animation(IslandMetrics.motion, value: model.isScreenRecording)
         .animation(IslandMetrics.motion, value: model.isSelectingScreenToRecord)
+        .animation(IslandMetrics.motion, value: model.persistentState)
     }
 
     // MARK: Compact ↔ expanded now playing (same tree so text can spring in)
@@ -163,7 +177,7 @@ struct NotchView: View {
             }
 
             VStack(spacing: model.isExpanded ? 12 : 0) {
-                HStack(alignment: .center, spacing: model.isExpanded ? 12 : 0) {
+                HStack(alignment: .center, spacing: compactRecordingMediaSpacing) {
                     albumArtwork(
                         size: model.isExpanded ? 48 : IslandMetrics.compactArt,
                         cornerRadius: model.isExpanded ? 12 : 5
@@ -187,15 +201,31 @@ struct NotchView: View {
                         .transition(IslandMetrics.contentReveal)
                     }
 
-                    Spacer(minLength: model.isExpanded ? 8 : 0)
+                    if showsCompactRecordingMedia {
+                        waveformIndicator(
+                            barHeight: 13,
+                            barWidth: 1.5125,
+                            spacing: 1.5125
+                        )
+                        .matchedGeometryEffect(id: "waveform", in: island)
+                    }
 
-                    waveformIndicator(
-                        barHeight: model.isExpanded ? 22 : 13,
-                        barWidth: model.isExpanded ? 2 : 1.5125,
-                        spacing: model.isExpanded ? 2 : 1.5125
-                    )
-                    .matchedGeometryEffect(id: "waveform", in: island)
-                    .padding(.trailing, model.isExpanded ? 0 : 8)
+                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia ? 8 : 0)
+
+                    if !showsCompactRecordingMedia {
+                        waveformIndicator(
+                            barHeight: model.isExpanded ? 22 : 13,
+                            barWidth: model.isExpanded ? 2 : 1.5125,
+                            spacing: model.isExpanded ? 2 : 1.5125
+                        )
+                        .matchedGeometryEffect(id: "waveform", in: island)
+                        .padding(.trailing, model.isExpanded ? 0 : 8)
+                    }
+
+                    if showsCompactRecordingMedia {
+                        RecordingPulseDot(size: 8, blinks: true)
+                            .padding(.trailing, 10)
+                    }
                 }
                 .frame(maxHeight: model.isExpanded ? nil : .infinity)
 
@@ -229,25 +259,33 @@ struct NotchView: View {
                     .frame(height: 40)
                     .padding(.top, 8)
                     .transition(IslandMetrics.contentReveal)
-
-                    if model.showsShelfRow {
-                        ShelfTray(
-                            items: model.shelfItems,
-                            isDropTargeted: model.isDropTargeted,
-                            onTargeted: { model.setDropTargeted($0) },
-                            onDrop: { model.handleShelfDrop(providers: $0) },
-                            onRemove: model.removeShelfItem,
-                            onDragBegan: model.beginShelfDrag,
-                            onDragEnded: { id, completed in
-                                model.endShelfDrag(itemID: id, completedOutside: completed)
-                            }
-                        )
-                        .frame(height: IslandMetrics.shelfRowHeight)
-                    }
                 }
             }
             .padding(.horizontal, model.isExpanded ? IslandMetrics.expandedHorizontalPadding : 0)
-            .padding(.bottom, model.isExpanded ? IslandMetrics.expandedVerticalPadding : 0)
+            .padding(
+                .bottom,
+                model.isExpanded && !model.showsShelfRow
+                    ? IslandMetrics.expandedVerticalPadding
+                    : 0
+            )
+
+            if model.isExpanded, model.showsShelfRow {
+                ShelfTray(
+                    items: model.shelfItems,
+                    isDropTargeted: model.isDropTargeted,
+                    onTargeted: { model.setDropTargeted($0) },
+                    onDrop: { model.handleShelfDrop(providers: $0) },
+                    onRemove: model.removeShelfItem,
+                    onDragBegan: model.beginShelfDrag,
+                    onDragEnded: { id, completed in
+                        model.endShelfDrag(itemID: id, completedOutside: completed)
+                    }
+                )
+                .frame(height: IslandMetrics.shelfRowHeight)
+                .padding(.top, IslandMetrics.shelfIslandGap)
+                .padding(.horizontal, IslandMetrics.expandedHorizontalPadding)
+                .padding(.bottom, IslandMetrics.expandedVerticalPadding)
+            }
         }
         .frame(
             width: shapeWidth,
@@ -279,8 +317,16 @@ struct NotchView: View {
             Color.clear
                 .frame(height: IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
 
-            if model.persistentState == .musicPlaying {
-                dualActivitySplit
+            if model.showsRecordingChatDual {
+                dualActivitySplit(
+                    left: recordingSplitColumn,
+                    right: chatSplitColumn
+                )
+            } else if model.persistentState == .musicPlaying {
+                dualActivitySplit(
+                    left: musicSplitColumn,
+                    right: chatSplitColumn
+                )
             } else {
                 chatOnlyColumn
                     .padding(.horizontal, IslandMetrics.chatOverlayHorizontalPadding)
@@ -290,7 +336,24 @@ struct NotchView: View {
         .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
     }
 
-    private var dualActivitySplit: some View {
+    private var mediaRecordingDual: some View {
+        VStack(spacing: 0) {
+            Color.clear
+                .frame(height: IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
+
+            dualActivitySplit(
+                left: musicSplitColumn,
+                right: recordingSplitColumn
+            )
+        }
+        .padding(.bottom, IslandMetrics.chatOverlayBottomPadding)
+        .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+    }
+
+    private func dualActivitySplit<Left: View, Right: View>(
+        left: Left,
+        right: Right
+    ) -> some View {
         GeometryReader { geo in
             let dividerWidth: CGFloat = 1
             let usableWidth = max(0, geo.size.width - dividerWidth)
@@ -298,7 +361,7 @@ struct NotchView: View {
             let rightWidth = usableWidth * IslandMetrics.dualRightRatio
 
             HStack(alignment: .top, spacing: 0) {
-                musicSplitColumn
+                left
                     .frame(width: leftWidth)
                     .frame(maxHeight: .infinity)
 
@@ -326,7 +389,7 @@ struct NotchView: View {
                     .frame(width: dividerWidth)
                     .frame(maxHeight: .infinity)
 
-                chatSplitColumn
+                right
                     .frame(width: rightWidth)
                     .frame(maxHeight: .infinity)
             }
@@ -392,6 +455,17 @@ struct NotchView: View {
             controlButton(system: "forward.fill", iconSize: 15, side: 36, action: model.skipForward)
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var recordingSplitColumn: some View {
+        ScreenRecordingSplitColumn(
+            elapsed: model.recordingElapsed,
+            onStop: model.stopScreenRecording,
+            usesChatDualPadding: model.showsRecordingChatDual
+        )
+        .padding(.leading, model.showsRecordingChatDual ? 0 : IslandMetrics.chatOverlayColumnSpacing)
+        .padding(.trailing, model.showsRecordingChatDual ? IslandMetrics.chatOverlayColumnSpacing : 0)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var chatSplitColumn: some View {

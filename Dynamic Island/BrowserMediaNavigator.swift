@@ -52,13 +52,25 @@ enum BrowserMediaNavigator {
         }) {
             return titled.tab
         }
-        // Stale youtube.com/watch preferredURL must not beat a Music tab
-        // whose document title is still the generic "YouTube Music".
+        let watchPlayback = ranked.first {
+            $0.score >= 20
+                && StreamingPlatform.from(url: $0.tab.url) == .youtube
+                && YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                    tabTitle: $0.tab.title,
+                    tabURL: $0.tab.url,
+                    nowPlayingTitle: nowPlayingTitle
+                )
+        }?.tab
+        // Stale named youtube.com/watch must not beat Music. A generic watch
+        // tab *can* bind (new video); prefer it over paused Music home.
         if let music = ranked.first(where: {
             $0.score >= 20
                 && StreamingPlatform.from(url: $0.tab.url) == .youtubeMusic
                 && StreamingPlatform.sourceURLCompatible($0.tab.url, withTitleHint: platform)
         }) {
+            if let watchPlayback {
+                return watchPlayback
+            }
             return music.tab
         }
         return ranked.first { $0.score >= 20 }?.tab
@@ -461,53 +473,103 @@ enum BrowserMediaNavigator {
         platform: StreamingPlatform?,
         bundleID: String
     ) -> String? {
-        guard platform == .netflix || platform == .primeVideo else { return nil }
-        let provider = platform == .netflix ? "netflix" : "prime video"
+        guard let platform, platform.prefersPageContentTitle else { return nil }
+        let aliases = StreamingPlatform.playbackTitleSkipNames(platform)
+        let skipJSON = (try? JSONSerialization.data(withJSONObject: aliases)).flatMap {
+            String(data: $0, encoding: .utf8)
+        } ?? "[]"
         let javascript = """
         (() => {
-          const provider = "\(provider)";
+          const skip = \(skipJSON).map((name) => String(name).toLowerCase());
+          const isGeneric = (value) => {
+            const lower = String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            if (!lower) return true;
+            if (skip.includes(lower)) return true;
+            if (lower.includes('watch movies') || lower.includes('watch tv shows')) return true;
+            return false;
+          };
           const text = (element) => {
             if (!element) return '';
-            const raw = element.content || element.getAttribute?.('aria-label')
+            const raw = element.content || element.getAttribute?.('content')
+              || element.getAttribute?.('aria-label')
               || element.innerText || element.textContent || '';
             return String(raw).split('\\n')[0].replace(/\\s+/g, ' ').trim();
           };
           const selectors = [
             '[data-uia="video-title"] h4',
+            'h4[data-uia="video-title"]',
             '[data-uia="video-title"]',
+            '.watch-video--bottom-controls-container h4',
             '.video-title h4',
             '.video-title',
             '[class*="video-title"] h4',
             '[data-testid="title"]',
             '[class*="Title"] h1',
+            'video[aria-label]',
             'meta[property="og:title"]',
+            'meta[name="twitter:title"]',
             'h1'
           ];
-          const mediaSessionTitle = navigator.mediaSession
-            && navigator.mediaSession.metadata
-            && navigator.mediaSession.metadata.title;
-          const candidates = [mediaSessionTitle]
-            .concat(selectors.map(selector => text(document.querySelector(selector))))
-            .concat([document.title]);
-          for (const raw of candidates) {
-            const value = String(raw || '').replace(/\\s+/g, ' ').trim();
-            const lower = value.toLowerCase();
-            if (!value || lower === provider || lower === 'amazon prime video') continue;
-            if (lower.includes('watch movies') || lower.includes('watch tv shows')) continue;
-            return value;
+          const collect = (root, depth, into) => {
+            if (!root || depth > 5) return;
+            try {
+              const md = (root.defaultView || window).navigator
+                && (root.defaultView || window).navigator.mediaSession
+                && (root.defaultView || window).navigator.mediaSession.metadata;
+              if (md) {
+                into.push(md.title);
+                into.push(md.album);
+                into.push(md.artist);
+              }
+            } catch (e) {}
+            for (let i = 0; i < selectors.length; i++) {
+              try {
+                const node = root.querySelector(selectors[i]);
+                if (node) into.push(text(node));
+              } catch (e) {}
+            }
+            let nodes;
+            try { nodes = root.querySelectorAll('*'); } catch (e) { nodes = []; }
+            for (let i = 0; i < nodes.length && i < 400; i++) {
+              try {
+                if (nodes[i].shadowRoot) collect(nodes[i].shadowRoot, depth + 1, into);
+              } catch (e) {}
+            }
+            let frames;
+            try { frames = root.querySelectorAll('iframe'); } catch (e) { return; }
+            for (let i = 0; i < frames.length; i++) {
+              try {
+                const doc = frames[i].contentDocument;
+                if (doc) collect(doc, depth + 1, into);
+              } catch (e) {}
+            }
+          };
+          const candidates = [];
+          collect(document, 0, candidates);
+          try {
+            const html = document.documentElement && document.documentElement.innerHTML || '';
+            const dumped = html.match(/"videoTitle"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"/);
+            if (dumped) candidates.push(JSON.parse('"' + dumped[1] + '"'));
+          } catch (e) {}
+          candidates.push(document.title);
+          for (let i = 0; i < candidates.length; i++) {
+            const value = String(candidates[i] || '').replace(/\\s+/g, ' ').trim();
+            if (!isGeneric(value)) return value;
           }
           return 'no-title';
         })()
         """
-        guard case .success(let value) = executeJavaScript(
+        let jsResult = executeJavaScript(
             javascript,
             on: tab,
             bundleID: bundleID
-        ) else {
+        )
+        guard case .success(let value) = jsResult else {
             return nil
         }
         let title = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return title == "no-title" || title.isEmpty ? nil : title
+        let scraped = title == "no-title" || title.isEmpty ? nil : title
+        return scraped
     }
 
     struct YouTubeMusicPlayback {

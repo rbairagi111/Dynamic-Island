@@ -150,9 +150,30 @@ enum YouTubeTabPicker {
         guard BrowserMediaNavigator.isLikelyPlaybackURL(tabURL, platform: platform) else {
             return false
         }
-        if allowStaleDocumentTitle { return true }
+        if allowStaleDocumentTitle { return isGenericYouTubeDocumentTitle(tabTitle) }
         if titlesMatch(tabTitle, nowPlayingTitle) { return true }
+        // Generic "YouTube" on a watch/Shorts URL is the new video. Generic
+        // "YouTube Music" on the Music SPA is not a YouTube watch session —
+        // treating them as one family is what drops posters after Music→Watch.
+        if platform == .youtubeMusic { return false }
         return isGenericYouTubeDocumentTitle(tabTitle)
+    }
+
+    /// Cached Music home must not keep supplying artwork / HTML playing state
+    /// once Now Playing moved to youtube.com (and the reverse). Isolated from
+    /// OTT title scraping and `isSameFamily` scoring.
+    static func cachedFamilyTabCanServeNowPlaying(
+        tabTitle: String,
+        tabURL: String,
+        nowPlayingTitle: String,
+        allowStaleDocumentTitle: Bool = false
+    ) -> Bool {
+        chromeTabCanBindToNowPlaying(
+            tabTitle: tabTitle,
+            tabURL: tabURL,
+            nowPlayingTitle: nowPlayingTitle,
+            allowStaleDocumentTitle: allowStaleDocumentTitle
+        )
     }
 
     /// Chrome puts an unread-count badge on the tab, e.g. "(14135) YouTube".

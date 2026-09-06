@@ -71,6 +71,20 @@ enum ScreenRecordingDSP {
         return textIndicatesStopRecording(title)
     }
 
+    /// The system Stop control that sits in the menu bar while capturing.
+    /// Do not match the screenshot toolbar or the click-to-record overlay.
+    static func looksLikeNativeStopControl(owner: String, title: String, bounds: CGRect) -> Bool {
+        if textIndicatesStopRecording(title) {
+            return isCaptureUIOwner(owner)
+                || SystemHUDDSP.bannerOwnerNames.contains(owner)
+        }
+        guard isCaptureUIOwner(owner) else { return false }
+        if textIndicatesRecordingOverlay(title) { return false }
+        if bounds.width >= 220 || bounds.height >= 80 { return false }
+        guard bounds.width >= 18, bounds.height >= 16 else { return false }
+        return bounds.minY < 72
+    }
+
     static func isCaptureUIOwner(_ owner: String) -> Bool {
         let ownerL = owner.lowercased()
         return ownerL.contains("screencapture") || ownerL.contains("screenshot")
@@ -259,14 +273,22 @@ final class ScreenRecordingMonitor {
             DispatchQueue.main.async {
                 self.recordIntentWhileCaptureUI = result.intent
                 self.emit(result.phase)
+                if result.phase == .recording {
+                    SystemHUDSuppressor.shared.hideNativeRecordingStop()
+                }
             }
         }
     }
 
     private func emit(_ phase: ScreenCapturePhase) {
-        guard phase != lastPhase else { return }
+        let changed = phase != lastPhase
         lastPhase = phase
-        onPhaseChange?(phase)
+        if changed, phase == .recording {
+            SystemHUDSuppressor.shared.suppressNativeRecordingStop()
+        }
+        if changed {
+            onPhaseChange?(phase)
+        }
     }
 
     private static func evaluatePhase(

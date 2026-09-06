@@ -795,6 +795,14 @@ final class NowPlayingService: ObservableObject {
                 lastMediaSourceURL = ""
                 lastMediaSourcePageTitle = ""
                 lastYouTubeControlURL = ""
+                if let cached = lastMediaSourceTab,
+                   !YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                    tabTitle: cached.title,
+                    tabURL: cached.url,
+                    nowPlayingTitle: title
+                   ) {
+                    lastMediaSourceTab = nil
+                }
             }
         }
         let currentPlatform = StreamingPlatform.resolve(
@@ -831,6 +839,17 @@ final class NowPlayingService: ObservableObject {
             let key = artKey
             let cachedTab = lastMediaSourceTab
                 ?? (snapshot.bundleIdentifier == bundleID ? snapshot.sourceTab : nil)
+            let reusableCachedTab: BrowserMediaNavigator.Tab?
+            if let cached = cachedTab,
+               YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                tabTitle: cached.title,
+                tabURL: cached.url,
+                nowPlayingTitle: title
+               ) {
+                reusableCachedTab = cached
+            } else {
+                reusableCachedTab = nil
+            }
             beginSourceResolve()
             // Tab listing and poster downloads must not sit on mediaQueue —
             // play/pause/skip wait there and stall for seconds. Keep this off
@@ -844,7 +863,7 @@ final class NowPlayingService: ObservableObject {
                     appName: appName,
                     remoteArtwork: remote,
                     artKey: key,
-                    cachedTab: cachedTab
+                    cachedTab: reusableCachedTab
                 )
             }
         }
@@ -861,11 +880,13 @@ final class NowPlayingService: ObservableObject {
         )
         let policyToken = prepared.token
         if prepared.image == nil,
+           !identityChanged,
            snapshot.bundleIdentifier == bundleID,
            let held = snapshot.artwork,
            MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
             previousToken: snapshot.artworkToken,
-            policyToken: policyToken
+            policyToken: policyToken,
+            identityChanged: identityChanged
            ) {
             prepared = (held, snapshot.artworkToken)
         } else if !identityChanged,
@@ -1083,6 +1104,11 @@ final class NowPlayingService: ObservableObject {
         let videoID = YouTubeTabPicker.youtubeVideoID(from: url)
         if !isMusic {
             lastBoundWatchTitle = title
+            if let playing = BrowserMediaNavigator.probePlaybackPlaying(on: tab, bundleID: bundleID) {
+                htmlPlaybackOverride = playing
+                lastHTMLPlaybackProbeAt = Date().timeIntervalSince1970
+                activeIsPlaying = playing
+            }
         } else {
             htmlPlaybackOverride = true
         }
@@ -1192,6 +1218,17 @@ final class NowPlayingService: ObservableObject {
         }
         let tabPlatform = StreamingPlatform.from(url: candidate.url)
         if tabPlatform == .youtube || tabPlatform == .youtubeMusic {
+            let staleOK = allowStaleDocumentTitle
+                && tabPlatform == .youtube
+                && YouTubeTabPicker.isGenericYouTubeDocumentTitle(candidate.title)
+            guard YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                tabTitle: candidate.title,
+                tabURL: candidate.url,
+                nowPlayingTitle: title,
+                allowStaleDocumentTitle: staleOK
+            ) else {
+                return false
+            }
             guard applyYouTubePoster(
                 from: candidate.url,
                 title: title,
@@ -1199,7 +1236,7 @@ final class NowPlayingService: ObservableObject {
                 appName: appName,
                 artist: artist,
                 tab: candidate,
-                allowStaleDocumentTitle: allowStaleDocumentTitle
+                allowStaleDocumentTitle: staleOK
             ) else {
                 return false
             }
@@ -1225,15 +1262,28 @@ final class NowPlayingService: ObservableObject {
             BrowserMediaNavigator.isLikelyPlaybackURL(candidate.url, platform: $0)
         } ?? false
         guard titleHit || playback else { return false }
+        var pageTitle = candidate.title
+        if StreamingPlatform.needsContentTitleRefresh(
+            mediaTitle: title,
+            pageTitle: pageTitle,
+            platform: tabPlatform
+        ),
+           let scraped = BrowserMediaNavigator.playbackTitle(
+            on: candidate,
+            platform: tabPlatform,
+            bundleID: bundleID
+           ) {
+            pageTitle = scraped
+        }
         lastMediaSourceURL = candidate.url
-        lastMediaSourcePageTitle = candidate.title
+        lastMediaSourcePageTitle = pageTitle
         lastMediaSourceTab = candidate
         lastYouTubeControlURL = ""
         staleClosedBrowserSessionKey = ""
         rememberBrowserSourceOnMediaQueue(
             tab: candidate,
             url: candidate.url,
-            pageTitle: candidate.title,
+            pageTitle: pageTitle,
             youtubeControlURL: ""
         )
         let prepared = preparedArtwork(
@@ -1251,7 +1301,7 @@ final class NowPlayingService: ObservableObject {
             var snap = self.snapshot
             guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
             snap.sourceURL = candidate.url
-            snap.sourcePageTitle = candidate.title
+            snap.sourcePageTitle = pageTitle
             snap.sourceTab = candidate
             snap.artwork = display.image
             snap.artworkToken = display.token
@@ -1368,17 +1418,22 @@ final class NowPlayingService: ObservableObject {
             return
         }
 
+        let urlPlatform = StreamingPlatform.from(url: tab.url)
+        let tabPlatform = urlPlatform ?? hinted
         let sourcePageTitle = BrowserMediaNavigator.playbackTitle(
             on: tab,
-            platform: hinted ?? StreamingPlatform.from(url: tab.url),
+            platform: tabPlatform,
             bundleID: bundleID
         ) ?? tab.title
-        let pickedMusic = StreamingPlatform.from(url: tab.url) == .youtubeMusic
+        let pickedMusic = urlPlatform == .youtubeMusic
         let pickedTitle = YouTubeTabPicker.titlesMatchSameTrack(tab.title, title)
-        if !pickedMusic && !pickedTitle {
-            if StreamingPlatform.from(url: tab.url) == .youtube {
-                lastBoundWatchTitle = tab.title
-            }
+        if urlPlatform == .youtube, !pickedTitle,
+           !YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+            tabTitle: tab.title,
+            tabURL: tab.url,
+            nowPlayingTitle: title
+           ) {
+            lastBoundWatchTitle = tab.title
             return
         }
         lastMediaSourceURL = tab.url
@@ -1438,15 +1493,10 @@ final class NowPlayingService: ObservableObject {
             )
         }
         let pixels = MediaClient.pixelSize(of: remote)
-        let alreadyThumb = MediaArtworkPolicy.isLikelyVideoThumbnail(
+        let alreadyThumb = MediaArtworkPolicy.remoteArtworkAlreadyMatchesBoundTab(
+            tabPlatform: StreamingPlatform.from(url: tab.url),
             pixelWidth: pixels.width,
             pixelHeight: pixels.height
-        ) || (
-            StreamingPlatform.from(url: tab.url) == .youtubeMusic
-                && MediaArtworkPolicy.isLikelyAlbumArtwork(
-                    pixelWidth: pixels.width,
-                    pixelHeight: pixels.height
-                )
         )
         if alreadyThumb {
             let prepared = preparedArtwork(

@@ -5,7 +5,9 @@ import Foundation
 
 /// Hides the native macOS volume / brightness / Focus bezel while the island
 /// is announcing the same event. Low Battery also hides the Mac's own
-/// battery alert. Chat and unrelated Notification Center banners stay.
+/// battery alert. While a capture is in progress, the system Stop Recording
+/// control is hidden because the island already provides it. Chat and
+/// unrelated Notification Center banners stay.
 final class SystemHUDSuppressor {
     static let shared = SystemHUDSuppressor()
 
@@ -55,6 +57,21 @@ final class SystemHUDSuppressor {
         }
         RunLoop.main.add(timer, forMode: .common)
         lowBatteryHideTimer = timer
+    }
+
+    /// Hide macOS's menu-bar Stop Recording control while the island shows it.
+    func suppressNativeRecordingStop() {
+        hideNativeRecordingStop()
+        for delay in [0.04, 0.12, 0.28, 0.5, 1.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.hideNativeRecordingStop()
+            }
+        }
+    }
+
+    func hideNativeRecordingStop() {
+        hideMatchingRecordingStopWindows()
+        hideCaptureUIStopWindows()
     }
 
     func hideNativeHUD() {
@@ -224,6 +241,102 @@ final class SystemHUDSuppressor {
               let button = buttonRef
         else { return }
         AXUIElementPerformAction(unsafeBitCast(button, to: AXUIElement.self), kAXPressAction as CFString)
+    }
+
+    private func hideMatchingRecordingStopWindows() {
+        guard let info = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]] else {
+            return
+        }
+        var pids = Set<pid_t>()
+        for window in info {
+            let owner = window[kCGWindowOwnerName as String] as? String ?? ""
+            let title = window[kCGWindowName as String] as? String ?? ""
+            let boundsDict = window[kCGWindowBounds as String] as? [String: CGFloat]
+            let bounds = CGRect(
+                x: boundsDict?["X"] ?? 0,
+                y: boundsDict?["Y"] ?? 0,
+                width: boundsDict?["Width"] ?? 0,
+                height: boundsDict?["Height"] ?? 0
+            )
+            guard ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: owner,
+                title: title,
+                bounds: bounds
+            ) else { continue }
+            if let pid = window[kCGWindowOwnerPID as String] as? pid_t {
+                pids.insert(pid)
+            }
+        }
+        guard AXIsProcessTrusted() else { return }
+        for pid in pids {
+            hideRecordingStopWindows(pid: pid)
+        }
+    }
+
+    private func hideCaptureUIStopWindows() {
+        guard AXIsProcessTrusted() else { return }
+        for app in NSWorkspace.shared.runningApplications {
+            guard ScreenRecordingDSP.isCaptureUIApp(
+                bundleID: app.bundleIdentifier,
+                localizedName: app.localizedName
+            ) else { continue }
+            hideRecordingStopWindows(pid: app.processIdentifier)
+        }
+    }
+
+    private func hideRecordingStopWindows(pid: pid_t) {
+        let app = AXUIElementCreateApplication(pid)
+        var windowsRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement]
+        else { return }
+
+        for window in windows {
+            let title = axString(window, kAXTitleAttribute as CFString)
+                ?? axString(window, kAXDescriptionAttribute as CFString)
+                ?? ""
+            let bounds = axFrame(window)
+            let running = NSRunningApplication(processIdentifier: pid)
+            let owner = running?.localizedName ?? ""
+            let matches = ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: owner,
+                title: title,
+                bounds: bounds
+            ) || axTreeContainsStopRecordingButton(window, depth: 0)
+            guard matches else { continue }
+            AXUIElementSetAttributeValue(window, kAXHiddenAttribute as CFString, kCFBooleanTrue)
+        }
+    }
+
+    private func axTreeContainsStopRecordingButton(_ element: AXUIElement, depth: Int) -> Bool {
+        guard depth < 6 else { return false }
+        var roleRef: CFTypeRef?
+        var isButton = false
+        if AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleRef) == .success,
+           let role = roleRef as? String {
+            isButton = role == (kAXButtonRole as String)
+                || role == (kAXRadioButtonRole as String)
+                || role == (kAXCheckBoxRole as String)
+        }
+        if isButton {
+            let texts = [
+                axString(element, kAXTitleAttribute as CFString),
+                axString(element, kAXDescriptionAttribute as CFString),
+                axString(element, kAXHelpAttribute as CFString)
+            ].compactMap { $0 }
+            if texts.contains(where: ScreenRecordingDSP.textIndicatesStopRecording) {
+                return true
+            }
+        }
+        var childrenRef: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXChildrenAttribute as CFString,
+            &childrenRef
+        ) == .success,
+              let children = childrenRef as? [AXUIElement]
+        else { return false }
+        return children.contains { axTreeContainsStopRecordingButton($0, depth: depth + 1) }
     }
 
     private func axFrame(_ element: AXUIElement) -> CGRect {
