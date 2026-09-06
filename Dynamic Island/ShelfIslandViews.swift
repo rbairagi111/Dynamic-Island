@@ -74,8 +74,7 @@ final class ShelfTrayView: NSView {
 
     override func layout() {
         super.layout()
-        let inset: CGFloat = 8
-        let box = bounds.insetBy(dx: inset, dy: 6)
+        let box = bounds.insetBy(dx: 8, dy: 8)
         let thumb = IslandMetrics.shelfThumbSize
         var x = box.minX + 6
         let y = box.midY - thumb / 2
@@ -87,7 +86,7 @@ final class ShelfTrayView: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        let box = bounds.insetBy(dx: 8, dy: 6)
+        let box = bounds.insetBy(dx: 8, dy: 8)
         let path = NSBezierPath(roundedRect: box, xRadius: 12, yRadius: 12)
         path.lineWidth = 1
         let dash: [CGFloat] = [5, 4]

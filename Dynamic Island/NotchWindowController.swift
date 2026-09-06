@@ -284,6 +284,8 @@ final class NotchWindowController: NSWindowController {
     /// Ignore a one-frame “outside” glitch so the island cannot collapse
     /// under the pointer while a control is still hovered.
     private var outsideClickThroughStreak = 0
+    /// Previous sample so a fast swipe that tunnels through the island still expands.
+    private var lastPointerScreenPoint: NSPoint?
 
     convenience init() {
         let window = NotchWindowController.makeWindow()
@@ -430,7 +432,9 @@ final class NotchWindowController: NSWindowController {
     /// the previous desktop until another swipe.
     private func beginArrival() {
         guard islandHasAppeared, !LockScreenMonitor.shared.isLocked else { return }
-        guard !usesTightLiveActivityWindow else { return }
+        guard IslandSurfacePolicy.shouldHandleSpaceSwipe(
+            usesTightLiveActivityWindow: usesTightLiveActivityWindow
+        ) else { return }
         pinWaitGeneration += 1
         spaceAnimTimer?.invalidate()
         spaceAnimTimer = nil
@@ -504,7 +508,9 @@ final class NotchWindowController: NSWindowController {
         spaceTickRunning = true
         defer { spaceTickRunning = false }
         guard islandHasAppeared, !LockScreenMonitor.shared.isLocked else { return }
-        guard !usesTightLiveActivityWindow else { return }
+        guard IslandSurfacePolicy.shouldHandleSpaceSwipe(
+            usesTightLiveActivityWindow: usesTightLiveActivityWindow
+        ) else { return }
         guard let window, spaceRestingFrame.width > 0 else { return }
         // The timer-driven arrival owns the panel until it reaches rest.
         // WindowServer still emits the tail of a slow Space morph here; do not
@@ -970,7 +976,7 @@ final class NotchWindowController: NSWindowController {
         let screenPoint = NSEvent.mouseLocation
         if event.type == .leftMouseDown,
            viewModel.isScreenRecording,
-           viewModel.isExpanded,
+           viewModel.isExpanded || viewModel.showsRecordingChatDual,
            recordingStopHitRect.contains(screenPoint) {
             viewModel.stopScreenRecording()
             updateClickThrough(withScreenPoint: screenPoint)
@@ -1010,11 +1016,15 @@ final class NotchWindowController: NSWindowController {
             overlay: viewModel.transientOverlay,
             hasMedia: viewModel.hasMedia,
             persistentIsMusic: viewModel.persistentState == .musicPlaying,
-            showsShelf: viewModel.showsShelfRow
+            showsShelf: viewModel.showsShelfRow,
+            isScreenRecording: viewModel.isScreenRecording
         )
         switch action {
         case .passthrough:
             return false
+        case .expandRecording:
+            NSLog("[NotchWindow] island click expand recording")
+            viewModel.expandRecordingFromClick()
         case .revealNowPlaying:
             NSLog("[NotchWindow] island click reveal now playing")
             viewModel.openNowPlayingSource()
@@ -1034,39 +1044,76 @@ final class NotchWindowController: NSWindowController {
         return true
     }
 
-    /// Mirrors RecordingStopControl's 32pt frame in screen coordinates, with
-    /// a 4pt hit slop. This avoids relying on activation of an accessory panel.
+    /// Mirrors RecordingStopControl in screen coordinates, with 4pt hit slop.
+    /// Dual layouts move the control into the recording column; recording-only
+    /// keeps it at the trailing edge of the expanded island.
     private var recordingStopHitRect: NSRect {
-        guard let window else { return .zero }
-        let outerPad: CGFloat = 4
-        let horizontalPadding: CGFloat = 18
-        let controlSize: CGFloat = 32
-        let centerX = window.frame.maxX - outerPad - horizontalPadding - controlSize / 2
-        let centerY = window.frame.maxY - viewModel.notchHeight - controlSize / 2
-        return NSRect(
-            x: centerX - controlSize / 2 - 4,
-            y: centerY - controlSize / 2 - 4,
-            width: controlSize + 8,
-            height: controlSize + 8
+        guard let window, let hosting = hostingView else { return .zero }
+        let islandInView = islandRect(in: hosting)
+        let local = IslandSurfacePolicy.recordingStopRect(
+            islandSize: islandInView.size,
+            notchHeight: viewModel.notchHeight,
+            isScreenRecording: viewModel.isScreenRecording,
+            isExpanded: viewModel.isExpanded || viewModel.isOverlayActive,
+            dual: viewModel.dualActivity
         )
+        guard local.width > 0, local.height > 0 else { return .zero }
+
+        let viewRect: NSRect
+        if hosting.isFlipped {
+            viewRect = NSRect(
+                x: islandInView.minX + local.minX,
+                y: islandInView.minY + local.minY,
+                width: local.width,
+                height: local.height
+            )
+        } else {
+            viewRect = NSRect(
+                x: islandInView.minX + local.minX,
+                y: islandInView.maxY - local.minY - local.height,
+                width: local.width,
+                height: local.height
+            )
+        }
+        let inWindow = hosting.convert(viewRect, to: nil)
+        return window.convertToScreen(inWindow).insetBy(dx: -4, dy: -4)
     }
 
     private func updateClickThrough(withScreenPoint screenPoint: NSPoint) {
         guard let window = window, let hosting = hostingView else { return }
 
-        // Recording / selecting uses a tight frame. Drive expansion directly
-        // from AppKit events because SwiftUI onHover is unreliable at the
-        // physical notch while screencapture owns the display.
+        // Recording / selecting: AppKit hover (SwiftUI onHover is unreliable
+        // at the notch during capture). Hit-test the island only so the
+        // YouTube-sized shadow bleed does not steal desktop / capture clicks.
         if usesTightLiveActivityWindow {
-            if window.ignoresMouseEvents {
-                window.ignoresMouseEvents = false
-            }
             window.level = Self.liveActivityWindowLevel
-            let inside = window.frame.insetBy(dx: -6, dy: -6).contains(screenPoint)
-            if inside, viewModel.isScreenRecording {
-                viewModel.expand()
-            } else if !inside, viewModel.isExpanded, !viewModel.isOverlayActive {
-                viewModel.collapse()
+            let islandInView = islandRect(in: hosting)
+            let inWindow = hosting.convert(islandInView, to: nil)
+            let inScreen = window.convertToScreen(inWindow)
+            let previous = lastPointerScreenPoint
+            let radius = IslandSurfacePolicy.islandHoverRadius(islandSize: inScreen.size)
+            let inside = IslandSurfacePolicy.pointerIsOverIsland(
+                point: screenPoint,
+                island: inScreen,
+                previous: previous,
+                radius: radius
+            )
+            lastPointerScreenPoint = screenPoint
+            if inside {
+                if window.ignoresMouseEvents {
+                    window.ignoresMouseEvents = false
+                }
+                if viewModel.isScreenRecording {
+                    viewModel.expand()
+                }
+            } else {
+                if !window.ignoresMouseEvents {
+                    window.ignoresMouseEvents = true
+                }
+                viewModel.releaseHoverExpandLockIfExpired()
+                if viewModel.isExpanded, !viewModel.isOverlayActive {
+                    viewModel.collapse()
+                }
             }
             return
         }
@@ -1079,7 +1126,15 @@ final class NotchWindowController: NSWindowController {
         let paddedInView = islandInView.insetBy(dx: -pad, dy: -pad)
         let inWindow = hosting.convert(paddedInView, to: nil)
         let inScreen = window.convertToScreen(inWindow)
-        let inside = inScreen.contains(screenPoint)
+        let previous = lastPointerScreenPoint
+        let radius = IslandSurfacePolicy.islandHoverRadius(islandSize: inScreen.size)
+        let inside = IslandSurfacePolicy.pointerIsOverIsland(
+            point: screenPoint,
+            island: inScreen,
+            previous: previous,
+            radius: radius
+        )
+        lastPointerScreenPoint = screenPoint
 
         if inside || viewModel.isDropTargeted || viewModel.isDraggingShelfItem {
             outsideClickThroughStreak = 0
@@ -1223,19 +1278,17 @@ final class NotchWindowController: NSWindowController {
         let frame: NSRect
 
         if usesTightLiveActivityWindow {
-            // Exact island bounds (+ tiny pad). A large elevated transparent
-            // window was swallowing desktop input during screen capture.
-            let pad: CGFloat = 4
-            let size = CGSize(
-                width: viewModel.islandShapeWidth + pad * 2,
-                height: viewModel.islandShapeHeight + pad * 2
+            // Island + the same 28pt shadow bleed as expanded YouTube.
+            // Click-through outside the island keeps capture UI usable.
+            let size = IslandMetrics.liveActivityWindowSize(
+                islandWidth: viewModel.islandShapeWidth,
+                islandHeight: viewModel.islandShapeHeight
             )
             frame = Self.anchoredFrame(on: screen, size: size)
-            window.ignoresMouseEvents = false
         } else {
             // Large enough for the expanded music card + shadow so expanding
             // never resizes AppKit (that hover↔resize loop crashed).
-            let shadowBleed: CGFloat = 28
+            let shadowBleed = IslandMetrics.islandShadowBleed
             let maxIslandWidth = max(
                 IslandMetrics.expandedWidth(notchWidth: viewModel.notchWidth),
                 IslandMetrics.dualWidthFixed,
@@ -1245,7 +1298,7 @@ final class NotchWindowController: NSWindowController {
             let size = CGSize(
                 width: maxIslandWidth + shadowBleed * 2,
                 height: IslandMetrics.expandedHeight
-                    + IslandMetrics.shelfRowHeight
+                    + IslandMetrics.shelfSectionHeight
                     + shadowBleed
                     + 2
             )

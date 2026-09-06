@@ -14,6 +14,8 @@ enum IslandClickPolicy {
         case playPause
         case skipBack
         case skipForward
+        /// Compact recording pill — expand so Stop is reachable.
+        case expandRecording
     }
 
     /// Bottom band reserved for play/pause, scrubbing, and the file shelf.
@@ -30,7 +32,8 @@ enum IslandClickPolicy {
         overlay: TransientOverlay?,
         hasMedia: Bool,
         persistentIsMusic: Bool,
-        showsShelf: Bool = false
+        showsShelf: Bool = false,
+        isScreenRecording: Bool = false
     ) -> Action {
         let bounds = CGRect(origin: .zero, size: islandSize)
         guard bounds.width > 1, bounds.height > 1, bounds.contains(pointFromTopLeft) else {
@@ -41,6 +44,20 @@ enum IslandClickPolicy {
         case .lowBattery:
             return .openBatterySettings
         case .chatReady:
+            let dual = IslandSurfacePolicy.dualActivity(
+                isScreenRecording: isScreenRecording,
+                hasMedia: persistentIsMusic,
+                overlay: overlay
+            )
+            if dual == .recordingAndChat {
+                let pad = IslandMetrics.chatOverlayHorizontalPadding
+                let innerWidth = max(0, islandSize.width - pad * 2)
+                let recordingRight = pad + innerWidth * IslandMetrics.dualLeftRatio
+                if pointFromTopLeft.x >= recordingRight {
+                    return .openChat
+                }
+                return .passthrough
+            }
             if persistentIsMusic {
                 let pad = IslandMetrics.chatOverlayHorizontalPadding
                 let innerWidth = max(0, islandSize.width - pad * 2)
@@ -65,6 +82,36 @@ enum IslandClickPolicy {
             return .passthrough
         case .none:
             break
+        }
+
+        // Compact recording is a live activity. Clicks must expand it even
+        // after Check Now locked hover (that lock is for player/chat bounce).
+        if isScreenRecording, !isExpanded {
+            return .expandRecording
+        }
+
+        if isScreenRecording, persistentIsMusic, isExpanded {
+            let pad = IslandMetrics.chatOverlayHorizontalPadding
+            let innerWidth = max(0, islandSize.width - pad * 2)
+            let musicWidth = innerWidth * IslandMetrics.dualLeftRatio
+            let musicRight = pad + musicWidth
+            if pointFromTopLeft.x >= musicRight {
+                return .passthrough
+            }
+            return musicAction(
+                point: pointFromTopLeft,
+                islandSize: islandSize,
+                notchHeight: notchHeight,
+                isExpanded: true,
+                hasMedia: hasMedia,
+                showsShelf: false,
+                bandLeft: pad,
+                bandWidth: musicWidth
+            )
+        }
+
+        if isScreenRecording, isExpanded {
+            return .passthrough
         }
 
         return musicAction(
@@ -93,14 +140,14 @@ enum IslandClickPolicy {
         if !isExpanded {
             return .revealNowPlaying
         }
-        if showsShelf, point.y >= islandSize.height - IslandMetrics.shelfRowHeight {
+        if showsShelf, point.y >= islandSize.height - IslandMetrics.shelfHangHeight {
             return .passthrough
         }
         var transportTop = islandSize.height - expandedTransportBand
         var controlTop = islandSize.height - expandedControlBand
         if showsShelf {
-            transportTop -= IslandMetrics.shelfRowHeight
-            controlTop -= IslandMetrics.shelfRowHeight
+            transportTop -= IslandMetrics.shelfHangHeight
+            controlTop -= IslandMetrics.shelfHangHeight
         }
         let headerFloor = IslandMetrics.expandedContentTopInset(notchHeight: notchHeight) + 40
         transportTop = max(transportTop, headerFloor)

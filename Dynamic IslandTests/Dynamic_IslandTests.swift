@@ -1990,6 +1990,58 @@ struct Dynamic_IslandTests {
         )
     }
 
+    @Test func nativeMenuBarStopControlIsDetectedWithoutMatchingTheToolbar() {
+        #expect(
+            ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "screencaptureui",
+                title: "Stop Recording",
+                bounds: CGRect(x: 1180, y: 6, width: 36, height: 36)
+            )
+        )
+        #expect(
+            ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "Screenshot",
+                title: "",
+                bounds: CGRect(x: 1200, y: 4, width: 28, height: 24)
+            )
+        )
+        #expect(
+            !ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "screencaptureui",
+                title: "Screenshot",
+                bounds: CGRect(x: 420, y: 48, width: 420, height: 72)
+            )
+        )
+        #expect(
+            !ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "screencaptureui",
+                title: "Click to record this display",
+                bounds: CGRect(x: 0, y: 0, width: 1512, height: 982)
+            )
+        )
+        #expect(
+            !ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "Finder",
+                title: "Stop Recording",
+                bounds: CGRect(x: 1180, y: 6, width: 36, height: 36)
+            )
+        )
+        #expect(
+            ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "Control Center",
+                title: "Stop Recording",
+                bounds: CGRect(x: 1180, y: 6, width: 36, height: 36)
+            )
+        )
+        #expect(
+            !ScreenRecordingDSP.looksLikeNativeStopControl(
+                owner: "Control Center",
+                title: "",
+                bounds: CGRect(x: 1180, y: 6, width: 36, height: 36)
+            )
+        )
+    }
+
     @Test func recordSelectionHeuristics() {
         #expect(ScreenRecordingDSP.isCaptureUIOwner("screencaptureui"))
         #expect(ScreenRecordingDSP.isCaptureUIOwner("Screenshot"))
@@ -2237,6 +2289,76 @@ struct Dynamic_IslandTests {
         #expect(IslandSurfacePolicy.shouldHideDesktopIsland(lockActive: true, overlayActive: false))
         #expect(!IslandSurfacePolicy.shouldHideDesktopIsland(lockActive: false, overlayActive: true))
         #expect(!IslandSurfacePolicy.shouldHideDesktopIsland(lockActive: false, overlayActive: false))
+        #expect(IslandSurfacePolicy.shouldHandleSpaceSwipe(usesTightLiveActivityWindow: false))
+        #expect(IslandSurfacePolicy.shouldHandleSpaceSwipe(usesTightLiveActivityWindow: true))
+    }
+
+    @Test func pointerOnIslandTopEdgeStillCountsAsHover() {
+        // Logged miss: y == island.maxY, CGRect.contains was false, dist 0.
+        let island = CGRect(x: 704, y: 949, width: 235, height: 33)
+        #expect(island.maxY == 982)
+        #expect(!island.contains(CGPoint(x: 821, y: 982)))
+        #expect(
+            IslandSurfacePolicy.pointerIsOverIsland(
+                point: CGPoint(x: 821, y: 982),
+                island: island,
+                previous: CGPoint(x: 826, y: 952),
+                radius: 17
+            )
+        )
+        #expect(
+            IslandSurfacePolicy.pointerIsOverIsland(
+                point: CGPoint(x: 821, y: 982),
+                island: CGRect(x: 654, y: 804, width: 335, height: 178),
+                previous: CGPoint(x: 821, y: 952),
+                radius: 89
+            )
+        )
+    }
+
+    @Test func pointerWithinIslandRadiusSlopExpands() {
+        let island = CGRect(x: 704, y: 949, width: 235, height: 33)
+        #expect(IslandSurfacePolicy.islandHoverSlop(radius: 17) == 1)
+        #expect(
+            IslandSurfacePolicy.pointerIsOverIsland(
+                point: CGPoint(x: 827, y: 948),
+                island: island,
+                previous: nil,
+                radius: 17
+            )
+        )
+        #expect(
+            !IslandSurfacePolicy.pointerIsOverIsland(
+                point: CGPoint(x: 827, y: 946),
+                island: island,
+                previous: nil,
+                radius: 17
+            )
+        )
+    }
+
+    @Test func pointerLeavingExpandedIslandBelowDoesNotStayHovered() {
+        let island = CGRect(x: 654, y: 804, width: 335, height: 178)
+        #expect(
+            !IslandSurfacePolicy.pointerIsOverIsland(
+                point: CGPoint(x: 849, y: 800),
+                island: island,
+                previous: CGPoint(x: 849, y: 810),
+                radius: 89
+            )
+        )
+    }
+
+    @Test func fastSwipeThatTunnelsThroughTheIslandStillHovers() {
+        let island = CGRect(x: 704, y: 949, width: 235, height: 33)
+        #expect(
+            IslandSurfacePolicy.pointerIsOverIsland(
+                point: CGPoint(x: 821, y: 1008),
+                island: island,
+                previous: CGPoint(x: 830, y: 910),
+                radius: 17
+            )
+        )
     }
 
     @Test func incomingSpacePlateHasNoIslandWhenWindowDoesNotJoinAllSpaces() {
@@ -2667,6 +2789,38 @@ struct Dynamic_IslandTests {
     }
 
     @Test @MainActor
+    func spaceChangeDuringRecordingStillArrivesOnTheNewSpace() {
+        let controller = NotchWindowController()
+        defer { controller.window?.close() }
+        guard let window = controller.window else {
+            Issue.record("expected island window")
+            return
+        }
+        window.orderFrontRegardless()
+        window.displayIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.12))
+        controller.viewModel.isScreenRecording = true
+        controller.test_beginArrivalFromSpaceChange()
+        window.displayIfNeeded()
+        #expect(
+            controller.test_liftTranslationY > 10,
+            "recording must not skip Space arrival. ty=\(controller.test_liftTranslationY)"
+        )
+        #expect(
+            abs(window.alphaValue) < 0.01,
+            "recording arrival must stay invisible through the morph. alpha=\(window.alphaValue)"
+        )
+        controller.test_runDropInFromAbove()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.12))
+        #expect(
+            controller.test_isOnActiveSpace,
+            "recording island must land on the Space the user swiped to"
+        )
+        #expect(window.alphaValue > 0.9)
+        #expect(!controller.test_joinsAllSpaces)
+    }
+
+    @Test @MainActor
     func spaceChangeDuringDropInRestartsArrival() {
         let controller = NotchWindowController()
         defer { controller.window?.close() }
@@ -2930,6 +3084,88 @@ struct Dynamic_IslandTests {
         #expect(IslandSurfacePolicy.isClaudeActivelyStreaming(attributeValues: ["false", "true"]))
     }
 
+    @Test func recordingSharesTheIslandWithMediaAndChatBanners() {
+        let tab = ClaudeTabInfo(tabID: 7, windowIndex: 1, tabIndex: 1, provider: .claude)
+        let chat = TransientOverlay.chatReady(preview: "Reply ready", tab: tab)
+
+        #expect(
+            IslandSurfacePolicy.dualActivity(
+                isScreenRecording: true,
+                hasMedia: true,
+                overlay: nil
+            ) == .mediaAndRecording
+        )
+        #expect(
+            IslandSurfacePolicy.dualActivity(
+                isScreenRecording: true,
+                hasMedia: false,
+                overlay: chat
+            ) == .recordingAndChat
+        )
+        #expect(
+            IslandSurfacePolicy.dualActivity(
+                isScreenRecording: true,
+                hasMedia: true,
+                overlay: chat
+            ) == .recordingAndChat
+        )
+        #expect(
+            IslandSurfacePolicy.dualActivity(
+                isScreenRecording: false,
+                hasMedia: true,
+                overlay: chat
+            ) == .mediaAndChat
+        )
+        #expect(
+            IslandSurfacePolicy.dualActivity(
+                isScreenRecording: true,
+                hasMedia: false,
+                overlay: nil
+            ) == .none
+        )
+        #expect(
+            IslandSurfacePolicy.dualActivity(
+                isScreenRecording: true,
+                hasMedia: true,
+                overlay: .volume(percent: 40, muted: false)
+            ) == .none
+        )
+
+        let dual = CGSize(width: 560, height: 144)
+        let mediaRecordingStop = IslandSurfacePolicy.recordingStopRect(
+            islandSize: dual,
+            notchHeight: 32,
+            isScreenRecording: true,
+            isExpanded: true,
+            dual: .mediaAndRecording
+        )
+        #expect(mediaRecordingStop.minX > dual.width * 0.5)
+        let contentTop = IslandMetrics.expandedContentTopInset(notchHeight: 32)
+        let contentBottom = dual.height - IslandMetrics.chatOverlayBottomPadding
+        #expect(abs(mediaRecordingStop.midY - (contentTop + contentBottom) / 2) < 1)
+        let recordingChatStop = IslandSurfacePolicy.recordingStopRect(
+            islandSize: dual,
+            notchHeight: 32,
+            isScreenRecording: true,
+            isExpanded: true,
+            dual: .recordingAndChat
+        )
+        #expect(recordingChatStop.maxX < dual.width * 0.5)
+        let actionRowTop = dual.height
+            - IslandMetrics.chatOverlayBottomPadding
+            - IslandMetrics.dualActionRowHeight
+        #expect(recordingChatStop.minY >= actionRowTop - 1)
+        #expect(
+            IslandSurfacePolicy.recordingStopRect(
+                islandSize: dual,
+                notchHeight: 32,
+                isScreenRecording: true,
+                isExpanded: true,
+                dual: .mediaAndChat
+            ) == .zero
+        )
+    }
+
     @Test func claudePushStillNotifiesAfterUserLeavesMidReply() {
         var tracker = ClaudeTabTracker()
         let tab = ClaudeTabInfo(tabID: 90, windowIndex: 1, tabIndex: 1, provider: .claude)
@@ -3021,6 +3257,13 @@ struct Dynamic_IslandTests {
             ) == "Unchanged YouTube Video Title"
         )
         #expect(
+            StreamingPlatform.displayTitle(
+                mediaTitle: "JioHotstar",
+                pageTitle: "Watch The Night Manager | JioHotstar",
+                platform: .jioHotstar
+            ) == "The Night Manager"
+        )
+        #expect(
             StreamingPlatform.needsContentTitleRefresh(
                 mediaTitle: "Netflix",
                 pageTitle: "Netflix",
@@ -3028,10 +3271,24 @@ struct Dynamic_IslandTests {
             )
         )
         #expect(
+            StreamingPlatform.needsContentTitleRefresh(
+                mediaTitle: "Hulu",
+                pageTitle: "Hulu",
+                platform: .hulu
+            )
+        )
+        #expect(
             !StreamingPlatform.needsContentTitleRefresh(
                 mediaTitle: "Netflix",
                 pageTitle: "Watch India's Got Talent | Netflix",
                 platform: .netflix
+            )
+        )
+        #expect(
+            !StreamingPlatform.needsContentTitleRefresh(
+                mediaTitle: "Unchanged YouTube Video Title",
+                pageTitle: "YouTube",
+                platform: .youtube
             )
         )
     }
@@ -3236,6 +3493,34 @@ struct Dynamic_IslandTests {
             MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
                 previousToken: "remote:ytimg:5YBHLwNuM9Y",
                 policyToken: "pending:youtube"
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
+                previousToken: "remote:ytimg:trailer",
+                policyToken: "pending:youtube",
+                identityChanged: true
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.remoteArtworkAlreadyMatchesBoundTab(
+                tabPlatform: .youtubeMusic,
+                pixelWidth: 320,
+                pixelHeight: 180
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.remoteArtworkAlreadyMatchesBoundTab(
+                tabPlatform: .youtubeMusic,
+                pixelWidth: 150,
+                pixelHeight: 150
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.remoteArtworkAlreadyMatchesBoundTab(
+                tabPlatform: .youtube,
+                pixelWidth: 320,
+                pixelHeight: 180
             )
         )
     }
@@ -3444,6 +3729,100 @@ struct Dynamic_IslandTests {
             platform: .youtube
         )
         #expect(stillWatching?.url.contains("watch?v=MyHUI_r79Ws") == true)
+    }
+
+    @Test func youtubeTrailerDoesNotStayBoundWhenMusicTrackStarts() {
+        let trailer = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 1,
+            tabID: 11,
+            title: "Official Trailer | Some Movie - YouTube",
+            url: "https://www.youtube.com/watch?v=TrailerID12"
+        )
+        let music = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 1,
+            tabID: 90,
+            title: "YouTube Music",
+            url: "https://music.youtube.com/"
+        )
+        let song = "Sanson Ki Mala Pe Guitar Version"
+        let picked = BrowserMediaNavigator.pick(
+            from: [trailer, music],
+            nowPlayingTitle: song,
+            nowPlayingArtist: "The Introvert Boy",
+            preferredURL: trailer.url,
+            platform: .youtube
+        )
+        #expect(picked?.url.contains("music.youtube.com") == true)
+        #expect(
+            !YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: trailer.title,
+                tabURL: trailer.url,
+                nowPlayingTitle: song
+            )
+        )
+        #expect(
+            !YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: trailer.title,
+                tabURL: trailer.url,
+                nowPlayingTitle: song,
+                allowStaleDocumentTitle: true
+            )
+        )
+        #expect(
+            !YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                tabTitle: trailer.title,
+                tabURL: trailer.url,
+                nowPlayingTitle: song
+            )
+        )
+    }
+
+    @Test func browserMediaPickerPrefersNewYouTubeWatchOverPausedMusicHome() {
+        let watch = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 1,
+            tabID: 11,
+            title: "(14135) YouTube",
+            url: "https://www.youtube.com/watch?v=sYWpPlR6Cd8"
+        )
+        let music = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 1,
+            tabID: 90,
+            title: "YouTube Music",
+            url: "https://music.youtube.com/"
+        )
+        let picked = BrowserMediaNavigator.pick(
+            from: [watch, music],
+            nowPlayingTitle: "THAT'S WHY HE'LL BE NUMBER ONE! | Zhao X",
+            nowPlayingArtist: "WST",
+            preferredURL: music.url,
+            platform: .youtube
+        )
+        #expect(picked?.url.contains("watch?v=sYWpPlR6Cd8") == true)
+        #expect(
+            !YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                tabTitle: music.title,
+                tabURL: music.url,
+                nowPlayingTitle: "THAT'S WHY HE'LL BE NUMBER ONE! | Zhao X"
+            )
+        )
+        #expect(
+            YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                tabTitle: watch.title,
+                tabURL: watch.url,
+                nowPlayingTitle: "THAT'S WHY HE'LL BE NUMBER ONE! | Zhao X"
+            )
+        )
+        #expect(
+            !YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+                tabTitle: "YouTube Music",
+                tabURL: "https://music.youtube.com/",
+                nowPlayingTitle: "THAT'S WHY HE'LL BE NUMBER ONE! | Zhao X"
+            )
+        )
     }
 
     @Test func youtubeSameTrackDoesNotBindMusicTitleToUnrelatedWatchTab() {
@@ -3719,6 +4098,128 @@ struct Dynamic_IslandTests {
         )
     }
 
+    @Test func islandClickSplitsRecordingWithMediaAndChat() {
+        let tab = ClaudeTabInfo(tabID: 4, windowIndex: 1, tabIndex: 1, provider: .claude)
+        let dual = CGSize(width: 560, height: 144)
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 420, y: 70),
+                islandSize: dual,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: .chatReady(preview: "Ready", tab: tab),
+                hasMedia: false,
+                persistentIsMusic: false,
+                isScreenRecording: true
+            ) == .openChat
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 80, y: 70),
+                islandSize: dual,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: .chatReady(preview: "Ready", tab: tab),
+                hasMedia: true,
+                persistentIsMusic: true,
+                isScreenRecording: true
+            ) == .passthrough
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 80, y: 40),
+                islandSize: dual,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                isScreenRecording: true
+            ) == .revealNowPlaying
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 420, y: 70),
+                islandSize: dual,
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                isScreenRecording: true
+            ) == .passthrough
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 110, y: 8),
+                islandSize: CGSize(width: 235, height: 33),
+                notchHeight: 32,
+                isExpanded: false,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                isScreenRecording: true
+            ) == .expandRecording
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 26, y: 22),
+                islandSize: CGSize(width: 235, height: 33),
+                notchHeight: 32,
+                isExpanded: false,
+                overlay: nil,
+                hasMedia: false,
+                persistentIsMusic: false,
+                isScreenRecording: true
+            ) == .expandRecording
+        )
+    }
+
+    @Test func recordingExpandIgnoresStuckChatHoverLock() {
+        #expect(
+            IslandSurfacePolicy.shouldAllowRecordingExpand(
+                isScreenRecording: true,
+                fromClick: true,
+                suppressHoverExpand: true,
+                suppressUntil: Date().addingTimeInterval(2.5)
+            )
+        )
+        #expect(
+            !IslandSurfacePolicy.shouldAllowRecordingExpand(
+                isScreenRecording: true,
+                fromClick: false,
+                suppressHoverExpand: true,
+                suppressUntil: Date().addingTimeInterval(2.5)
+            )
+        )
+        #expect(
+            IslandSurfacePolicy.shouldAllowRecordingExpand(
+                isScreenRecording: true,
+                fromClick: false,
+                suppressHoverExpand: true,
+                suppressUntil: Date().addingTimeInterval(-1)
+            )
+        )
+        #expect(
+            !IslandSurfacePolicy.shouldAllowRecordingExpand(
+                isScreenRecording: false,
+                fromClick: true,
+                suppressHoverExpand: true,
+                suppressUntil: nil
+            )
+        )
+    }
+
+    @Test func recordingWindowKeepsYouTubeShadowBleed() {
+        #expect(IslandMetrics.islandShadowBleed == 28)
+        let dual = IslandMetrics.liveActivityWindowSize(islandWidth: 560, islandHeight: 144)
+        #expect(dual.width == 616)
+        #expect(dual.height == 172)
+        let compact = IslandMetrics.liveActivityWindowSize(islandWidth: 235, islandHeight: 33)
+        #expect(compact.width == 291)
+        #expect(compact.height == 61)
+    }
+
     @Test func browserMediaTabListParserKeepsNumericIndices() {
         let output = """
         1\t3\t44\tPrime Video\thttps://www.primevideo.com/detail/Reacher
@@ -3819,7 +4320,7 @@ struct Dynamic_IslandTests {
         let musicHeight = model.islandShapeHeight
         model.shelfItems = ShelfPreview.sampleItems()
         #expect(model.islandShapeWidth == musicWidth)
-        #expect(model.islandShapeHeight == musicHeight + IslandMetrics.shelfRowHeight)
+        #expect(model.islandShapeHeight == musicHeight + IslandMetrics.shelfSectionHeight)
         #expect(model.showsShelfRow)
     }
 

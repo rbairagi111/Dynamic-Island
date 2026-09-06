@@ -188,6 +188,17 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
         }
     }
 
+    /// MediaRemote often publishes only the brand name for these sites.
+    /// YouTube / Spotify / Music already send the real track or video title.
+    var prefersPageContentTitle: Bool {
+        switch self {
+        case .youtube, .youtubeMusic, .spotify, .appleMusic, .soundcloud, .jioSaavn:
+            return false
+        default:
+            return true
+        }
+    }
+
     var homepageURL: URL? {
         switch self {
         case .primeVideo: return URL(string: "https://www.primevideo.com")
@@ -264,12 +275,10 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
         platform: StreamingPlatform?
     ) -> String {
         let media = mediaTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard platform == .primeVideo || platform == .netflix else {
+        guard platform?.prefersPageContentTitle == true else {
             return media
         }
 
-        // Netflix often reports only "Netflix" through MediaRemote while its
-        // browser tab contains "Watch <name> | Netflix".
         for candidate in [pageTitle, media, metadataTitle] where !candidate.isEmpty {
             let cleaned = cleanProviderTitle(candidate, platform: platform)
             if isMeaningfulContentTitle(cleaned, platform: platform) {
@@ -285,14 +294,14 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
         metadataTitle: String = "",
         platform: StreamingPlatform?
     ) -> Bool {
-        guard platform == .primeVideo || platform == .netflix else { return false }
+        guard let platform, platform.prefersPageContentTitle else { return false }
         return displayTitle(
             mediaTitle: mediaTitle,
             pageTitle: pageTitle,
             metadataTitle: metadataTitle,
             platform: platform
         )
-        .caseInsensitiveCompare(platform?.displayName ?? "") == .orderedSame
+        .caseInsensitiveCompare(platform.displayName) == .orderedSame
     }
 
     private static func cleanProviderTitle(
@@ -300,26 +309,18 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
         platform: StreamingPlatform?
     ) -> String {
         var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let commonPatterns = [
+        let names = providerTitleAliases(platform)
+        let escaped = names.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        let patterns = [
             #"(?i)^\s*watch\s+"#,
             #"(?i)\s*[-–—|:]\s*season\s+\d+.*$"#
-        ]
-        let providerPatterns: [String]
-        switch platform {
-        case .primeVideo:
-            providerPatterns = [
-                #"(?i)^\s*(?:amazon\s+)?prime\s+video\s*[:|–—-]\s*"#,
-                #"(?i)\s*[:|–—-]\s*(?:amazon\s+)?prime\s+video(?:\s+official\s+site)?\s*$"#
+        ] + (
+            escaped.isEmpty ? [] : [
+                "(?i)^\\s*(?:\(escaped))\\s*[:|–—-]\\s*",
+                "(?i)\\s*[:|–—-]\\s*(?:\(escaped))(?:\\s+official\\s+site)?\\s*$"
             ]
-        case .netflix:
-            providerPatterns = [
-                #"(?i)^\s*netflix\s*[:|–—-]\s*"#,
-                #"(?i)\s*[:|–—-]\s*netflix(?:\s+official\s+site)?\s*$"#
-            ]
-        default:
-            providerPatterns = []
-        }
-        for pattern in providerPatterns + commonPatterns {
+        )
+        for pattern in patterns {
             value = value.replacingOccurrences(
                 of: pattern,
                 with: "",
@@ -330,14 +331,32 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
         return value
     }
 
+    private static func providerTitleAliases(_ platform: StreamingPlatform?) -> [String] {
+        guard let platform else { return [] }
+        switch platform {
+        case .primeVideo:
+            return ["Amazon Prime Video", "Prime Video"]
+        case .jioHotstar:
+            return ["Disney+ Hotstar", "JioHotstar", "Hotstar"]
+        case .disneyPlus:
+            return ["Disney Plus", "Disney+"]
+        default:
+            return [platform.displayName]
+        }
+    }
+
+    static func playbackTitleSkipNames(_ platform: StreamingPlatform) -> [String] {
+        providerTitleAliases(platform)
+    }
+
     private static func isMeaningfulContentTitle(
         _ title: String,
         platform: StreamingPlatform?
     ) -> Bool {
         let value = title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         guard value.count >= 2 else { return false }
-        let provider = platform?.displayName.lowercased() ?? ""
-        if value == provider || value == "amazon prime video" { return false }
+        let names = providerTitleAliases(platform)
+        if names.contains(where: { value == $0.lowercased() }) { return false }
         let genericPhrases = [
             "watch movies",
             "watch tv shows",
@@ -498,7 +517,13 @@ enum MediaArtworkPolicy {
 
     /// Keep the last real mark/poster while YouTube's thumbnail downloads.
     /// Do not keep a Chrome favicon or 150×83 MediaRemote preview.
-    static func shouldHoldArtworkWhilePosterLoads(previousToken: String, policyToken: String) -> Bool {
+    /// Do not keep a watch poster after Now Playing moved to another item.
+    static func shouldHoldArtworkWhilePosterLoads(
+        previousToken: String,
+        policyToken: String,
+        identityChanged: Bool = false
+    ) -> Bool {
+        if identityChanged { return false }
         guard policyToken.hasPrefix("pending:") else { return false }
         guard !previousToken.isEmpty else { return false }
         if previousToken.hasPrefix("pending:") { return false }
@@ -506,6 +531,23 @@ enum MediaArtworkPolicy {
             return false
         }
         return true
+    }
+
+    /// A youtube.com 16:9 preview is not YouTube Music cover art.
+    static func remoteArtworkAlreadyMatchesBoundTab(
+        tabPlatform: StreamingPlatform?,
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) -> Bool {
+        switch tabPlatform {
+        case .youtubeMusic:
+            return isLikelyAlbumArtwork(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+        case .youtube:
+            return isLikelyVideoThumbnail(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+        default:
+            return isLikelyVideoThumbnail(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+                || isLikelyAlbumArtwork(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+        }
     }
 
     /// Show MediaRemote art immediately when it is already a poster. Hold

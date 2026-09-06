@@ -59,6 +59,8 @@ enum IslandMetrics {
     /// Bottom action row in the dual overlay (transport + Check Now).
     static let dualActionRowHeight: CGFloat = 36
     static let dualDivider = Color(red: 0.62, green: 0.86, blue: 1.0)
+    static let recordingStopSize: CGFloat = 32
+    static let recordingStopTrailingPad: CGFloat = 18
     /// Charging, low battery, sound, brightness: 800px @2x → 400pt
     static let batteryBannerWidth: CGFloat = 400
     /// Muted terracotta tile behind the starburst, per the reference mock.
@@ -107,6 +109,30 @@ enum IslandMetrics {
     static let shelfThumbSize: CGFloat = 44
     /// Extra hang below the music player for the file tray. Width stays the music island.
     static let shelfRowHeight: CGFloat = 70
+    /// Space between the player controls and the drop well so the tray is
+    /// not flush with the island content above it.
+    static let shelfIslandGap: CGFloat = 12
+    /// Player hang plus the gap and drop row.
+    static var shelfSectionHeight: CGFloat {
+        shelfIslandGap + shelfRowHeight
+    }
+    /// From the island bottom up through the drop well and its gap.
+    static var shelfHangHeight: CGFloat {
+        shelfSectionHeight + expandedVerticalPadding
+    }
+
+    /// Figma drop shadow (X 0, Y 2, blur 24). YouTube expanded and recording
+    /// share this window bleed so the shadow is not clipped.
+    static let islandShadowBleed: CGFloat = 28
+
+    /// Recording stays sized to the live island, plus the same shadow bleed
+    /// as Now Playing. A full-size elevated window swallowed capture clicks.
+    static func liveActivityWindowSize(islandWidth: CGFloat, islandHeight: CGFloat) -> CGSize {
+        CGSize(
+            width: islandWidth + islandShadowBleed * 2,
+            height: islandHeight + islandShadowBleed
+        )
+    }
 }
 
 final class NotchViewModel: ObservableObject {
@@ -199,26 +225,48 @@ final class NotchViewModel: ObservableObject {
 
     var isOverlayActive: Bool { transientOverlay != nil }
 
+    var dualActivity: IslandSurfacePolicy.DualActivity {
+        IslandSurfacePolicy.dualActivity(
+            isScreenRecording: isScreenRecording,
+            hasMedia: persistentState == .musicPlaying,
+            overlay: transientOverlay
+        )
+    }
+
     var showsCompactLiveActivity: Bool {
         transientOverlay == nil
             && !isExpanded
-            && (isScreenRecording || isSelectingScreenToRecord)
+            && (isSelectingScreenToRecord || (isScreenRecording && persistentState != .musicPlaying))
     }
 
     var showsRecordingExpanded: Bool {
-        transientOverlay == nil && isScreenRecording && isExpanded
+        transientOverlay == nil
+            && isScreenRecording
+            && isExpanded
+            && persistentState != .musicPlaying
+    }
+
+    var showsMediaRecordingDual: Bool {
+        dualActivity == .mediaAndRecording && isExpanded
+    }
+
+    var showsRecordingChatDual: Bool {
+        dualActivity == .recordingAndChat
     }
 
     var islandShapeWidth: CGFloat {
         switch transientOverlay {
         case .charging, .lowBattery, .volume, .brightness, .focusMode:
             return IslandMetrics.batteryBannerWidth
-        case .chatReady where persistentState == .musicPlaying:
+        case .chatReady where dualActivity == .recordingAndChat || persistentState == .musicPlaying:
             return IslandMetrics.dualWidthFixed
         case .chatReady:
             return IslandMetrics.chatOnlyWidthFixed
         case .none:
             break
+        }
+        if showsMediaRecordingDual {
+            return IslandMetrics.dualWidthFixed
         }
         if isScreenRecording && isExpanded {
             return IslandMetrics.batteryBannerWidth
@@ -238,12 +286,15 @@ final class NotchViewModel: ObservableObject {
         case .none:
             break
         }
+        if showsMediaRecordingDual {
+            return IslandMetrics.dualHeight(notchHeight: notchHeight)
+        }
         if isScreenRecording && isExpanded {
             return IslandMetrics.recordingBannerHeight(notchHeight: notchHeight)
         }
         if isExpanded {
             if showsShelfRow {
-                return IslandMetrics.expandedHeight + IslandMetrics.shelfRowHeight
+                return IslandMetrics.expandedHeight + IslandMetrics.shelfSectionHeight
             }
             return IslandMetrics.expandedHeight
         }
@@ -263,12 +314,36 @@ final class NotchViewModel: ObservableObject {
         (settings.shelfEnabled || shelfPreviewActive)
             && transientOverlay == nil
             && !showsRecordingExpanded
+            && !showsMediaRecordingDual
             && isExpanded
             && (isDropTargeted || !shelfItems.isEmpty)
     }
 
     func expand() {
+        expandLiveActivity(fromClick: false)
+    }
+
+    /// Deliberate click on the compact recording pill. Clears the Check Now
+    /// hover lock so Stop stays reachable after swapping to another app.
+    func expandRecordingFromClick() {
+        expandLiveActivity(fromClick: true)
+    }
+
+    private func expandLiveActivity(fromClick: Bool) {
         if isDropTargeted || isDraggingShelfItem {
+            isExpanded = true
+            return
+        }
+        if IslandSurfacePolicy.shouldAllowRecordingExpand(
+            isScreenRecording: isScreenRecording,
+            fromClick: fromClick,
+            suppressHoverExpand: suppressHoverExpand,
+            suppressUntil: suppressExpandUntil
+        ) {
+            if fromClick {
+                suppressHoverExpand = false
+                suppressExpandUntil = nil
+            }
             isExpanded = true
             return
         }
@@ -664,6 +739,15 @@ final class NotchViewModel: ObservableObject {
                 self?.recordingMonitor.setPreview(true)
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .previewRecordingChat)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] note in
+                let raw = note.userInfo?["provider"] as? String
+                let provider = raw.flatMap(ChatProvider.init(rawValue:)) ?? .claude
+                self?.presentRecordingChatPreview(provider: provider)
+            }
+            .store(in: &cancellables)
     }
 
     private func bindShelfExpiry() {
@@ -871,6 +955,13 @@ final class NotchViewModel: ObservableObject {
         )
     }
 
+    /// Settings preview: recording column on the left, chat reply on the right.
+    private func presentRecordingChatPreview(provider: ChatProvider) {
+        recordingMonitor.setPreview(true)
+        setScreenRecording(true)
+        presentChatReadyPreview(provider: provider)
+    }
+
     private func presentChatReady(_ snapshot: ClaudeTabSnapshot) {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
@@ -930,14 +1021,16 @@ final class NotchViewModel: ObservableObject {
         if hovering {
             overlayTimeout?.invalidate()
         } else {
-            // Don't unlock expand during the Check Now grace window.
-            if suppressExpandUntil == nil || suppressExpandUntil! <= Date() {
-                suppressHoverExpand = false
-            }
+            releaseHoverExpandLockIfExpired()
             if isOverlayActive {
                 restartOverlayTimer()
             }
         }
+    }
+
+    func releaseHoverExpandLockIfExpired() {
+        if let until = suppressExpandUntil, until > Date() { return }
+        suppressHoverExpand = false
     }
 
     /// Album-art side of a compressed overlay — expand the full player, keep music state.

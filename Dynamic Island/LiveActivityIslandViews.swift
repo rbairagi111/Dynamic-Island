@@ -41,17 +41,17 @@ struct ScreenRecordingIsland: View {
             }
             Spacer(minLength: 8)
             Button(action: onStop) {
-                RecordingStopControl(size: 32)
+                RecordingStopControl(size: IslandMetrics.recordingStopSize)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Stop screen recording")
         }
-        .padding(.horizontal, 18)
+        .padding(.horizontal, IslandMetrics.recordingStopTrailingPad)
         .padding(.bottom, 14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private static func timestamp(_ elapsed: TimeInterval) -> String {
+    static func timestamp(_ elapsed: TimeInterval) -> String {
         let total = max(0, Int(elapsed))
         let minutes = total / 60
         let seconds = total % 60
@@ -59,7 +59,68 @@ struct ScreenRecordingIsland: View {
     }
 }
 
-private struct RecordingStopControl: View {
+struct ScreenRecordingSplitColumn: View {
+    var elapsed: TimeInterval
+    var onStop: () -> Void
+    /// When true, use the YouTube | AI column: header at the top, action on
+    /// the bottom row. Otherwise keep the compact centered cluster used when
+    /// recording sits beside Now Playing.
+    var usesChatDualPadding: Bool = false
+
+    var body: some View {
+        if usesChatDualPadding {
+            overlayColumn
+        } else {
+            centeredCluster
+        }
+    }
+
+    private var overlayColumn: some View {
+        header
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .overlay(alignment: .bottom) {
+                Button(action: onStop) {
+                    RecordingStopControl(size: IslandMetrics.recordingStopSize)
+                }
+                .buttonStyle(.plain)
+                .frame(height: IslandMetrics.dualActionRowHeight)
+                .frame(maxWidth: .infinity)
+                .accessibilityLabel("Stop screen recording")
+            }
+    }
+
+    private var centeredCluster: some View {
+        HStack(alignment: .center, spacing: 12) {
+            header
+            Spacer(minLength: 8)
+            Button(action: onStop) {
+                RecordingStopControl(size: IslandMetrics.recordingStopSize)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Stop screen recording")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                RecordingPulseDot(size: 7, color: LiveActivityPalette.recordRed, blinks: false)
+                Text(ScreenRecordingIsland.timestamp(elapsed))
+                    .font(.system(size: 12, weight: .regular).monospacedDigit())
+                    .foregroundStyle(LiveActivityPalette.recordRed)
+            }
+            Text("Screen Recording")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+}
+
+struct RecordingStopControl: View {
     var size: CGFloat
 
     var body: some View {
@@ -75,7 +136,7 @@ private struct RecordingStopControl: View {
     }
 }
 
-private struct RecordingPulseDot: View {
+struct RecordingPulseDot: View {
     var size: CGFloat
     var color: Color = LiveActivityPalette.recordRed
     var blinks: Bool = true

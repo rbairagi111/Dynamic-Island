@@ -172,11 +172,18 @@ struct SettingsView: View {
             }
 
             Section("Screen recording") {
-                Text("Screen Recording: red dot while capturing, hover to expand and stop.")
+                Text("Screen Recording: red dot while capturing, hover to expand and stop. With a chat reply, recording sits on the left and Claude / ChatGPT / Gemini on the right.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Button("Preview Screen Recording") {
                     NotificationCenter.default.post(name: .previewScreenRecording, object: nil)
+                }
+                Button("Preview Recording + Claude") {
+                    NotificationCenter.default.post(
+                        name: .previewRecordingChat,
+                        object: nil,
+                        userInfo: ["provider": ChatProvider.claude.rawValue]
+                    )
                 }
             }
             }
