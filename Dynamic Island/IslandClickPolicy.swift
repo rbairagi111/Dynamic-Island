@@ -14,6 +14,8 @@ enum IslandClickPolicy {
         case playPause
         case skipBack
         case skipForward
+        /// Scrub the timeline — SwiftUI drag never fires in this panel.
+        case seek
         /// Compact recording pill — expand so Stop is reachable.
         case expandRecording
     }
@@ -23,6 +25,11 @@ enum IslandClickPolicy {
     /// Play/pause/skip sit in the lower part of that band; the progress bar is above.
     /// 40pt buttons + 8pt row padding + 14pt island padding.
     static let expandedControlBand: CGFloat = 62
+    /// Hit height of the elapsed/duration row above the transport buttons.
+    static let expandedProgressBand: CGFloat = 32
+    static let progressLeadingTimeWidth: CGFloat = 48
+    static let progressTrailingTimeWidth: CGFloat = 54
+    static let progressTimeSpacing: CGFloat = 10
 
     static func action(
         pointFromTopLeft: CGPoint,
@@ -152,24 +159,36 @@ enum IslandClickPolicy {
         let headerFloor = IslandMetrics.expandedContentTopInset(notchHeight: notchHeight) + 40
         transportTop = max(transportTop, headerFloor)
         controlTop = max(controlTop, transportTop)
-        if point.y < transportTop {
+        var progressTop = controlTop - expandedProgressBand
+        progressTop = max(progressTop, headerFloor)
+        if point.y < progressTop {
             return .revealNowPlaying
         }
         if point.y < controlTop {
+            return .seek
+        }
+        let third = max(bandWidth / 3, 1)
+        let rel = point.x - bandLeft
+        guard rel >= 0, rel <= bandWidth else {
             return .passthrough
         }
-        let buttonSide: CGFloat = bandWidth + 1 < islandSize.width ? 36 : 40
-        let spacing: CGFloat = 20
-        let cluster = buttonSide * 3 + spacing * 2
-        let clusterLeft = bandLeft + max((bandWidth - cluster) / 2, 0)
-        let rel = point.x - clusterLeft
-        guard rel >= 0, rel <= cluster else {
-            return .passthrough
-        }
-        let prevEnd = buttonSide + spacing / 2
-        let playEnd = buttonSide + spacing + buttonSide + spacing / 2
-        if rel < prevEnd { return .skipBack }
-        if rel < playEnd { return .playPause }
+        if rel < third { return .skipBack }
+        if rel < third * 2 { return .playPause }
         return .skipForward
+    }
+
+    /// Horizontal position along the 4pt bar, ignoring the time labels.
+    static func seekFraction(
+        x: CGFloat,
+        islandWidth: CGFloat,
+        bandLeft: CGFloat = 0,
+        bandWidth: CGFloat? = nil
+    ) -> Double {
+        let width = bandWidth ?? islandWidth
+        let pad = IslandMetrics.expandedHorizontalPadding
+        let barLeft = bandLeft + pad + progressLeadingTimeWidth + progressTimeSpacing
+        let barRight = bandLeft + width - pad - progressTrailingTimeWidth - progressTimeSpacing
+        let span = max(barRight - barLeft, 1)
+        return min(max(Double((x - barLeft) / span), 0), 1)
     }
 }

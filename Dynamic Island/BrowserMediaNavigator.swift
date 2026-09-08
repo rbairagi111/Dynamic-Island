@@ -48,6 +48,7 @@ enum BrowserMediaNavigator {
         if let titled = ranked.first(where: {
             $0.score >= 20
                 && YouTubeTabPicker.titlesMatchSameTrack($0.tab.title, nowPlayingTitle)
+                && StreamingPlatform.from(url: $0.tab.url) != nil
                 && StreamingPlatform.sourceURLCompatible($0.tab.url, withTitleHint: platform)
         }) {
             return titled.tab
@@ -72,6 +73,9 @@ enum BrowserMediaNavigator {
                 return watchPlayback
             }
             return music.tab
+        }
+        if let watchPlayback {
+            return watchPlayback
         }
         return ranked.first { $0.score >= 20 }?.tab
     }
@@ -351,6 +355,30 @@ enum BrowserMediaNavigator {
         }
     }
 
+    /// Elapsed / duration from the in-tab player when MediaRemote has none.
+    static func probePlaybackTiming(on tab: Tab, bundleID: String) -> (elapsed: TimeInterval, duration: TimeInterval)? {
+        switch executeJavaScript(playbackTimingJavaScript, on: tab, bundleID: bundleID) {
+        case .success(let value):
+            let parts = value.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 2,
+                  let elapsed = Double(parts[0]),
+                  let duration = Double(parts[1]) else { return nil }
+            return (max(0, elapsed), max(0, duration))
+        case .needsPermission, .failed, .missingTab:
+            return nil
+        }
+    }
+
+    private static let playbackTimingJavaScript = """
+    (() => {
+      const v = document.querySelector('#movie_player video.html5-main-video, #movie_player video, #song-video video, video.html5-main-video, video');
+      if (!v) return '0\\t0';
+      const elapsed = Number.isFinite(v.currentTime) ? v.currentTime : 0;
+      const duration = Number.isFinite(v.duration) ? v.duration : 0;
+      return elapsed + '\\t' + duration;
+    })()
+    """
+
     private static let playbackProbeJavaScript = """
     (() => {
       const seen = [];
@@ -381,6 +409,104 @@ enum BrowserMediaNavigator {
       if (state === 'playing') return 'playing';
       if (state === 'paused') return 'paused';
       return 'unknown';
+    })()
+    """
+
+    /// Next item on YouTube Music — one click, no playlist key simulation.
+    static let youtubeMusicNextJavaScript = """
+    (() => {
+      const b = document.querySelector('#next-button, .next-button, ytmusic-player-bar .next-button, [aria-label="Next"], [title="Next"]');
+      if (b) { b.click(); return 'ytm-next'; }
+      return 'no-player';
+    })()
+    """
+
+    /// Previous *item* on YouTube Music. Mid-track, YouTube restarts on the
+    /// first click — send a second click in the same turn so one island click
+    /// goes to the previous song.
+    static let youtubeMusicPreviousJavaScript = """
+    (() => {
+      const b = document.querySelector('#previous-button, .previous-button, ytmusic-player-bar .previous-button, [aria-label="Previous"], [title="Previous"]');
+      const v = document.querySelector('#song-video video, video');
+      const nearStart = !v || v.currentTime <= 1.25;
+      if (!b) return 'no-player';
+      b.click();
+      if (!nearStart) b.click();
+      return 'ytm-prev';
+    })()
+    """
+
+    /// Next video on youtube.com. Click the control first — `nextVideo()` is a
+    /// no-op on many watch pages that are not an explicit playlist.
+    static let youtubeWatchNextJavaScript = """
+    (() => {
+      const p = document.querySelector('#movie_player, .html5-video-player');
+      const b = document.querySelector('a.ytp-next-button, .ytp-next-button');
+      const href = (b && (b.href || b.getAttribute('href'))) || '';
+      if (href.indexOf('/watch') !== -1) {
+        window.location.href = href;
+        return 'nav';
+      }
+      if (p && typeof p.nextVideo === 'function') { p.nextVideo(); return 'api'; }
+      if (b) { b.click(); return 'click'; }
+      return 'no-player';
+    })()
+    """
+
+    /// When the watch player has finished and Autoplay is on, start the next video.
+    static let youtubeWatchEndedAutoplayJavaScript = """
+    (() => {
+      const v = document.querySelector('#movie_player video.html5-main-video, #movie_player video, video.html5-main-video, video');
+      if (!v) return 'no-video';
+      const ended = v.ended || (Number.isFinite(v.duration) && v.duration > 1 && v.currentTime >= v.duration - 0.45);
+      if (!ended) return 'not-ended';
+      const btn = document.querySelector('.ytp-autonav-toggle-button');
+      const checked = btn ? String(btn.getAttribute('aria-checked') || '') : 'true';
+      if (btn && checked !== 'true') return 'autoplay-off';
+      const next = document.querySelector('.ytp-next-button');
+      if (next && next.getAttribute('aria-disabled') !== 'true') { next.click(); return 'click-next'; }
+      const p = document.querySelector('#movie_player, .html5-video-player');
+      if (p && typeof p.nextVideo === 'function') { p.nextVideo(); return 'api-next'; }
+      return 'ended-no-next';
+    })()
+    """
+
+    static let youtubeMusicEndedAutoplayJavaScript = """
+    (() => {
+      const v = document.querySelector('#song-video video, video');
+      if (!v) return 'no-video';
+      const ended = v.ended || (Number.isFinite(v.duration) && v.duration > 1 && v.currentTime >= v.duration - 0.45);
+      if (!ended) return 'not-ended';
+      const b = document.querySelector('#next-button, .next-button, ytmusic-player-bar .next-button, [aria-label="Next"], [title="Next"]');
+      if (b) { b.click(); return 'ytm-next'; }
+      return 'ended-no-next';
+    })()
+    """
+
+    /// Previous video on youtube.com in one click (not restart-then-skip).
+    static let youtubeWatchPreviousJavaScript = """
+    (() => {
+      const p = document.querySelector('#movie_player, .html5-video-player');
+      const b = document.querySelector('a.ytp-prev-button, .ytp-prev-button');
+      const v = document.querySelector('#movie_player video.html5-main-video, video.html5-main-video, video');
+      const nearStart = !v || v.currentTime <= 1.25;
+      const href = (b && (b.href || b.getAttribute('href'))) || '';
+      if (!nearStart && v) {
+        if (p && typeof p.seekTo === 'function') { p.seekTo(0, true); }
+        v.currentTime = 0;
+        return 'restart';
+      }
+      if (href.indexOf('/watch') !== -1) {
+        window.location.href = href;
+        return 'nav';
+      }
+      if (p && typeof p.previousVideo === 'function') { p.previousVideo(); return 'api'; }
+      if (b) {
+        b.click();
+        return 'click';
+      }
+      if (history.length > 1) { history.back(); return 'history-back'; }
+      return 'no-player';
     })()
     """
 
@@ -584,6 +710,7 @@ enum BrowserMediaNavigator {
         let javascript = """
         (() => {
           const pick = (value) => String(value || '').trim();
+          const isAvatar = (src) => /yt3\\.(ggpht|googleusercontent)\\./i.test(src);
           const idFrom = (raw) => {
             const text = pick(raw);
             if (!text) return '';
@@ -598,14 +725,36 @@ enum BrowserMediaNavigator {
               || text.match(/\\/vi\\/([a-zA-Z0-9_-]{8,20})\\//);
             return m ? m[1] : '';
           };
-          const img = document.querySelector(
+          const imgs = Array.from(document.querySelectorAll(
             'ytmusic-player-bar img, #song-image img, .thumbnail-image-wrapper img, ytmusic-player img'
-          );
-          const art = pick(img && (img.currentSrc || img.src));
+          ));
+          let art = '';
+          let avatarArt = '';
+          for (const img of imgs) {
+            const src = pick(img && (img.currentSrc || img.src));
+            if (!src || src.toLowerCase().startsWith('data:')) continue;
+            if (isAvatar(src)) {
+              if (!avatarArt) avatarArt = src;
+              continue;
+            }
+            art = src;
+            break;
+          }
           const md = navigator.mediaSession && navigator.mediaSession.metadata;
-          const sessionArt = md && md.artwork && md.artwork.length
-            ? pick(md.artwork[md.artwork.length - 1].src)
-            : '';
+          let sessionArt = '';
+          let sessionArea = 0;
+          if (md && md.artwork) {
+            for (const item of md.artwork) {
+              const src = pick(item && item.src);
+              if (!src) continue;
+              const dim = String(item.sizes || '').match(/(\\d+)\\s*x\\s*(\\d+)/i);
+              const area = dim ? (Number(dim[1]) * Number(dim[2])) : 0;
+              if (area >= sessionArea) {
+                sessionArt = src;
+                sessionArea = area;
+              }
+            }
+          }
           const player = document.querySelector('ytmusic-player, ytmusic-player-bar, ytmusic-app');
           const attrId = pick(
             player && (
@@ -617,8 +766,14 @@ enum BrowserMediaNavigator {
             || attrId
             || idFrom(art)
             || idFrom(sessionArt)
+            || idFrom(avatarArt)
             || idFrom(document.querySelector('link[rel="canonical"]') && document.querySelector('link[rel="canonical"]').href);
-          return videoId + '\\t' + (art || sessionArt);
+          const chosen = (art && !isAvatar(art) ? art : '')
+            || (sessionArt && !isAvatar(sessionArt) ? sessionArt : '')
+            || sessionArt
+            || art
+            || avatarArt;
+          return videoId + '\\t' + chosen;
         })()
         """
         guard case .success(let value) = executeJavaScript(
@@ -638,7 +793,7 @@ enum BrowserMediaNavigator {
             : YouTubeTabPicker.youtubeVideoID(from: "https://music.youtube.com/watch?v=\(rawID)")
         let art = artworkURL.isEmpty || artworkURL.lowercased().hasPrefix("data:")
             ? nil
-            : artworkURL
+            : MediaArtworkPolicy.preferredYouTubeMusicArtworkURL(playerBarURL: artworkURL)
         if id == nil, art == nil { return nil }
         return YouTubeMusicPlayback(videoID: id, artworkURL: art)
     }
@@ -674,13 +829,18 @@ enum BrowserMediaNavigator {
             """
         } else {
             let tabID = tab.tabID
+            let liveURLGuard = activationURLAppleScriptGuard(
+                expectedURL: tab.url,
+                variable: "liveURL"
+            )
             script = """
             tell application "\(appName)"
               if \(windowIndex) is less than or equal to count of windows then
                 if \(tabIndex) is less than or equal to count of tabs of window \(windowIndex) then
                   set directTab to tab \(tabIndex) of window \(windowIndex)
                   set directID to (id of directTab) as text
-                  if "\(tabID)" is "0" or directID is "\(tabID)" then
+                  set liveURL to URL of directTab
+                  if ("\(tabID)" is "0" or directID is "\(tabID)") and (\(liveURLGuard)) then
                     try
                       return execute directTab javascript "\(escapedJS)"
                     on error errMsg
@@ -691,15 +851,13 @@ enum BrowserMediaNavigator {
               end if
               if "\(tabID)" is not "0" then
                 repeat with w from 1 to count of windows
-                  repeat with t from 1 to count of tabs of window w
-                    if ((id of tab t of window w) as text) is "\(tabID)" then
-                      try
-                        return execute tab t of window w javascript "\(escapedJS)"
-                      on error errMsg
-                        return "err:" & errMsg
-                      end try
+                  try
+                    set idTab to (first tab of window w whose id is \(tabID))
+                    set liveURL to URL of idTab
+                    if \(liveURLGuard) then
+                      return execute idTab javascript "\(escapedJS)"
                     end if
-                  end repeat
+                  end try
                 end repeat
               end if
               return "no-tab"
@@ -727,13 +885,38 @@ enum BrowserMediaNavigator {
 
     /// Prefer a live tab ID so Shorts can keep playing after the URL changes.
     static func resolveLiveTab(_ tab: Tab, from tabs: [Tab]) -> Tab? {
-        if tab.tabID != 0, let match = tabs.first(where: { $0.tabID == tab.tabID }) {
+        if tab.tabID != 0,
+           let match = tabs.first(where: {
+               $0.tabID == tab.tabID
+                   && activationURLIsCompatible(expectedURL: tab.url, liveURL: $0.url)
+           }) {
             return match
         }
         if !tab.url.isEmpty, let match = tabs.first(where: { YouTubeTabPicker.urlsMatch($0.url, tab.url) }) {
             return match
         }
         return nil
+    }
+
+    /// A stable Chrome tab ID is useful only while that tab remains on the
+    /// exact expected YouTube video (or the expected non-YouTube service).
+    /// Chrome keeps the ID when a tab navigates, so a host-only check can still
+    /// open another YouTube video in the wrong window.
+    static func activationURLIsCompatible(expectedURL: String, liveURL: String) -> Bool {
+        if StreamingPlatform.from(url: expectedURL) == .youtube,
+           YouTubeTabPicker.youtubeVideoID(from: expectedURL) != nil {
+            return YouTubeTabPicker.videoIDsMatch(expectedURL, liveURL)
+        }
+        guard let liveHost = normalizedHost(from: liveURL) else { return false }
+        return activationAllowedHosts(for: expectedURL).contains(liveHost)
+    }
+
+    /// The front-tab shortcut is only safe for a recognized playback service.
+    /// Unknown pages still participate in the full ranked scan, but can never
+    /// preempt a background YouTube tab merely because their titles overlap.
+    static func canFastBindActiveTab(_ tab: Tab, titleHint: StreamingPlatform?) -> Bool {
+        guard StreamingPlatform.from(url: tab.url) != nil else { return false }
+        return StreamingPlatform.sourceURLCompatible(tab.url, withTitleHint: titleHint)
     }
 
     @discardableResult
@@ -751,45 +934,80 @@ enum BrowserMediaNavigator {
             )
             return false
         } else {
-            NSLog("[BrowserMedia] activated app=%@ url=%@", appName, tab.url)
-            return result?.booleanValue ?? true
+            let value = result?.stringValue ?? ""
+            let ok = value == "true"
+                || value.hasPrefix("ok")
+                || (result?.booleanValue ?? false)
+            NSLog("[BrowserMedia] activated app=%@ url=%@ result=%@", appName, tab.url, value)
+            return ok
         }
     }
 
     /// Locate the tab with a read-only scan, then retarget by stable window id.
-    /// Integer `window w` becomes stale after a tab change, and `window 1` is
-    /// not Chrome's frontmost window. `activate` last can restore the previous
-    /// window, so raise the matched window again after it.
+    /// Integer `window w` is z-order and goes stale. Chrome becoming frontmost
+    /// can also restore its last-used window, so reassert the resolved stable
+    /// window ID and tab index after making the process frontmost.
+    ///
+    /// Match **tab ID first**. OR-ing URL / video-id in the same scan picks the
+    /// first window that happens to have that watch URL — often a duplicate
+    /// tab — and never reaches the Now Playing tab.
     static func activationAppleScript(tab: Tab, bundleID: String) -> String {
         let appName = appleScriptName(for: bundleID)
         let escapedURL = appleScriptEscape(tab.url)
         let escapedVideoID = appleScriptEscape(YouTubeTabPicker.youtubeVideoID(from: tab.url) ?? "")
+        let liveURLGuard = activationURLAppleScriptGuard(
+            expectedURL: tab.url,
+            variable: "liveURL"
+        )
         if appName == "Safari" {
             return """
+            set winID to 0
+            set tabIdx to 0
             tell application "Safari"
               set targetURL to "\(escapedURL)"
               set targetVideo to "\(escapedVideoID)"
-              set winID to 0
-              set tabIdx to 0
-              repeat with w from 1 to count of windows
-                repeat with t from 1 to count of tabs of window w
-                  try
-                    set u to URL of tab t of window w
-                    if u is targetURL or (targetVideo is not "" and (u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo))) then
-                      set winID to id of window w
-                      set tabIdx to t
-                      exit repeat
-                    end if
-                  end try
+              if targetURL is not "" then
+                repeat with w from 1 to count of windows
+                  repeat with t from 1 to count of tabs of window w
+                    try
+                      set u to URL of tab t of window w
+                      if u is targetURL then
+                        set winID to (id of window w) as integer
+                        set tabIdx to t
+                        exit repeat
+                      end if
+                    end try
+                  end repeat
+                  if winID is not 0 then exit repeat
                 end repeat
-                if winID is not 0 then exit repeat
-              end repeat
-              if winID is 0 then return false
+              end if
+              if winID is 0 and targetVideo is not "" then
+                repeat with w from 1 to count of windows
+                  repeat with t from 1 to count of tabs of window w
+                    try
+                      set u to URL of tab t of window w
+                      if u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo) then
+                        set winID to (id of window w) as integer
+                        set tabIdx to t
+                        exit repeat
+                      end if
+                    end try
+                  end repeat
+                  if winID is not 0 then exit repeat
+                end repeat
+              end if
+            end tell
+            if winID is 0 then return false
+            tell application "Safari"
               tell window id winID to set current tab to tab tabIdx
               set index of window id winID to 1
-              activate
+            end tell
+            \(makeApplicationFrontmostAppleScript(appName: "Safari"))
+            tell application "Safari"
               set index of window id winID to 1
-              return true
+              tell window id winID to set current tab to tab tabIdx
+              set index of window id winID to 1
+              return "ok:" & ((index of window id winID) as text)
             end tell
             """
         }
@@ -800,34 +1018,161 @@ enum BrowserMediaNavigator {
             """
         }
         return """
+        set winID to 0
+        set tabIdx to 0
         tell application "\(appName)"
           set targetURL to "\(escapedURL)"
           set targetID to "\(tab.tabID)"
           set targetVideo to "\(escapedVideoID)"
-          set winID to 0
-          set tabIdx to 0
-          repeat with w from 1 to count of windows
-            repeat with t from 1 to count of tabs of window w
-              try
-                set candidate to tab t of window w
-                set candidateID to (id of candidate) as text
-                set u to URL of candidate
-                if (targetID is not "0" and candidateID is targetID) or u is targetURL or (targetVideo is not "" and (u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo))) then
-                  set winID to id of window w
-                  set tabIdx to t
-                  exit repeat
-                end if
-              end try
+          if targetID is not "0" then
+            repeat with w from 1 to count of windows
+              repeat with t from 1 to count of tabs of window w
+                try
+                  if ((id of tab t of window w) as text) is targetID then
+                    set liveURL to URL of tab t of window w
+                    if \(liveURLGuard) then
+                      set winID to (id of window w) as integer
+                      set tabIdx to t
+                      exit repeat
+                    end if
+                  end if
+                end try
+              end repeat
+              if winID is not 0 then exit repeat
             end repeat
-            if winID is not 0 then exit repeat
-          end repeat
-          if winID is 0 then return false
+          end if
+          if winID is 0 and targetURL is not "" then
+            repeat with w from 1 to count of windows
+              repeat with t from 1 to count of tabs of window w
+                try
+                  if (URL of tab t of window w) is targetURL then
+                    set winID to (id of window w) as integer
+                    set tabIdx to t
+                    exit repeat
+                  end if
+                end try
+              end repeat
+              if winID is not 0 then exit repeat
+            end repeat
+          end if
+          if winID is 0 and targetVideo is not "" then
+            repeat with w from 1 to count of windows
+              repeat with t from 1 to count of tabs of window w
+                try
+                  set u to URL of tab t of window w
+                  if u contains ("/shorts/" & targetVideo) or u contains ("v=" & targetVideo) or u contains ("youtu.be/" & targetVideo) then
+                    set winID to (id of window w) as integer
+                    set tabIdx to t
+                    exit repeat
+                  end if
+                end try
+              end repeat
+              if winID is not 0 then exit repeat
+            end repeat
+          end if
+        end tell
+        if winID is 0 then return false
+        tell application "\(appName)"
+          set active tab index of window id winID to tabIdx
+          try
+            set minimized of window id winID to false
+          end try
+          set index of window id winID to 1
+        end tell
+        \(makeApplicationFrontmostAppleScript(appName: appName))
+        tell application "\(appName)"
+          set index of window id winID to 1
           set active tab index of window id winID to tabIdx
           set index of window id winID to 1
-          activate
-          set index of window id winID to 1
-          return true
+          return "ok:" & ((index of window id winID) as text)
         end tell
+        """
+    }
+
+    private static func normalizedHost(from rawURL: String) -> String? {
+        guard let host = URLComponents(string: rawURL)?.host?
+            .lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".")),
+              !host.isEmpty else {
+            return nil
+        }
+        return host
+    }
+
+    private static func activationAllowedHosts(for rawURL: String) -> Set<String> {
+        guard let host = normalizedHost(from: rawURL) else { return [] }
+        if let platform = StreamingPlatform.from(url: rawURL),
+           platform == .youtube || platform == .youtubeMusic {
+            return [
+                "youtube.com",
+                "www.youtube.com",
+                "m.youtube.com",
+                "music.youtube.com",
+                "youtu.be",
+                "www.youtu.be"
+            ]
+        }
+        if host.hasPrefix("www.") {
+            return [host, String(host.dropFirst(4))]
+        }
+        return [host, "www.\(host)"]
+    }
+
+    private static func activationURLAppleScriptGuard(
+        expectedURL: String,
+        variable: String
+    ) -> String {
+        if StreamingPlatform.from(url: expectedURL) == .youtube,
+           let videoID = YouTubeTabPicker.youtubeVideoID(from: expectedURL) {
+            let escapedID = appleScriptEscape(videoID)
+            return [
+                "\(variable) contains \"/shorts/\(escapedID)\"",
+                "\(variable) contains \"v=\(escapedID)\"",
+                "\(variable) contains \"youtu.be/\(escapedID)\""
+            ]
+            .joined(separator: " or ")
+        }
+        let clauses = activationAllowedHosts(for: expectedURL)
+            .sorted()
+            .flatMap { host in
+                let escapedHost = appleScriptEscape(host)
+                return [
+                    "\(variable) is \"https://\(escapedHost)\"",
+                    "\(variable) starts with \"https://\(escapedHost)/\"",
+                    "\(variable) is \"http://\(escapedHost)\"",
+                    "\(variable) starts with \"http://\(escapedHost)/\""
+                ]
+            }
+        return clauses.isEmpty ? "false" : clauses.joined(separator: " or ")
+    }
+
+    /// Letter-heavy prefix so Accessibility window names still match after
+    /// YouTube emoji / badge text is stripped.
+    static func accessibilityWindowNeedle(from title: String) -> String {
+        let kept = title.unicodeScalars.filter { scalar in
+            CharacterSet.letters.contains(scalar)
+                || CharacterSet.decimalDigits.contains(scalar)
+                || scalar == "'"
+                || scalar == " "
+        }
+        let compact = String(String.UnicodeScalarView(kept))
+            .replacingOccurrences(of: "  ", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if compact.count >= 4 {
+            return String(compact.prefix(32))
+        }
+        return String(title.prefix(24))
+    }
+
+    private static func makeApplicationFrontmostAppleScript(appName: String) -> String {
+        return """
+        try
+          tell application "System Events"
+            tell process "\(appName)"
+              set frontmost to true
+            end tell
+          end tell
+        end try
         """
     }
 

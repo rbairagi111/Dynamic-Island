@@ -109,12 +109,18 @@ final class ShelfTrayView: NSView {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        if sender.draggingSource is ShelfThumbView {
+            return []
+        }
         onTargeted?(true)
         return .copy
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        .copy
+        if sender.draggingSource is ShelfThumbView {
+            return []
+        }
+        return .copy
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
@@ -122,11 +128,12 @@ final class ShelfTrayView: NSView {
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        true
+        sender.draggingSource is ShelfThumbView ? false : true
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         onTargeted?(false)
+        if sender.draggingSource is ShelfThumbView { return false }
         let urls = sender.draggingPasteboard.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
@@ -145,10 +152,12 @@ final class ShelfTrayView: NSView {
         for item in items {
             if let existing = thumbViews[item.id] {
                 existing.item = item
+                existing.onRemove = { [weak self] in self?.onRemove?(item.id) }
                 existing.needsDisplay = true
                 continue
             }
             let thumb = ShelfThumbView(item: item)
+            thumb.onRemove = { [weak self] in self?.onRemove?(item.id) }
             thumb.onDragBegan = { [weak self] in self?.onDragBegan?() }
             thumb.onDragEnded = { [weak self] completed in
                 self?.onDragEnded?(item.id, completed)
@@ -166,8 +175,60 @@ final class ShelfTrayView: NSView {
     ]
 }
 
+/// Apple dismiss control for a held file: SF Symbol `xmark.circle.fill`
+/// (HIG: use the system clear/dismiss glyph, not a custom X).
+enum ShelfCancelBadge {
+    static let symbolName = "xmark.circle.fill"
+    static let size: CGFloat = 16
+    static let inset: CGFloat = 1
+
+    static func rect(in bounds: NSRect) -> NSRect {
+        NSRect(
+            x: bounds.maxX - size - inset,
+            y: bounds.minY + inset,
+            width: size,
+            height: size
+        )
+    }
+
+    static func hitRect(in bounds: NSRect) -> NSRect {
+        rect(in: bounds).insetBy(dx: -4, dy: -4).intersection(bounds)
+    }
+
+    static func draw(in bounds: NSRect) {
+        let badge = rect(in: bounds)
+        let halo = badge.insetBy(dx: -1, dy: -1)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: halo).fill()
+        image.draw(
+            in: badge,
+            from: .zero,
+            operation: .sourceOver,
+            fraction: 1,
+            respectFlipped: true,
+            hints: nil
+        )
+    }
+
+    static var image: NSImage {
+        let symbol = NSImage(
+            systemSymbolName: symbolName,
+            accessibilityDescription: "Cancel"
+        ) ?? NSImage()
+        let config = NSImage.SymbolConfiguration(pointSize: 13, weight: .bold)
+            .applying(
+                NSImage.SymbolConfiguration(paletteColors: [
+                    NSColor(white: 0.12, alpha: 0.94),
+                    .white
+                ])
+            )
+        return symbol.withSymbolConfiguration(config) ?? symbol
+    }
+}
+
 final class ShelfThumbView: NSView, NSDraggingSource {
     var item: ShelfItem
+    var onRemove: (() -> Void)?
     var onDragBegan: (() -> Void)?
     var onDragEnded: ((Bool) -> Void)?
     private var started = false
@@ -176,8 +237,9 @@ final class ShelfThumbView: NSView, NSDraggingSource {
         self.item = item
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.cornerRadius = 10
-        layer?.masksToBounds = true
+        layer?.masksToBounds = false
+        setAccessibilityRole(.image)
+        setAccessibilityLabel(item.filename)
     }
 
     required init?(coder: NSCoder) {
@@ -188,17 +250,26 @@ final class ShelfThumbView: NSView, NSDraggingSource {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
+        NSGraphicsContext.saveGraphicsState()
+        NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).addClip()
         if let image = item.thumbnail {
             image.draw(in: bounds)
         } else {
             NSColor.white.withAlphaComponent(0.12).setFill()
             bounds.fill()
         }
+        NSGraphicsContext.restoreGraphicsState()
+        ShelfCancelBadge.draw(in: bounds)
     }
 
     override func mouseDown(with event: NSEvent) {
         started = false
         guard let window else { return }
+        let local = convert(event.locationInWindow, from: nil)
+        if ShelfCancelBadge.hitRect(in: bounds).contains(local) {
+            trackCancelClick(from: event)
+            return
+        }
         onDragBegan?()
         let start = event.locationInWindow
         while true {
@@ -233,8 +304,48 @@ final class ShelfThumbView: NSView, NSDraggingSource {
         started = true
         let writer = ShelfFileURLWriter(url: item.url)
         let dragItem = NSDraggingItem(pasteboardWriter: writer)
-        dragItem.setDraggingFrame(bounds, contents: item.thumbnail)
+        dragItem.setDraggingFrame(bounds, contents: draggingPreview())
         beginDraggingSession(with: [dragItem], event: event, source: self)
+    }
+
+    private func trackCancelClick(from event: NSEvent) {
+        guard let window else { return }
+        while true {
+            guard let next = window.nextEvent(
+                matching: [.leftMouseUp, .leftMouseDragged],
+                until: .distantFuture,
+                inMode: .eventTracking,
+                dequeue: true
+            ) else { return }
+            if next.type == .leftMouseUp {
+                let local = convert(next.locationInWindow, from: nil)
+                if ShelfCancelBadge.hitRect(in: bounds).contains(local) {
+                    onRemove?()
+                }
+                return
+            }
+        }
+    }
+
+    /// Drag preview keeps the same dismiss badge attached to the file.
+    private func draggingPreview() -> NSImage {
+        let size = bounds.size
+        guard size.width > 0, size.height > 0 else {
+            return item.thumbnail ?? NSImage(size: NSSize(width: 1, height: 1))
+        }
+        return NSImage(size: size, flipped: true) { rect in
+            NSGraphicsContext.saveGraphicsState()
+            NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10).addClip()
+            if let image = self.item.thumbnail {
+                image.draw(in: rect)
+            } else {
+                NSColor.white.withAlphaComponent(0.12).setFill()
+                rect.fill()
+            }
+            NSGraphicsContext.restoreGraphicsState()
+            ShelfCancelBadge.draw(in: rect)
+            return true
+        }
     }
 
     func draggingSession(

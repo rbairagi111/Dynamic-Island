@@ -758,6 +758,36 @@ struct Dynamic_IslandTests {
         #expect(ChromeTabMonitor.parseFrontmostActiveTabID("1,2,101,claude") == nil)
     }
 
+    @Test func chatActivationSelectsMatchedWindowNotWindowListPositionOne() {
+        let conversation = ClaudeTabInfo(
+            tabID: 1530773650,
+            windowIndex: 2,
+            tabIndex: 4,
+            provider: .claude,
+            url: "https://claude.ai/chat/abc12345-def6-7890"
+        )
+        let script = ChromeTabMonitor.activateScript(tab: conversation)
+        #expect(script.contains("set active tab index of window id winID to tabIdx"))
+        #expect(script.contains("set index of window id winID to 1"))
+        #expect(!script.contains("set active tab index of window 1 to"))
+        #expect(script.contains("if (URL of candidate) is targetURL then"))
+        let home = ClaudeTabInfo(
+            tabID: 99,
+            windowIndex: 1,
+            tabIndex: 1,
+            provider: .claude,
+            url: "https://claude.ai/new"
+        )
+        let homeScript = ChromeTabMonitor.activateScript(tab: home)
+        #expect(homeScript.contains("if false then"))
+        #expect(!homeScript.contains("if (URL of candidate) is targetURL then"))
+        #expect(ChromeTabMonitor.chatActivationURLIsSpecific("https://claude.ai/chat/abc12345-def6-7890"))
+        #expect(!ChromeTabMonitor.chatActivationURLIsSpecific("https://claude.ai/new"))
+        #expect(!ChromeTabMonitor.chatActivationURLIsSpecific("https://claude.ai/"))
+        #expect(ChromeTabMonitor.chatActivationURLIsSpecific("https://chatgpt.com/c/xyz98765-aaaa"))
+        #expect(!ChromeTabMonitor.chatActivationURLIsSpecific("https://chatgpt.com/"))
+    }
+
     @Test func suppressOverlayWhenFrontChatTabIsAlreadyVisible() {
         #expect(
             ChromeTabMonitor.shouldSuppressIslandOverlay(
@@ -1791,6 +1821,19 @@ struct Dynamic_IslandTests {
         )
     }
 
+    @Test func youtubeSkipScriptsAdvanceOnASingleClick() {
+        let nextWatch = BrowserMediaNavigator.youtubeWatchNextJavaScript
+        #expect(nextWatch.contains(".ytp-next-button"))
+        #expect(nextWatch.contains("b.click()"))
+        let prevWatch = BrowserMediaNavigator.youtubeWatchPreviousJavaScript
+        #expect(!prevWatch.contains("setTimeout"))
+        #expect(prevWatch.contains("if (!nearStart) b.click()"))
+        let prevMusic = BrowserMediaNavigator.youtubeMusicPreviousJavaScript
+        #expect(!prevMusic.contains("setTimeout"))
+        #expect(prevMusic.contains("if (!nearStart) b.click()"))
+        #expect(BrowserMediaNavigator.youtubeMusicNextJavaScript.contains("b.click()"))
+    }
+
     @Test func audioAmplitudeRMSOfSilenceIsZero() {
         #expect(AudioAmplitudeDSP.rms(samples: []) == 0)
         #expect(AudioAmplitudeDSP.rms(samples: [0, 0, 0, 0]) == 0)
@@ -2282,6 +2325,54 @@ struct Dynamic_IslandTests {
         #expect(RedirectedMediaKey.fromCGKeyCode(RedirectedMediaKey.cgKeyF18) == .volumeUp)
         #expect(RedirectedMediaKey.fromNXKeyCode(0) == .volumeUp)
         #expect(RedirectedMediaKey.fromCGKeyCode(0) == nil)
+    }
+
+    @Test func keyboardArrowsMapToTheSameIslandTransportButtons() {
+        #expect(IslandKeyboardTransport.fromNXKeyCode(16) == .playPause)
+        #expect(IslandKeyboardTransport.fromNXKeyCode(17) == .skipForward)
+        #expect(IslandKeyboardTransport.fromNXKeyCode(18) == .skipBack)
+        #expect(IslandKeyboardTransport.fromNXKeyCode(19) == .skipForward)
+        #expect(IslandKeyboardTransport.fromNXKeyCode(20) == .skipBack)
+        #expect(IslandKeyboardTransport.fromNXKeyCode(0) == nil)
+        #expect(IslandKeyboardTransport.fromNXKeyCode(7) == nil)
+
+        let none = CGEventFlags(rawValue: 0)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(123, flags: none) == .skipBack)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(124, flags: none) == .skipForward)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(49, flags: none) == .playPause)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(123, flags: .maskCommand) == nil)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(124, flags: .maskShift) == nil)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(49, flags: .maskAlternate) == nil)
+        #expect(IslandKeyboardTransport.fromCGKeyCode(126, flags: none) == nil)
+
+        #expect(
+            IslandSurfacePolicy.shouldBindArrowKeysToIsland(
+                isExpanded: true,
+                hasMedia: true,
+                pointerOverIsland: true
+            )
+        )
+        #expect(
+            !IslandSurfacePolicy.shouldBindArrowKeysToIsland(
+                isExpanded: false,
+                hasMedia: true,
+                pointerOverIsland: true
+            )
+        )
+        #expect(
+            !IslandSurfacePolicy.shouldBindArrowKeysToIsland(
+                isExpanded: true,
+                hasMedia: true,
+                pointerOverIsland: false
+            )
+        )
+        #expect(
+            !IslandSurfacePolicy.shouldBindArrowKeysToIsland(
+                isExpanded: true,
+                hasMedia: false,
+                pointerOverIsland: true
+            )
+        )
     }
 
     @Test func desktopIslandStaysVisibleWhenABannerIsShowing() {
@@ -3395,16 +3486,66 @@ struct Dynamic_IslandTests {
         #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 640, pixelHeight: 360))
         #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 320, pixelHeight: 180))
         #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 480, pixelHeight: 360))
-        #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 150, pixelHeight: 83))
+        #expect(MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 150, pixelHeight: 83))
         #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 256, pixelHeight: 256))
         #expect(MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 150, pixelHeight: 150))
         #expect(MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 544, pixelHeight: 544))
+        #expect(!MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 120, pixelHeight: 120))
         #expect(!MediaArtworkPolicy.isLikelyAlbumArtwork(pixelWidth: 64, pixelHeight: 64))
         #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 128, pixelHeight: 128))
         #expect(!MediaArtworkPolicy.isLikelyVideoThumbnail(pixelWidth: 0, pixelHeight: 0))
         #expect(MediaArtworkPolicy.isYouTubePosterToken("ytimg:abc"))
         #expect(MediaArtworkPolicy.isYouTubePosterToken("remote:ytimg:abc"))
         #expect(!MediaArtworkPolicy.isYouTubePosterToken("remote:/9j/4AAQ"))
+        #expect(!MediaArtworkPolicy.isYouTubePosterToken("remote:ytmimg:https://lh3.googleusercontent.com/a"))
+        #expect(MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork("remote:ytimg:abc"))
+        #expect(MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork("remote:ytmimg:https://lh3.googleusercontent.com/a"))
+        #expect(!MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork("remote:/9j/4AAQ"))
+        #expect(
+            MediaArtworkPolicy.isAllowedYouTubeArtworkDownloadHost("lh3.googleusercontent.com")
+        )
+        #expect(MediaArtworkPolicy.isAllowedYouTubeArtworkDownloadHost("i.ytimg.com"))
+        #expect(!MediaArtworkPolicy.isAllowedYouTubeArtworkDownloadHost("yt3.ggpht.com"))
+        #expect(!MediaArtworkPolicy.isAllowedYouTubeArtworkDownloadHost("example.com"))
+        #expect(
+            MediaArtworkPolicy.isAllowedYouTubeMusicArtworkDownloadHost("yt3.googleusercontent.com")
+        )
+        #expect(
+            MediaArtworkPolicy.isAllowedYouTubeMusicArtworkDownloadHost("lh3.googleusercontent.com")
+        )
+        #expect(
+            MediaArtworkPolicy.preferredYouTubeMusicArtworkURL(
+                playerBarURL: "https://yt3.googleusercontent.com/avatar",
+                sessionURL: "https://lh3.googleusercontent.com/cover=s544"
+            ) == "https://lh3.googleusercontent.com/cover=s544"
+        )
+        #expect(
+            MediaArtworkPolicy.preferredYouTubeMusicArtworkURL(
+                playerBarURL: "https://lh3.googleusercontent.com/cover=s544",
+                sessionURL: "https://yt3.googleusercontent.com/avatar"
+            ) == "https://lh3.googleusercontent.com/cover=s544"
+        )
+        #expect(
+            MediaArtworkPolicy.shouldAcceptYouTubeMusicRemoteImage(pixelWidth: 544, pixelHeight: 544)
+        )
+        #expect(
+            MediaArtworkPolicy.shouldAcceptYouTubeMusicRemoteImage(pixelWidth: 320, pixelHeight: 180)
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldAcceptYouTubeMusicRemoteImage(pixelWidth: 64, pixelHeight: 64)
+        )
+        #expect(
+            MediaArtworkPolicy.youtubeMusicShouldTryPlayerBarArtworkBeforeWatchPoster(
+                hasPlayerBarImageURL: true,
+                hasVideoID: true
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.youtubeMusicShouldTryPlayerBarArtworkBeforeWatchPoster(
+                hasPlayerBarImageURL: false,
+                hasVideoID: true
+            )
+        )
         #expect(MediaClient.squareCropRect(pixelWidth: 480, pixelHeight: 360).side == 270)
         #expect(MediaClient.squareCropRect(pixelWidth: 480, pixelHeight: 360).x == 105)
         #expect(MediaClient.squareCropRect(pixelWidth: 480, pixelHeight: 360).y == 45)
@@ -3415,7 +3556,9 @@ struct Dynamic_IslandTests {
                 platform: nil,
                 resemblesBrowserIcon: false,
                 isLikelyVideoThumbnail: true,
-                hasRemote: true
+                hasRemote: true,
+                pixelWidth: 150,
+                pixelHeight: 83
             )
         )
         #expect(
@@ -3424,6 +3567,16 @@ struct Dynamic_IslandTests {
                 resemblesBrowserIcon: false,
                 isLikelyVideoThumbnail: false,
                 hasRemote: true
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: nil,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true,
+                pixelWidth: 256,
+                pixelHeight: 256
             )
         )
         #expect(
@@ -3454,12 +3607,65 @@ struct Dynamic_IslandTests {
         )
         #expect(
             !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtubeMusic,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: true,
+                hasRemote: true,
+                pixelWidth: 320,
+                pixelHeight: 180
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
                 platform: .youtube,
                 resemblesBrowserIcon: false,
                 isLikelyVideoThumbnail: false,
                 hasRemote: true,
                 pixelWidth: 150,
                 pixelHeight: 150
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: nil,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true,
+                pixelWidth: 256,
+                pixelHeight: 256,
+                sourceURL: "https://www.youtube.com/watch?v=abc"
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtube,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: true,
+                hasRemote: true,
+                pixelWidth: 320,
+                pixelHeight: 180,
+                sourceURL: "https://www.youtube.com/watch?v=abc"
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: nil,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true,
+                pixelWidth: 256,
+                pixelHeight: 256
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldShowBrowserRemoteArtwork(
+                platform: .youtubeMusic,
+                resemblesBrowserIcon: false,
+                isLikelyVideoThumbnail: false,
+                hasRemote: true,
+                pixelWidth: 256,
+                pixelHeight: 256,
+                sourceURL: "https://music.youtube.com/"
             )
         )
     }
@@ -3484,10 +3690,20 @@ struct Dynamic_IslandTests {
             )
         )
         #expect(
-            !MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
+            MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
                 previousToken: "remote:/9j/4AAQ",
                 policyToken: "pending:browser"
             )
+        )
+        #expect(
+            MediaArtworkPolicy.upgradedYouTubeMusicArtworkURL(
+                "https://lh3.googleusercontent.com/cover=s60"
+            ).contains("=s544")
+        )
+        #expect(
+            MediaArtworkPolicy.upgradedYouTubeMusicArtworkURL(
+                "https://lh3.googleusercontent.com/cover=w60-h60-l90-rj"
+            ).contains("=w544-h544")
         )
         #expect(
             MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
@@ -3496,10 +3712,58 @@ struct Dynamic_IslandTests {
             )
         )
         #expect(
+            MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
+                previousToken: "remote:ytmimg:https://lh3.googleusercontent.com/cover",
+                policyToken: "pending:youtube"
+            )
+        )
+        #expect(
             !MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
                 previousToken: "remote:ytimg:trailer",
                 policyToken: "pending:youtube",
                 identityChanged: true
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldDropHeldYouTubeArtwork(
+                identityChanged: true,
+                sameYouTubeVideo: true,
+                previousTitle: "The Greatest Comeback Ever? (Arslan Ash)",
+                nextTitle: "Gucci Gang"
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldDropHeldYouTubeArtwork(
+                identityChanged: true,
+                sameYouTubeVideo: true,
+                previousTitle: "Some Video Title",
+                nextTitle: "YouTube"
+            )
+        )
+        #expect(
+            !MediaArtworkPolicy.shouldDropHeldYouTubeArtwork(
+                identityChanged: false,
+                sameYouTubeVideo: true,
+                previousTitle: "Same Track",
+                nextTitle: "Same Track"
+            )
+        )
+        #expect(
+            MediaArtworkPolicy.shouldDropHeldYouTubeArtwork(
+                identityChanged: true,
+                sameYouTubeVideo: false,
+                previousTitle: "Old Track",
+                nextTitle: "New Track"
+            )
+        )
+        // Stale youtube.com binding after a title change must not keep Chrome's
+        // 16:9 JPEG; Music cover fetch happens after the Music tab binds.
+        #expect(
+            MediaArtworkPolicy.shouldDropHeldYouTubeArtwork(
+                identityChanged: true,
+                sameYouTubeVideo: true,
+                previousTitle: "Trailer Title Here",
+                nextTitle: "Gucci Gang"
             )
         )
         #expect(
@@ -3582,7 +3846,7 @@ struct Dynamic_IslandTests {
             url: "https://www.primevideo.com/detail/0NPUDV12CFZ3EA8Z5WJZFNIDIS"
         )
         #expect(
-            YouTubeTabPicker.titlesMatchSameTrack(youtube.title, prime.title)
+            !YouTubeTabPicker.titlesMatchSameTrack(youtube.title, prime.title)
         )
         #expect(
             !StreamingPlatform.sourceURLCompatible(
@@ -3649,8 +3913,22 @@ struct Dynamic_IslandTests {
         )
         #expect(chrome.contains("set active tab index of window id winID to tabIdx"))
         #expect(chrome.contains("set index of window id winID to 1"))
+        #expect(chrome.contains("set winID to (id of window w) as integer"))
+        #expect(chrome.contains("set minimized of window id winID to false"))
+        #expect(chrome.contains("tell application \"System Events\""))
+        #expect(chrome.contains("set frontmost to true"))
+        #expect(!chrome.contains("perform action \"AXRaise\" of w"))
+        #expect(!chrome.contains("repeat with w in windows"))
+        #expect(chrome.contains("return \"ok:\" & ((index of window id winID) as text)"))
         #expect(!chrome.contains("set active tab index of window 1 to t"))
         #expect(!chrome.contains("set active tab index of window w to t"))
+        #expect(chrome.contains("if targetID is not \"0\" then"))
+        #expect(!chrome.contains("candidateID is targetID) or u is targetURL"))
+        #expect(
+            BrowserMediaNavigator.accessibilityWindowNeedle(
+                from: "O'Sullivan's SIXTH 1️⃣4️⃣7️⃣ 🔥 | World Championship 2003"
+            ).contains("O'Sullivan")
+        )
         let safari = BrowserMediaNavigator.activationAppleScript(
             tab: tab,
             bundleID: "com.apple.Safari"
@@ -3835,6 +4113,12 @@ struct Dynamic_IslandTests {
                 "HE'S TOO GOOD! 🔥 | Zhao Xintong vs Michael Holt"
             )
         )
+        #expect(
+            !YouTubeTabPicker.titlesMatchSameTrack(
+                "INCREDIBLE PERFORMANCE! Barry Hawkins vs Liam Davies | 2026 British Open",
+                "THAT WAS A FUN FRAME 😊! Zhao Xintong vs Oliver Brown | Unibet British Open 2026"
+            )
+        )
         #expect(YouTubeTabPicker.isGenericYouTubeDocumentTitle("(14135) YouTube"))
         #expect(YouTubeTabPicker.isGenericYouTubeDocumentTitle("(1) YouTube Music"))
         #expect(
@@ -3857,6 +4141,30 @@ struct Dynamic_IslandTests {
                 tabTitle: "WHO HOLDS THEIR NERVE? Chris Wakelin vs Ronnie",
                 tabURL: "https://www.youtube.com/watch?v=6p179tTNPxQ",
                 nowPlayingTitle: "WINNING IS HARD! Wu Yize vs Liu Hongyu"
+            )
+        )
+        let watchA = "https://www.youtube.com/watch?v=3KQc0LmCaaE"
+        let watchB = "https://www.youtube.com/watch?v=KNAGNQeu5J8"
+        #expect(YouTubeTabPicker.videoIDsMatch(watchA, watchA))
+        #expect(!YouTubeTabPicker.videoIDsMatch(watchA, watchB))
+        #expect(
+            YouTubeTabPicker.snapshotCanAcceptYouTubePoster(
+                snapshotTitle: "YouTube",
+                snapshotURL: watchA,
+                snapshotBundle: "com.google.Chrome",
+                requestedTitle: "WORLD #1 IN TROUBLE! Oliver Lines vs Zhao Xintong",
+                requestedURL: watchA,
+                requestedBundle: "com.google.Chrome"
+            )
+        )
+        #expect(
+            !YouTubeTabPicker.snapshotCanAcceptYouTubePoster(
+                snapshotTitle: "YouTube",
+                snapshotURL: watchB,
+                snapshotBundle: "com.google.Chrome",
+                requestedTitle: "WORLD #1 IN TROUBLE! Oliver Lines vs Zhao Xintong",
+                requestedURL: watchA,
+                requestedBundle: "com.google.Chrome"
             )
         )
     }
@@ -3946,6 +4254,111 @@ struct Dynamic_IslandTests {
         #expect(live == shorts)
     }
 
+    @Test func staleYouTubeTabIDCanNeverActivateGoogleDrive() {
+        let expected = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 3,
+            tabID: 88,
+            title: "Current video - YouTube",
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        )
+        let reusedByDrive = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 3,
+            tabID: 88,
+            title: "Access Denied - Google Drive",
+            url: "https://drive.google.com/drive/folders/example"
+        )
+        let liveYouTube = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 1,
+            tabID: 99,
+            title: "Current video - YouTube",
+            url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share"
+        )
+
+        #expect(
+            !BrowserMediaNavigator.activationURLIsCompatible(
+                expectedURL: expected.url,
+                liveURL: reusedByDrive.url
+            )
+        )
+        #expect(
+            !StreamingPlatform.sourceURLCompatible(
+                reusedByDrive.url,
+                withTitleHint: .youtube
+            )
+        )
+        #expect(
+            !BrowserMediaNavigator.canFastBindActiveTab(
+                reusedByDrive,
+                titleHint: nil
+            )
+        )
+        #expect(
+            BrowserMediaNavigator.canFastBindActiveTab(
+                liveYouTube,
+                titleHint: .youtube
+            )
+        )
+        #expect(
+            BrowserMediaNavigator.activationURLIsCompatible(
+                expectedURL: expected.url,
+                liveURL: "https://music.youtube.com/watch?v=dQw4w9WgXcQ"
+            )
+        )
+        #expect(
+            !BrowserMediaNavigator.activationURLIsCompatible(
+                expectedURL: expected.url,
+                liveURL: "https://www.youtube.com/watch?v=9bZkp7q19f0"
+            )
+        )
+        #expect(
+            BrowserMediaNavigator.resolveLiveTab(
+                expected,
+                from: [reusedByDrive, liveYouTube]
+            ) == liveYouTube
+        )
+        #expect(
+            BrowserMediaNavigator.resolveLiveTab(
+                expected,
+                from: [reusedByDrive]
+            ) == nil
+        )
+
+        let script = BrowserMediaNavigator.activationAppleScript(
+            tab: expected,
+            bundleID: "com.google.Chrome"
+        )
+        #expect(script.contains("set liveURL to URL of tab t of window w"))
+        #expect(script.contains("liveURL contains \"v=dQw4w9WgXcQ\""))
+        #expect(!script.contains("perform action \"AXRaise\" of w"))
+
+        let titleCollisionOnDrive = BrowserMediaNavigator.Tab(
+            windowIndex: 1,
+            tabIndex: 4,
+            tabID: 100,
+            title: "Current video - YouTube Campaign - Google Drive",
+            url: "https://drive.google.com/file/d/example/view"
+        )
+        let genericYouTube = BrowserMediaNavigator.Tab(
+            windowIndex: 2,
+            tabIndex: 2,
+            tabID: 101,
+            title: "(14181) YouTube",
+            url: expected.url
+        )
+        #expect(
+            BrowserMediaNavigator.pick(
+                from: [titleCollisionOnDrive, genericYouTube],
+                nowPlayingTitle: "Current video - YouTube Campaign",
+                nowPlayingArtist: "Creator",
+                preferredURL: expected.url,
+                platform: .youtube
+            ) == genericYouTube
+        )
+    }
+
     @Test func islandClickRevealsMediaAndLeavesTransportForControls() {
         let expanded = CGSize(width: 335, height: 178)
         #expect(
@@ -4012,7 +4425,13 @@ struct Dynamic_IslandTests {
                 overlay: nil,
                 hasMedia: true,
                 persistentIsMusic: true
-            ) == .passthrough
+            ) == .seek
+        )
+        #expect(
+            abs(
+                IslandClickPolicy.seekFraction(x: 58, islandWidth: 335)
+                    - 0
+            ) < 0.02
         )
         #expect(
             IslandClickPolicy.action(
@@ -4267,6 +4686,20 @@ struct Dynamic_IslandTests {
         #expect(ShelfLogic.kind(for: URL(fileURLWithPath: "/tmp/photo.png")) == .image)
     }
 
+    @Test func shelfCancelBadgeUsesAppleDismissSymbolOnTheTopTrailingCorner() {
+        let bounds = NSRect(x: 0, y: 0, width: IslandMetrics.shelfThumbSize, height: IslandMetrics.shelfThumbSize)
+        let badge = ShelfCancelBadge.rect(in: bounds)
+        let hit = ShelfCancelBadge.hitRect(in: bounds)
+        #expect(ShelfCancelBadge.symbolName == "xmark.circle.fill")
+        #expect(NSImage(systemSymbolName: ShelfCancelBadge.symbolName, accessibilityDescription: nil) != nil)
+        #expect(badge.maxX <= bounds.maxX)
+        #expect(badge.minY >= bounds.minY)
+        #expect(badge.minX > bounds.midX)
+        #expect(badge.maxY < bounds.midY)
+        #expect(hit.contains(NSPoint(x: badge.midX, y: badge.midY)))
+        #expect(!hit.contains(NSPoint(x: bounds.midX, y: bounds.midY)))
+    }
+
     @Test func shelfAutoExpireSelectsOldItemsOnly() {
         let old = ShelfLogic.makeItem(
             url: URL(fileURLWithPath: "/tmp/old.png"),
@@ -4376,5 +4809,39 @@ struct Dynamic_IslandTests {
                 "Click at file thumb hit \(String(describing: type(of: hit))) instead of ShelfThumbView"
             )
         }
+    }
+
+    @Test func ftueStorePlaysOncePerDefaults() {
+        let suite = "island.ftue.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("Could not create FTUE defaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suite)
+        #expect(NotchFTUEStore.shouldPlay(defaults: defaults))
+        NotchFTUEStore.markSeen(defaults: defaults)
+        #expect(!NotchFTUEStore.shouldPlay(defaults: defaults))
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    @Test @MainActor
+    func firstLaunchStartsFTUEGlowOnce() {
+        let suite = "island.ftue.model.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("Could not create FTUE defaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suite)
+        let model = NotchViewModel()
+        model.noteIslandAppeared(defaults: defaults)
+        #expect(model.isFTUEGlowActive)
+        #expect(defaults.bool(forKey: NotchFTUEMetrics.defaultsKey))
+        model.noteIslandAppeared(defaults: defaults)
+        #expect(model.isFTUEGlowActive)
+        model.noteFTUEGlowFinished()
+        #expect(!model.isFTUEGlowActive)
+        model.noteIslandAppeared(defaults: defaults)
+        #expect(!model.isFTUEGlowActive)
+        defaults.removePersistentDomain(forName: suite)
     }
 }

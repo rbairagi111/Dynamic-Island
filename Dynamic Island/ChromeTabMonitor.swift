@@ -10,6 +10,8 @@ import Foundation
 final class AppleScriptRunLoop: @unchecked Sendable {
     static let shared = AppleScriptRunLoop(threadName: "island.chrome-applescript")
     static let media = AppleScriptRunLoop(threadName: "island.media-applescript")
+    /// HTML playback probes — never share the transport thread or a click waits.
+    static let probe = AppleScriptRunLoop(threadName: "island.probe-applescript")
     private let loop: CFRunLoop
 
     private init(threadName: String) {
@@ -22,7 +24,9 @@ final class AppleScriptRunLoop: @unchecked Sendable {
             ready.signal()
             CFRunLoopRun()
         }
-        thread.qualityOfService = .userInitiated
+        thread.qualityOfService = threadName.contains("media-applescript")
+            ? .userInteractive
+            : .userInitiated
         thread.start()
         ready.wait()
         loop = captured
@@ -551,42 +555,76 @@ final class ChromeTabMonitor {
 
     static func activateScript(tab: ClaudeTabInfo) -> String {
         let targetURL = appleScriptEscape(tab.url)
+        let allowURLFallback = chatActivationURLIsSpecific(tab.url)
+        let urlClause = allowURLFallback
+            ? #"if (URL of candidate) is targetURL then"#
+            : "if false then"
         return """
         tell application "Google Chrome"
-          activate
           set targetID to "\(tab.tabID)"
           set targetURL to "\(targetURL)"
-          repeat with wi from 1 to count of windows
-            set tabCount to count of tabs of window wi
-            repeat with ti from 1 to tabCount
+          set winID to 0
+          set tabIdx to 0
+          set matched to "none"
+          repeat with w from 1 to count of windows
+            repeat with t from 1 to count of tabs of window w
               try
-                set candidate to tab ti of window wi
+                set candidate to tab t of window w
                 if ((id of candidate) as text) is targetID then
-                  set index of window wi to 1
-                  set active tab index of window 1 to ti
-                  return "id"
+                  set winID to id of window w
+                  set tabIdx to t
+                  set matched to "id"
+                  exit repeat
                 end if
               end try
             end repeat
+            if winID is not 0 then exit repeat
           end repeat
-          if targetURL is not "" then
-            repeat with wi from 1 to count of windows
-              set tabCount to count of tabs of window wi
-              repeat with ti from 1 to tabCount
+          if winID is 0 and targetURL is not "" then
+            repeat with w from 1 to count of windows
+              repeat with t from 1 to count of tabs of window w
                 try
-                  set candidate to tab ti of window wi
-                  if (URL of candidate) is targetURL then
-                    set index of window wi to 1
-                    set active tab index of window 1 to ti
-                    return "url"
+                  set candidate to tab t of window w
+                  \(urlClause)
+                    set winID to id of window w
+                    set tabIdx to t
+                    set matched to "url"
+                    exit repeat
                   end if
                 end try
               end repeat
+              if winID is not 0 then exit repeat
             end repeat
           end if
-          return "not-found"
+          if winID is 0 then return "not-found"
+          set active tab index of window id winID to tabIdx
+          set index of window id winID to 1
+          activate
+          set index of window id winID to 1
+          return matched
         end tell
         """
+    }
+
+    /// Home/new-chat URLs exist in every Chrome profile. Matching them after
+    /// a Space swipe activates whichever profile happens to be window 1.
+    static func chatActivationURLIsSpecific(_ rawURL: String) -> Bool {
+        let trimmed = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), let host = url.host?.lowercased() else {
+            return false
+        }
+        let path = url.path.lowercased()
+        let parts = path.split(separator: "/").filter { !$0.isEmpty }
+        if host.contains("claude.") {
+            return parts.count >= 2 && parts[0] == "chat" && parts[1].count >= 8
+        }
+        if host.contains("chatgpt.com") || host.contains("openai.com") {
+            return parts.count >= 2 && parts[0] == "c" && parts[1].count >= 8
+        }
+        if host.contains("gemini.google.com") {
+            return parts.count >= 2 && parts[0] == "app" && parts[1].count >= 6
+        }
+        return false
     }
 
     private static func parseListedTabs(_ output: String) -> [ListedChromeTab] {

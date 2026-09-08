@@ -138,6 +138,8 @@ enum IslandMetrics {
 final class NotchViewModel: ObservableObject {
     @Published var isExpanded = false
     @Published var hasPhysicalNotch = true
+    /// One-shot first-launch edge glow. Independent of hover, overlays, and Now Playing.
+    @Published private(set) var isFTUEGlowActive = false
 
     /// Real notch geometry set by the window controller at launch and on screen changes.
     @Published var notchWidth:  CGFloat = 180
@@ -305,6 +307,18 @@ final class NotchViewModel: ObservableObject {
         0
     }
 
+    /// Call from the island view’s `onAppear`. Marks the FTUE seen immediately so
+    /// SwiftUI re-appears cannot replay it.
+    func noteIslandAppeared(defaults: UserDefaults = .standard) {
+        guard NotchFTUEStore.shouldPlay(defaults: defaults) else { return }
+        NotchFTUEStore.markSeen(defaults: defaults)
+        isFTUEGlowActive = true
+    }
+
+    func noteFTUEGlowFinished() {
+        isFTUEGlowActive = false
+    }
+
     var notchDeadZoneWidth: CGFloat {
         hasPhysicalNotch ? max(notchWidth - 8, 24) : 16
     }
@@ -331,7 +345,7 @@ final class NotchViewModel: ObservableObject {
 
     private func expandLiveActivity(fromClick: Bool) {
         if isDropTargeted || isDraggingShelfItem {
-            isExpanded = true
+            setExpandedIfNeeded()
             return
         }
         if IslandSurfacePolicy.shouldAllowRecordingExpand(
@@ -344,18 +358,24 @@ final class NotchViewModel: ObservableObject {
                 suppressHoverExpand = false
                 suppressExpandUntil = nil
             }
-            isExpanded = true
+            setExpandedIfNeeded()
             return
         }
         guard !suppressHoverExpand else { return }
         if let until = suppressExpandUntil, until > Date() { return }
         if isSelectingScreenToRecord && !isScreenRecording { return }
+        setExpandedIfNeeded()
+    }
+
+    private func setExpandedIfNeeded() {
+        guard !isExpanded else { return }
         isExpanded = true
     }
 
     func collapse() {
         guard !isOverlayActive else { return }
         guard !isDropTargeted, !isDraggingShelfItem else { return }
+        guard isExpanded else { return }
         isExpanded = false
     }
 
@@ -485,8 +505,24 @@ final class NotchViewModel: ObservableObject {
     /// Next item in the queue / YouTube playlist.
     func skipForward()     { nowPlaying.nextTrack() }
 
+    func handleKeyboardTransport(_ key: IslandKeyboardTransport) {
+        guard hasMedia else { return }
+        switch key {
+        case .playPause:
+            togglePlayPause()
+        case .skipBack:
+            skipBackward()
+        case .skipForward:
+            skipForward()
+        }
+    }
+
     func openNowPlayingSource() {
         guard hasMedia else { return }
+        // Same as opening a chat tab: Chrome comes forward under the cursor,
+        // and hover must not bounce the player back open.
+        suppressHoverExpand = true
+        collapse()
         nowPlaying.revealSource()
     }
 
@@ -632,9 +668,14 @@ final class NotchViewModel: ObservableObject {
             metadataTitle: snap.album,
             platform: platform
         )
-        songTitle = hasMedia
+        let nextTitle = hasMedia
             ? (displayTitle.isEmpty ? "Now Playing" : displayTitle)
             : "Not Playing"
+        let trackIdentityChanged = hasMedia
+            && nextTitle != songTitle
+            && !songTitle.isEmpty
+            && songTitle != "Not Playing"
+        songTitle = nextTitle
         artistName = hasMedia
             ? (snap.artist.isEmpty ? "—" : snap.artist)
             : "—"
@@ -643,9 +684,12 @@ final class NotchViewModel: ObservableObject {
         }
         duration = snap.duration
         let pendingArtwork = snap.artworkToken.hasPrefix("pending:")
+        let platformChanged = platform != mediaPlatform
+            && platform != nil
+            && mediaPlatform != nil
         if let image = snap.artwork {
             artwork = image
-        } else if !pendingArtwork {
+        } else if !pendingArtwork || trackIdentityChanged || platformChanged {
             artwork = nil
         }
         mediaPlatform = platform
@@ -691,6 +735,9 @@ final class NotchViewModel: ObservableObject {
         levelMonitor.onEvent = { [weak self] event in
             self?.presentLevelHUD(event)
         }
+        levelMonitor.onTransport = { [weak self] key in
+            self?.handleKeyboardTransport(key)
+        }
         levelMonitor.start()
 
         NotificationCenter.default.publisher(for: .previewSound)
@@ -726,6 +773,7 @@ final class NotchViewModel: ObservableObject {
     }
 
     private func bindLiveActivities() {
+        guard IslandFeatures.screenRecordingEnabled else { return }
         recordingMonitor.onPhaseChange = { [weak self] phase in
             DispatchQueue.main.async {
                 self?.setCapturePhase(phase)

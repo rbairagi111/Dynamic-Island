@@ -4,6 +4,14 @@ import CoreGraphics
 import Darwin
 import Foundation
 
+/// Compile-time feature switches. Keep existing island surfaces intact; flip
+/// these rather than deleting live-activity code.
+enum IslandFeatures {
+    /// Screen-recording live activity (red dot, hover-to-stop, split with media/chat).
+    /// Set to `true` to restore detection, island UI, native-stop hiding, and Settings previews.
+    static let screenRecordingEnabled = false
+}
+
 enum ScreenCapturePhase: Equatable {
     case idle
     case selecting
@@ -197,6 +205,7 @@ final class ScreenRecordingMonitor {
     private init() {}
 
     func start() {
+        guard IslandFeatures.screenRecordingEnabled else { return }
         guard timer == nil else { return }
         poll()
         let timer = Timer(timeInterval: 0.45, repeats: true) { [weak self] _ in
@@ -207,11 +216,13 @@ final class ScreenRecordingMonitor {
     }
 
     func setPreview(_ active: Bool) {
+        guard IslandFeatures.screenRecordingEnabled else { return }
         previewForced = active
         poll()
     }
 
     func stopSystemRecording() {
+        guard IslandFeatures.screenRecordingEnabled else { return }
         NSLog("[ScreenRecording] stopSystemRecording entered")
         if previewForced {
             previewForced = false

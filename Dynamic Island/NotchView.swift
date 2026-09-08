@@ -53,9 +53,19 @@ struct NotchView: View {
         !model.isExpanded && model.isScreenRecording && model.persistentState == .musicPlaying
     }
 
+    /// YouTube Music metadata is already on the view model in compact; watch
+    /// compact stays art + waveform only.
+    private var showsCompactMusicText: Bool {
+        !model.isExpanded
+            && !model.isOverlayActive
+            && model.hasMedia
+            && model.mediaPlatform == .youtubeMusic
+    }
+
     private var compactRecordingMediaSpacing: CGFloat {
         if model.isExpanded { return 12 }
-        return showsCompactRecordingMedia ? 8 : 0
+        if showsCompactRecordingMedia || showsCompactMusicText { return 8 }
+        return 0
     }
 
     private var islandStrokeColor: Color {
@@ -165,6 +175,15 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.isScreenRecording)
         .animation(IslandMetrics.motion, value: model.isSelectingScreenToRecord)
         .animation(IslandMetrics.motion, value: model.persistentState)
+        .notchFTUEGlow(
+            isActive: model.isFTUEGlowActive,
+            bottomLeadingRadius: bottomRadius,
+            bottomTrailingRadius: bottomRadius,
+            onFinished: model.noteFTUEGlowFinished
+        )
+        .onAppear {
+            model.noteIslandAppeared()
+        }
     }
 
     // MARK: Compact ↔ expanded now playing (same tree so text can spring in)
@@ -199,6 +218,20 @@ struct NotchView: View {
                                 .allowsHitTesting(false)
                         }
                         .transition(IslandMetrics.contentReveal)
+                    } else if showsCompactMusicText {
+                        VStack(alignment: .leading, spacing: 0) {
+                            Text(model.songTitle)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .allowsHitTesting(false)
+                            Text(model.artistName)
+                                .font(.system(size: 9))
+                                .foregroundStyle(.white.opacity(0.6))
+                                .lineLimit(1)
+                                .allowsHitTesting(false)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     if showsCompactRecordingMedia {
@@ -210,7 +243,7 @@ struct NotchView: View {
                         .matchedGeometryEffect(id: "waveform", in: island)
                     }
 
-                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia ? 8 : 0)
+                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia || showsCompactMusicText ? 8 : 0)
 
                     if !showsCompactRecordingMedia {
                         waveformIndicator(
@@ -230,11 +263,14 @@ struct NotchView: View {
                 .frame(maxHeight: model.isExpanded ? nil : .infinity)
 
                 if model.isExpanded {
-                    HStack(spacing: 10) {
+                    HStack(spacing: IslandClickPolicy.progressTimeSpacing) {
                         Text(timeString(from: model.displayedTime))
                             .font(.system(size: 11, weight: .medium).monospacedDigit())
                             .foregroundStyle(.white.opacity(0.7))
-                            .frame(width: 34, alignment: .leading)
+                            .frame(
+                                width: IslandClickPolicy.progressLeadingTimeWidth,
+                                alignment: .leading
+                            )
                             .allowsHitTesting(false)
 
                         progressBar
@@ -242,7 +278,12 @@ struct NotchView: View {
                         Text(totalDurationLabel)
                             .font(.system(size: 11, weight: .medium).monospacedDigit())
                             .foregroundStyle(.white.opacity(0.7))
-                            .frame(width: 40, alignment: .trailing)
+                            .frame(
+                                width: IslandClickPolicy.progressTrailingTimeWidth,
+                                alignment: .trailing
+                            )
+                            .minimumScaleFactor(0.85)
+                            .lineLimit(1)
                             .allowsHitTesting(false)
                     }
                     .transition(IslandMetrics.contentReveal)
@@ -586,6 +627,7 @@ struct NotchView: View {
                             .resizable()
                             .aspectRatio(contentMode: model.usesPlatformLogo ? .fit : .fill)
                             .transaction { $0.animation = nil }
+                            .id(ObjectIdentifier(artwork))
                     }
                     .clipped()
             } else {
@@ -678,10 +720,16 @@ struct NotchView: View {
         return timeString(from: model.duration)
     }
 
+    /// Elapsed / total labels: `m:ss`, or `h:mm:ss` once past one hour.
     private func timeString(from seconds: TimeInterval) -> String {
-        let m = Int(seconds) / 60
-        let s = Int(seconds) % 60
-        return String(format: "%d:%02d", m, s)
+        let total = max(0, Int(seconds.rounded(.down)))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%d:%02d", minutes, secs)
     }
 }
 

@@ -70,8 +70,9 @@ enum YouTubeTabPicker {
         let wx = Set(significantWords(x))
         let wy = Set(significantWords(y))
         let exact = wx.intersection(wy)
-        if exact.contains(where: { $0.count >= 6 }) { return true }
-        return exact.filter { $0.count >= 4 }.count >= 2
+        // One shared event word ("british", "open", a player's surname) is not
+        // the same video. Autoplay/skip would keep the previous watch URL.
+        return exact.filter { $0.count >= 5 }.count >= 2
     }
 
     private static func significantWords(_ s: String) -> [String] {
@@ -117,6 +118,36 @@ enum YouTubeTabPicker {
             swap(&prev, &cur)
         }
         return prev[bc.count]
+    }
+
+    static func videoIDsMatch(_ a: String, _ b: String) -> Bool {
+        guard let left = youtubeVideoID(from: a), let right = youtubeVideoID(from: b) else {
+            return false
+        }
+        return left.caseInsensitiveCompare(right) == .orderedSame
+    }
+
+    /// MediaRemote often swaps the watch title for generic "YouTube" while a
+    /// ytimg fetch that started with the real title is still in flight.
+    static func snapshotCanAcceptYouTubePoster(
+        snapshotTitle: String,
+        snapshotURL: String,
+        snapshotBundle: String,
+        requestedTitle: String,
+        requestedURL: String,
+        requestedBundle: String
+    ) -> Bool {
+        guard snapshotBundle == requestedBundle, !requestedBundle.isEmpty else { return false }
+        if snapshotTitle == requestedTitle { return true }
+        if titlesMatch(snapshotTitle, requestedTitle) { return true }
+        if videoIDsMatch(snapshotURL, requestedURL) { return true }
+        guard isGenericYouTubeDocumentTitle(snapshotTitle)
+            || isGenericYouTubeDocumentTitle(requestedTitle) else {
+            return false
+        }
+        if youtubeVideoID(from: requestedURL) == nil { return false }
+        if snapshotURL.isEmpty { return true }
+        return videoIDsMatch(snapshotURL, requestedURL)
     }
 
     static func urlsMatch(_ a: String, _ b: String) -> Bool {
