@@ -116,6 +116,16 @@ enum IslandSurfacePolicy {
         isTrusted && !alreadyAttempted && !previousCreateFailed
     }
 
+    /// Cursor arrows / space drive island transport only while the user is
+    /// actually on the expanded player. F7–F9 media keys are separate.
+    static func shouldBindArrowKeysToIsland(
+        isExpanded: Bool,
+        hasMedia: Bool,
+        pointerOverIsland: Bool
+    ) -> Bool {
+        isExpanded && hasMedia && pointerOverIsland
+    }
+
     /// Split layouts when two live activities share the island.
     /// Charging / volume / Focus keep the full-width banner and are never dualed.
     enum DualActivity: Equatable {

@@ -83,6 +83,11 @@ final class NowPlayingService: ObservableObject {
     private var lastBrowserScanAt: TimeInterval = 0
     private var lastYouTubePosterID: String = ""
     private var lastYouTubePosterImage: NSImage?
+    private var lastYouTubeMusicArtURL: String = ""
+    private var lastYouTubeMusicArtImage: NSImage?
+    /// After skip/autoplay, MediaRemote title updates before Chrome's href.
+    /// Keep rescanning the same tab until `v=` is no longer this ID.
+    private var staleYouTubeVideoIDAwaitingRefresh: String = ""
     /// In-tab HTML5 pause/play. Chrome MediaRemote often never sends pause for
     /// browser video, so the simulated waveform kept running.
     private var htmlPlaybackOverride: Bool?
@@ -94,10 +99,13 @@ final class NowPlayingService: ObservableObject {
     /// MediaRemote keeps the closed tab's title; ignore it until a live tab binds.
     private var staleClosedBrowserSessionKey: String = ""
     private var transportGeneration = 0
+    private let transportLock = NSLock()
     private var lastSpotifyProbeAt: TimeInterval = 0
     private var preferSpotifyUntil: TimeInterval = 0
     private var lastSpotifyPlayAt: TimeInterval = 0
     private var lastBrowserPlayAt: TimeInterval = 0
+    private var lastChromeFallbackAt: TimeInterval = 0
+    private var chromeFallbackInFlight = false
     private var spotifyProbeWasPlaying = false
     private let spotifyProbeQueue = DispatchQueue(label: "island.spotify-probe")
     private static let htmlPlaybackProbeInterval: TimeInterval = 0.35
@@ -108,10 +116,16 @@ final class NowPlayingService: ObservableObject {
     private var listenerBuffer = Data()
     private var elapsedTicker: DispatchSourceTimer?
     private var lastElapsedWallTime: TimeInterval?
+    private var lastEndedAdvanceAt: TimeInterval = 0
     private var listenerRestartScheduled = false
     private var revealInFlight = false
     private let posterQueue = DispatchQueue(label: "island.youtube-poster")
     private var posterFetchGeneration = 0
+    /// True while the machine is asleep; pauses elapsed ticking and probes.
+    private var macIsAsleep = false
+    /// Brief grace period after wake: ignore empty MediaRemote until adapter recovers.
+    private var wakeGraceUntil: TimeInterval = 0
+    private var sleepWakeObservers: [NSObjectProtocol] = []
 
     private static let ignoreSIGPIPE: Void = {
         signal(SIGPIPE, SIG_IGN)
@@ -196,11 +210,66 @@ final class NowPlayingService: ObservableObject {
         mediaQueue.async { [weak self] in
             self?.startAdapterListener()
         }
+        observeSleepWake()
     }
 
     deinit {
         elapsedTicker?.cancel()
         stopAdapterListener()
+        for observer in sleepWakeObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+    }
+
+    // MARK: - Sleep / Wake lifecycle
+
+    private func observeSleepWake() {
+        let center = NSWorkspace.shared.notificationCenter
+        let sleepHandler: (Notification) -> Void = { [weak self] _ in
+            self?.handleSystemSleep()
+        }
+        let wakeHandler: (Notification) -> Void = { [weak self] _ in
+            self?.handleSystemWake()
+        }
+        sleepWakeObservers = [
+            center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: nil, using: sleepHandler),
+            center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: nil, using: sleepHandler),
+            center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: nil, using: wakeHandler),
+            center.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: nil, using: wakeHandler),
+        ]
+    }
+
+    private func handleSystemSleep() {
+        mediaQueue.async { [weak self] in
+            guard let self else { return }
+            self.macIsAsleep = true
+            // Freeze the wall-clock baseline so elapsed doesn't jump on wake.
+            self.lastElapsedWallTime = nil
+            NSLog("[NowPlaying] system sleep — paused elapsed ticker, adapter stays alive")
+        }
+    }
+
+    private func handleSystemWake() {
+        mediaQueue.async { [weak self] in
+            guard let self else { return }
+            self.macIsAsleep = false
+            // Reset wall-clock so the first post-wake tick doesn't jump elapsed.
+            self.lastElapsedWallTime = Date().timeIntervalSince1970
+            // Grace period: ignore empty adapter lines for 3s while mediaremoted recovers.
+            self.wakeGraceUntil = Date().timeIntervalSince1970 + 3.0
+            // Force-restart the adapter to ensure fresh MediaRemote subscription.
+            self.stopAdapterListener()
+            self.startAdapterListener()
+            // Send a `get` command to immediately fetch current Now Playing state.
+            self.mediaQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.runAdapterCommand("get")
+            }
+            // Reset Chrome fallback cooldown so YouTube probe runs immediately.
+            self.lastChromeFallbackAt = 0
+            self.lastBrowserScanAt = 0
+            self.lastSpotifyProbeAt = 0
+            NSLog("[NowPlaying] system wake — adapter restarted, probes reset")
+        }
     }
 
     /// Bring the Now Playing app — or the matching browser tab — to the front.
@@ -232,8 +301,18 @@ final class NowPlayingService: ObservableObject {
         let url = snap.sourceURL
         AppleScriptRunLoop.media.async { [weak self] in
             var switched = false
+            // Fast path: activate the cached Now Playing tab immediately.
+            // listTabs was doubling Chrome AppleScript cost (1–6s+) and almost
+            // always resolved to the same tab ID we already had.
             if let tab {
                 switched = BrowserMediaNavigator.activateTab(tab, bundleID: bundleID)
+            }
+            if !switched, let tab {
+                let tabs = BrowserMediaNavigator.listTabs(bundleID: bundleID)
+                let live = BrowserMediaNavigator.resolveLiveTab(tab, from: tabs) ?? tab
+                if live.tabID != tab.tabID || live.url != tab.url {
+                    switched = BrowserMediaNavigator.activateTab(live, bundleID: bundleID)
+                }
             }
             if !switched, !url.isEmpty {
                 let fallback = BrowserMediaNavigator.Tab(
@@ -252,203 +331,188 @@ final class NowPlayingService: ObservableObject {
         }
     }
 
-    private func noteUserTransport() {
+    @discardableResult
+    private func noteUserTransport() -> Int {
+        transportLock.lock()
         transportGeneration += 1
         ignoreHTMLProbeUntil = Date().timeIntervalSince1970 + 1.6
+        let generation = transportGeneration
+        transportLock.unlock()
+        return generation
+    }
+
+    private func currentTransportGeneration() -> Int {
+        transportLock.lock()
+        defer { transportLock.unlock() }
+        return transportGeneration
+    }
+
+    private func isIgnoringHTMLProbe(at now: TimeInterval = Date().timeIntervalSince1970) -> Bool {
+        transportLock.lock()
+        defer { transportLock.unlock() }
+        return now < ignoreHTMLProbeUntil
     }
 
     func togglePlayPause() {
+        let snap = snapshot
+        let wasPlaying = snap.isPlaying
+        let tab = snap.sourceTab
+        let bundleID = snap.bundleIdentifier
+        let target = Self.controlTarget(
+            bundleID: bundleID,
+            appName: snap.appName,
+            artist: snap.artist,
+            title: snap.title,
+            url: snap.sourceURL
+        )
+        NSLog(
+            "[NowPlaying] togglePlayPause target=%@ playing=%@ bundle=%@",
+            target.logName,
+            wasPlaying ? "YES" : "NO",
+            bundleID
+        )
+        let generation = noteUserTransport()
         mediaQueue.async { [weak self] in
-            guard let self else { return }
-            let target = self.controlTarget
-            NSLog(
-                "[NowPlaying] togglePlayPause target=%@ playing=%@ bundle=%@",
-                target.logName,
-                self.activeIsPlaying ? "YES" : "NO",
-                self.activeBundleID
-            )
-
-            switch target {
-            case .youtubeBrowser:
-                let wasPlaying = self.activeIsPlaying
-                self.noteUserTransport()
-                let generation = self.transportGeneration
-                self.publishOptimisticPlaying(!wasPlaying)
-                AppleScriptRunLoop.media.async { [weak self] in
-                    guard let self else { return }
-                    guard generation == self.transportGeneration else { return }
-                    var applied = false
-                    switch self.trySilentYouTubePlayPause(shouldPause: wasPlaying) {
-                    case .ok:
-                        applied = true
-                    case .needsPermission:
-                        if self.ensureChromeJavaScriptFromAppleEventsEnabled() {
-                            Thread.sleep(forTimeInterval: 0.25)
-                            if case .ok = self.trySilentYouTubePlayPause(shouldPause: wasPlaying) {
-                                applied = true
-                            }
-                        }
-                    case .failed:
-                        if wasPlaying {
-                            self.mediaQueue.async { self.runAdapterCommand("pause") }
-                            applied = true
-                        } else {
-                            NSLog("[NowPlaying] skip MediaRemote play; no matching YouTube tab")
-                        }
-                    }
-                    if !applied {
-                        self.mediaQueue.async { self.publishOptimisticPlaying(wasPlaying) }
-                    }
-                }
-
-            case .browserMedia:
-                let wasPlaying = self.activeIsPlaying
-                self.noteUserTransport()
-                let generation = self.transportGeneration
-                self.publishOptimisticPlaying(!wasPlaying)
-                AppleScriptRunLoop.media.async { [weak self] in
-                    guard let self, generation == self.transportGeneration else { return }
-                    if !self.trySilentBrowserPlayPause() {
-                        self.mediaQueue.async {
-                            self.runAdapterCommand(wasPlaying ? "pause" : "play")
-                        }
-                    }
-                }
-
-            case .nativeMediaRemote:
-                if self.activeIsPlaying {
-                    self.runAdapterCommand("pause")
-                } else {
-                    self.runAdapterCommand("play")
-                }
-                self.publishOptimisticPlaying(!self.activeIsPlaying)
+            self?.publishOptimisticPlaying(!wasPlaying)
+            if target == .nativeMediaRemote {
+                self?.runAdapterCommand(wasPlaying ? "pause" : "play")
             }
+        }
+        guard target != .nativeMediaRemote else { return }
+        AppleScriptRunLoop.media.async { [weak self] in
+            guard let self, generation == self.currentTransportGeneration() else { return }
+            self.applyBrowserPlayPause(
+                shouldPause: wasPlaying,
+                target: target,
+                tab: tab,
+                bundleID: bundleID
+            )
         }
     }
 
     /// Seek the current track/video to `seconds` (clamped to duration when known).
     func seek(to seconds: TimeInterval) {
-        mediaQueue.async { [weak self] in
+        let snap = snapshot
+        let tab = snap.sourceTab
+        let bundleID = snap.bundleIdentifier
+        let duration = snap.duration > 0 ? snap.duration : activeDuration
+        let targetTime: TimeInterval
+        if duration > 0 {
+            targetTime = min(max(0, seconds), max(duration - 0.25, 0))
+        } else {
+            targetTime = max(0, seconds)
+        }
+        let target = Self.controlTarget(
+            bundleID: bundleID,
+            appName: snap.appName,
+            artist: snap.artist,
+            title: snap.title,
+            url: snap.sourceURL
+        )
+        NSLog(
+            "[NowPlaying] seek to %.2fs target=%@ bundle=%@",
+            targetTime,
+            target.logName,
+            bundleID
+        )
+        let generation = noteUserTransport()
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            let duration = self.activeDuration
-            let targetTime: TimeInterval
-            if duration > 0 {
-                targetTime = min(max(0, seconds), max(duration - 0.25, 0))
-            } else {
-                targetTime = max(0, seconds)
+            var next = self.snapshot
+            next.elapsed = targetTime
+            self.snapshot = next
+        }
+        mediaQueue.async { [weak self] in
+            self?.activeElapsed = targetTime
+            self?.lastElapsedWallTime = Date().timeIntervalSince1970
+        }
+        if target == .nativeMediaRemote {
+            mediaQueue.async { [weak self] in
+                self?.runAdapterCommand("set_time", arguments: [String(targetTime)])
             }
-
-            let target = self.controlTarget
-            NSLog(
-                "[NowPlaying] seek to %.2fs target=%@ bundle=%@",
-                targetTime,
-                target.logName,
-                self.activeBundleID
-            )
-
-            // Optimistic UI update.
-            DispatchQueue.main.async {
-                var snap = self.snapshot
-                snap.elapsed = targetTime
-                self.snapshot = snap
-            }
-
+            return
+        }
+        AppleScriptRunLoop.media.async { [weak self] in
+            guard let self, generation == self.currentTransportGeneration() else { return }
             switch target {
             case .youtubeBrowser:
-                switch self.trySilentYouTubeSeek(to: targetTime) {
+                let js = self.trySilentYouTubeSeek(to: targetTime, tab: tab, bundleID: bundleID)
+                switch js {
                 case .ok:
                     break
                 case .needsPermission:
                     if self.ensureChromeJavaScriptFromAppleEventsEnabled() {
-                        Thread.sleep(forTimeInterval: 0.25)
-                        _ = self.trySilentYouTubeSeek(to: targetTime)
+                        _ = self.trySilentYouTubeSeek(to: targetTime, tab: tab, bundleID: bundleID)
                     }
                 case .failed:
-                    self.runAdapterCommand("set_time", arguments: [String(targetTime)])
+                    self.mediaQueue.async {
+                        self.runAdapterCommand("set_time", arguments: [String(targetTime)])
+                    }
                 }
-
             case .browserMedia:
-                if !self.trySilentBrowserSeek(to: targetTime) {
-                    self.runAdapterCommand("set_time", arguments: [String(targetTime)])
+                let ok = self.trySilentBrowserSeek(to: targetTime)
+                if !ok {
+                    self.mediaQueue.async {
+                        self.runAdapterCommand("set_time", arguments: [String(targetTime)])
+                    }
                 }
-
             case .nativeMediaRemote:
-                self.runAdapterCommand("set_time", arguments: [String(targetTime)])
+                break
             }
-
-            self.activeElapsed = targetTime
-            self.lastElapsedWallTime = Date().timeIntervalSince1970
         }
     }
 
     func skipForward() {
-        mediaQueue.async { [weak self] in
-            self?.goNext()
-        }
+        dispatchSkip(next: true)
     }
 
     func skipBackward() {
-        mediaQueue.async { [weak self] in
-            self?.goPrevious()
-        }
+        dispatchSkip(next: false)
     }
 
     func nextTrack() { skipForward() }
     func previousTrack() { skipBackward() }
+
+    private func dispatchSkip(next: Bool) {
+        let snap = snapshot
+        let tab = snap.sourceTab
+        let bundleID = snap.bundleIdentifier
+        let target = Self.controlTarget(
+            bundleID: bundleID,
+            appName: snap.appName,
+            artist: snap.artist,
+            title: snap.title,
+            url: snap.sourceURL
+        )
+        NSLog(
+            "[NowPlaying] %@ target=%@ bundle=%@",
+            next ? "next" : "previous",
+            target.logName,
+            bundleID
+        )
+        let generation = noteUserTransport()
+        if target == .nativeMediaRemote {
+            mediaQueue.async { [weak self] in
+                self?.runAdapterCommand(next ? "next_track" : "previous_track")
+            }
+            return
+        }
+        AppleScriptRunLoop.media.async { [weak self] in
+            guard let self, generation == self.currentTransportGeneration() else { return }
+            self.applyBrowserSkip(
+                next: next,
+                target: target,
+                tab: tab,
+                bundleID: bundleID
+            )
+        }
+    }
 
     func refresh() {
         mediaQueue.async { [weak self] in
             guard let self else { return }
             self.stopAdapterListener()
             self.startAdapterListener()
-        }
-    }
-
-    private func goNext() {
-        let target = controlTarget
-        NSLog("[NowPlaying] next target=%@ bundle=%@", target.logName, activeBundleID)
-
-        switch target {
-        case .youtubeBrowser:
-            noteUserTransport()
-            let generation = transportGeneration
-            AppleScriptRunLoop.media.async { [weak self] in
-                guard let self, generation == self.transportGeneration else { return }
-                self.sendYouTubePlaylistKey(next: true)
-            }
-        case .browserMedia:
-            noteUserTransport()
-            let generation = transportGeneration
-            AppleScriptRunLoop.media.async { [weak self] in
-                guard let self, generation == self.transportGeneration else { return }
-                self.seekBrowserVideo(by: 10)
-            }
-        case .nativeMediaRemote:
-            runAdapterCommand("next_track")
-        }
-    }
-
-    private func goPrevious() {
-        let target = controlTarget
-        NSLog("[NowPlaying] previous target=%@ bundle=%@", target.logName, activeBundleID)
-
-        switch target {
-        case .youtubeBrowser:
-            noteUserTransport()
-            let generation = transportGeneration
-            AppleScriptRunLoop.media.async { [weak self] in
-                guard let self, generation == self.transportGeneration else { return }
-                self.sendYouTubePlaylistKey(next: false)
-            }
-        case .browserMedia:
-            noteUserTransport()
-            let generation = transportGeneration
-            AppleScriptRunLoop.media.async { [weak self] in
-                guard let self, generation == self.transportGeneration else { return }
-                self.seekBrowserVideo(by: -10)
-            }
-        case .nativeMediaRemote:
-            runAdapterCommand("previous_track")
         }
     }
 
@@ -468,16 +532,32 @@ final class NowPlayingService: ObservableObject {
     }
 
     private var controlTarget: ControlTarget {
-        guard isBrowserBundle(activeBundleID) else { return .nativeMediaRemote }
-        let platform = StreamingPlatform.resolve(
+        Self.controlTarget(
             bundleID: activeBundleID,
             appName: activeAppName,
             artist: activeArtist,
             title: activeTitle,
             url: lastMediaSourceURL
         )
+    }
+
+    private static func controlTarget(
+        bundleID: String,
+        appName: String,
+        artist: String,
+        title: String,
+        url: String
+    ) -> ControlTarget {
+        guard MediaClient.isBrowserBundle(bundleID) else { return .nativeMediaRemote }
+        let platform = StreamingPlatform.resolve(
+            bundleID: bundleID,
+            appName: appName,
+            artist: artist,
+            title: title,
+            url: url
+        )
         return BrowserMediaControlPolicy.usesYouTubeSpecificControls(
-            bundleID: activeBundleID,
+            bundleID: bundleID,
             platform: platform
         )
             ? .youtubeBrowser
@@ -527,6 +607,9 @@ final class NowPlayingService: ObservableObject {
             self?.mediaQueue.async {
                 self?.consumeListenerData(chunk)
             }
+        }
+        (process.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = { handle in
+            _ = handle.availableData
         }
 
         process.terminationHandler = { [weak self] _ in
@@ -585,6 +668,8 @@ final class NowPlayingService: ObservableObject {
             // Track changes briefly send null. Clearing here emptied the
             // island (placeholder flash) and dropped the last client before
             // Spotify / the next song could arrive.
+            // Also skip during wake grace period: mediaremoted needs time to
+            // re-attach its Now Playing subscription.
             return
         }
 
@@ -624,8 +709,16 @@ final class NowPlayingService: ObservableObject {
     }
 
     private func tickElapsed() {
+        guard !macIsAsleep else {
+            lastElapsedWallTime = nil
+            return
+        }
         probeNativeSpotifyIfNeeded()
+        probeBrowserYouTubeIfMediaRemoteMissing()
         probeBrowserPlaybackIfNeeded()
+        if activeDuration > 5, activeElapsed >= activeDuration - 0.75 {
+            advanceEndedBrowserMediaIfNeeded()
+        }
         guard activeIsPlaying, activeDuration > 0 else {
             lastElapsedWallTime = Date().timeIntervalSince1970
             return
@@ -633,7 +726,13 @@ final class NowPlayingService: ObservableObject {
         let now = Date().timeIntervalSince1970
         let previous = lastElapsedWallTime ?? now
         lastElapsedWallTime = now
-        let nextElapsed = min(activeDuration, activeElapsed + max(0, now - previous))
+        // Clamp delta to 1s so sleep/wake never jumps elapsed to track end.
+        let rawDelta = max(0, now - previous)
+        let delta = min(rawDelta, 1.0)
+        let nextElapsed = min(activeDuration, activeElapsed + delta)
+        if activeDuration > 1, nextElapsed >= activeDuration - 0.6 {
+            advanceEndedBrowserMediaIfNeeded()
+        }
         guard abs(nextElapsed - activeElapsed) >= 0.2 else { return }
         activeElapsed = nextElapsed
         DispatchQueue.main.async { [weak self] in
@@ -642,6 +741,30 @@ final class NowPlayingService: ObservableObject {
             guard snap.hasMedia, snap.isPlaying else { return }
             snap.elapsed = nextElapsed
             self.snapshot = snap
+        }
+    }
+
+    private func advanceEndedBrowserMediaIfNeeded() {
+        let now = Date().timeIntervalSince1970
+        if now - lastEndedAdvanceAt < 1.25 { return }
+        let target = Self.controlTarget(
+            bundleID: activeBundleID,
+            appName: activeAppName,
+            artist: activeArtist,
+            title: activeTitle,
+            url: lastMediaSourceURL
+        )
+        guard target != .nativeMediaRemote else { return }
+        lastEndedAdvanceAt = now
+        let tab = lastMediaSourceTab
+        let bundleID = activeBundleID
+        AppleScriptRunLoop.media.async { [weak self] in
+            _ = self?.runSilentBrowserMediaJavaScript(
+                musicJS: BrowserMediaNavigator.youtubeMusicEndedAutoplayJavaScript,
+                watchJS: BrowserMediaNavigator.youtubeWatchEndedAutoplayJavaScript,
+                tab: tab,
+                bundleID: bundleID
+            )
         }
     }
 
@@ -662,6 +785,8 @@ final class NowPlayingService: ObservableObject {
         lastBrowserScanAt = 0
         lastYouTubePosterID = ""
         lastYouTubePosterImage = nil
+        lastYouTubeMusicArtURL = ""
+        lastYouTubeMusicArtImage = nil
         htmlPlaybackOverride = nil
         lastHTMLPlaybackProbeAt = 0
         preferSpotifyUntil = 0
@@ -787,11 +912,46 @@ final class NowPlayingService: ObservableObject {
         )
         if identityChanged {
             lastListedIdentity = identity
-            if bundleID != previousBundleID || platformChanged {
+            let keepBoundPlaybackTab = isBrowserBundle(bundleID)
+                && lastMediaSourceTab != nil
+                && !lastMediaSourceURL.isEmpty
+                && StreamingPlatform.sourceURLCompatible(
+                    lastMediaSourceURL,
+                    withTitleHint: incomingHint
+                )
+                && (StreamingPlatform.from(url: lastMediaSourceURL).map {
+                    BrowserMediaNavigator.isLikelyPlaybackURL(lastMediaSourceURL, platform: $0)
+                } ?? false)
+            if (bundleID != previousBundleID || platformChanged), !keepBoundPlaybackTab {
                 clearBrowserSource()
+            } else if keepBoundPlaybackTab {
+                staleYouTubeVideoIDAwaitingRefresh = ""
+            } else if isBrowserBundle(bundleID) {
+                let previousID = YouTubeTabPicker.youtubeVideoID(from: lastMediaSourceURL)
+                    ?? lastYouTubePosterID
+                if !previousID.isEmpty {
+                    staleYouTubeVideoIDAwaitingRefresh = previousID
+                }
+                lastMediaSourceURL = ""
+                lastMediaSourcePageTitle = ""
+                lastYouTubeControlURL = ""
+                lastYouTubePosterID = ""
+                lastYouTubePosterImage = nil
+                lastYouTubeMusicArtURL = ""
+                lastYouTubeMusicArtImage = nil
+                if let cached = lastMediaSourceTab {
+                    let compatible = StreamingPlatform.sourceURLCompatible(
+                        cached.url,
+                        withTitleHint: incomingHint
+                    )
+                    let playback = StreamingPlatform.from(url: cached.url).map {
+                        BrowserMediaNavigator.isLikelyPlaybackURL(cached.url, platform: $0)
+                    } ?? false
+                    if !compatible || !playback {
+                        lastMediaSourceTab = nil
+                    }
+                }
             } else if !cachedStillMatches {
-                // Same tab, new video — keep window/tab indices so we can
-                // re-read location.href instead of waiting on activeTab.
                 lastMediaSourceURL = ""
                 lastMediaSourcePageTitle = ""
                 lastYouTubeControlURL = ""
@@ -818,17 +978,25 @@ final class NowPlayingService: ObservableObject {
             metadataTitle: album,
             platform: currentPlatform
         )
+        let awaitingYouTubeURLRefresh = isBrowserBundle(bundleID)
+            && !staleYouTubeVideoIDAwaitingRefresh.isEmpty
         let needsRescanForNewIdentity = identityChanged && (
             lastMediaSourceURL.isEmpty
                 || !cachedStillMatches
                 || platformChanged
                 || bundleID != previousBundleID
+                || awaitingYouTubeURLRefresh
         )
         let shouldScanBrowser = isBrowserBundle(bundleID)
             && (
                 needsRescanForNewIdentity
                     || (
+                        awaitingYouTubeURLRefresh
+                            && now - lastBrowserScanAt >= 0.35
+                    )
+                    || (
                         !identityChanged
+                            && !awaitingYouTubeURLRefresh
                             && (lastMediaSourceURL.isEmpty || needsOTTContentTitle)
                             && now - lastBrowserScanAt >= 2
                     )
@@ -840,13 +1008,21 @@ final class NowPlayingService: ObservableObject {
             let cachedTab = lastMediaSourceTab
                 ?? (snapshot.bundleIdentifier == bundleID ? snapshot.sourceTab : nil)
             let reusableCachedTab: BrowserMediaNavigator.Tab?
-            if let cached = cachedTab,
-               YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
-                tabTitle: cached.title,
-                tabURL: cached.url,
-                nowPlayingTitle: title
-               ) {
-                reusableCachedTab = cached
+            if let cached = cachedTab {
+                let familyOK = YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+                    tabTitle: cached.title,
+                    tabURL: cached.url,
+                    nowPlayingTitle: title
+                )
+                let playbackRefresh = awaitingYouTubeURLRefresh
+                    && StreamingPlatform.sourceURLCompatible(
+                        cached.url,
+                        withTitleHint: incomingHint
+                    )
+                    && (StreamingPlatform.from(url: cached.url).map {
+                        BrowserMediaNavigator.isLikelyPlaybackURL(cached.url, platform: $0)
+                    } ?? false)
+                reusableCachedTab = (familyOK || playbackRefresh) ? cached : nil
             } else {
                 reusableCachedTab = nil
             }
@@ -879,27 +1055,45 @@ final class NowPlayingService: ObservableObject {
             url: artworkURL
         )
         let policyToken = prepared.token
+        let sameYouTubeVideo = YouTubeTabPicker.videoIDsMatch(
+            snapshot.sourceURL.isEmpty ? lastMediaSourceURL : snapshot.sourceURL,
+            artworkURL.isEmpty ? snapshot.sourceURL : artworkURL
+        )
+        let dropHeldArtwork = MediaArtworkPolicy.shouldDropHeldYouTubeArtwork(
+            identityChanged: identityChanged,
+            sameYouTubeVideo: sameYouTubeVideo,
+            previousTitle: snapshot.title,
+            nextTitle: title
+        )
         if prepared.image == nil,
-           !identityChanged,
+           !dropHeldArtwork,
            snapshot.bundleIdentifier == bundleID,
            let held = snapshot.artwork,
            MediaArtworkPolicy.shouldHoldArtworkWhilePosterLoads(
             previousToken: snapshot.artworkToken,
             policyToken: policyToken,
-            identityChanged: identityChanged
+            identityChanged: dropHeldArtwork
            ) {
             prepared = (held, snapshot.artworkToken)
-        } else if !identityChanged,
+        } else if !dropHeldArtwork,
                   snapshot.bundleIdentifier == bundleID,
-                  YouTubeTabPicker.titlesMatch(snapshot.title, title),
-                  MediaArtworkPolicy.isYouTubePosterToken(snapshot.artworkToken),
-                  !MediaArtworkPolicy.isYouTubePosterToken(prepared.token) {
+                  MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork(snapshot.artworkToken),
+                  !MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork(prepared.token),
+                  (sameYouTubeVideo
+                    || (!identityChanged && YouTubeTabPicker.titlesMatch(snapshot.title, title))) {
             prepared = (snapshot.artwork, snapshot.artworkToken)
+        }
+        // Dropping a watch poster under a stale youtube.com binding must not
+        // fall through to Chrome's 16:9 MediaRemote JPEG for the old tab.
+        if dropHeldArtwork,
+           StreamingPlatform.from(url: artworkURL) == .youtube,
+           !MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork(prepared.token) {
+            prepared = (nil, "pending:youtube")
         }
         if prepared.image == nil, let held = artwork,
            MediaArtworkPolicy.allowsRemoteArtworkFallback(
             isBrowser: isBrowserBundle(bundleID),
-            policyToken: policyToken
+            policyToken: prepared.token.hasPrefix("pending:") ? prepared.token : policyToken
            ) {
             prepared = (held, artKey.isEmpty ? "remote:held" : "remote:\(artKey)")
         }
@@ -939,6 +1133,20 @@ final class NowPlayingService: ObservableObject {
                 if merged.sourcePageTitle.isEmpty {
                     merged.sourcePageTitle = self.snapshot.sourcePageTitle
                 }
+            }
+            if merged.artwork == nil,
+               !merged.artworkToken.hasPrefix("pending:"),
+               MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork(self.snapshot.artworkToken),
+               YouTubeTabPicker.snapshotCanAcceptYouTubePoster(
+                snapshotTitle: self.snapshot.title,
+                snapshotURL: self.snapshot.sourceURL,
+                snapshotBundle: self.snapshot.bundleIdentifier,
+                requestedTitle: merged.title,
+                requestedURL: merged.sourceURL,
+                requestedBundle: merged.bundleIdentifier
+               ) {
+                merged.artwork = self.snapshot.artwork
+                merged.artworkToken = self.snapshot.artworkToken
             }
             self.snapshot = merged
         }
@@ -985,7 +1193,8 @@ final class NowPlayingService: ObservableObject {
             isLikelyVideoThumbnail: likelyThumb,
             hasRemote: remote != nil,
             pixelWidth: pixels.width,
-            pixelHeight: pixels.height
+            pixelHeight: pixels.height,
+            sourceURL: url
         )
         if isBrowser, platform == nil || youtubeFamily {
             if showRemote {
@@ -1007,7 +1216,7 @@ final class NowPlayingService: ObservableObject {
                 continue
             }
             let icon = NSWorkspace.shared.icon(forFile: appURL.path)
-            if MediaClient.resembles(image, icon) {
+            if MediaClient.resembles(image, icon, meanAbsDelta: 0.28) {
                 return true
             }
         }
@@ -1045,19 +1254,38 @@ final class NowPlayingService: ObservableObject {
     }
 
     private func imageFromRemoteArtworkURL(_ raw: String) -> NSImage? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = MediaArtworkPolicy.upgradedYouTubeMusicArtworkURL(raw)
         guard let url = URL(string: trimmed), url.scheme?.lowercased() == "https" else {
             return nil
         }
         let host = (url.host ?? "").lowercased()
-        let allowed = host.contains("ytimg.com")
-            || host.contains("ggpht.com")
-            || host.contains("googleusercontent.com")
-            || host.contains("youtube.com")
-        guard allowed, let data = try? Data(contentsOf: url), let image = NSImage(data: data) else {
+        guard MediaArtworkPolicy.isAllowedYouTubeMusicArtworkDownloadHost(host) else {
             return nil
         }
-        return image
+        if trimmed == lastYouTubeMusicArtURL, let cached = lastYouTubeMusicArtImage {
+            return cached
+        }
+        var request = URLRequest(url: url, timeoutInterval: 1.5)
+        request.cachePolicy = .returnCacheDataElseLoad
+        let sem = DispatchSemaphore(value: 0)
+        var image: NSImage?
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            defer { sem.signal() }
+            guard let data, let loaded = NSImage(data: data) else { return }
+            let px = MediaClient.pixelSize(of: loaded)
+            guard MediaArtworkPolicy.shouldAcceptYouTubeMusicRemoteImage(
+                pixelWidth: px.width,
+                pixelHeight: px.height
+            ) else { return }
+            image = loaded
+        }.resume()
+        _ = sem.wait(timeout: .now() + 1.6)
+        if let image {
+            lastYouTubeMusicArtURL = trimmed
+            lastYouTubeMusicArtImage = image
+            return image
+        }
+        return nil
     }
 
     private func islandDisplayArtwork(
@@ -1076,7 +1304,8 @@ final class NowPlayingService: ObservableObject {
         appName: String,
         artist: String,
         tab: BrowserMediaNavigator.Tab,
-        allowStaleDocumentTitle: Bool = false
+        allowStaleDocumentTitle: Bool = false,
+        allowURLIdentityRefresh: Bool = false
     ) -> Bool {
         let titleHint = StreamingPlatform.titleHint(
             bundleID: bundleID,
@@ -1092,7 +1321,8 @@ final class NowPlayingService: ObservableObject {
             if url.contains("youtube.com") || url.contains("youtu.be") {
                 lastBoundWatchTitle = tab.title
             }
-            guard YouTubeTabPicker.chromeTabCanBindToNowPlaying(
+            guard allowURLIdentityRefresh
+                || YouTubeTabPicker.chromeTabCanBindToNowPlaying(
                 tabTitle: tab.title,
                 tabURL: url,
                 nowPlayingTitle: title,
@@ -1121,11 +1351,25 @@ final class NowPlayingService: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             var snap = self.snapshot
-            guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+            guard YouTubeTabPicker.snapshotCanAcceptYouTubePoster(
+                snapshotTitle: snap.title,
+                snapshotURL: snap.sourceURL,
+                snapshotBundle: snap.bundleIdentifier,
+                requestedTitle: title,
+                requestedURL: sourceURL,
+                requestedBundle: bundleID
+            ) else { return }
+            let previousURL = snap.sourceURL
             snap.sourceURL = sourceURL
             snap.sourcePageTitle = tab.title
             snap.sourceTab = tab
             snap.isPlaying = self.activeIsPlaying
+            if MediaArtworkPolicy.isYouTubePosterToken(snap.artworkToken),
+               isMusic
+                || !YouTubeTabPicker.videoIDsMatch(previousURL, sourceURL) {
+                snap.artwork = nil
+                snap.artworkToken = "pending:youtube"
+            }
             self.snapshot = snap
         }
         requestYouTubePoster(
@@ -1149,30 +1393,47 @@ final class NowPlayingService: ObservableObject {
         appName: String,
         artist: String,
         tab: BrowserMediaNavigator.Tab,
-        sourceURL: String
+        sourceURL: String,
+        musicArtworkURL: String? = nil
     ) {
         posterFetchGeneration += 1
         let generation = posterFetchGeneration
         posterQueue.async { [weak self] in
+            guard let self else { return }
             var id = videoID
-            var poster = id.flatMap { self?.youtubePosterImage(videoID: $0) }
+            var poster: NSImage?
             var artKey = id.map { "ytimg:\($0)" } ?? ""
-            if poster == nil, url.contains("music.youtube.com"), let self {
-                let probe = BrowserMediaNavigator.probeYouTubeMusicPlayback(
-                    on: tab,
-                    bundleID: bundleID
-                )
-                if id == nil { id = probe?.videoID }
-                if poster == nil, let found = id {
-                    poster = self.youtubePosterImage(videoID: found)
-                    artKey = "ytimg:\(found)"
+            if url.contains("music.youtube.com") {
+                var barURL = (musicArtworkURL ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                // Probe even when `watch?v=` is already known — otherwise we
+                // skip the player-bar cover and flash the 16:9 YouTube poster.
+                if barURL.isEmpty {
+                    let probe = BrowserMediaNavigator.probeYouTubeMusicPlayback(
+                        on: tab,
+                        bundleID: bundleID
+                    )
+                    if id == nil { id = probe?.videoID }
+                    if barURL.isEmpty { barURL = probe?.artworkURL ?? "" }
                 }
-                if poster == nil, let artURL = probe?.artworkURL {
-                    poster = self.imageFromRemoteArtworkURL(artURL)
-                    if artKey.isEmpty { artKey = "ytmimg:\(artURL.prefix(64))" }
+                if !barURL.isEmpty {
+                    poster = self.imageFromRemoteArtworkURL(barURL)
+                    if poster != nil {
+                        artKey = "ytmimg:\(barURL.prefix(64))"
+                    }
                 }
+                // Player-bar cover is preferred, but a track poster is better
+                // than keeping the previous YouTube watch thumbnail.
+                if poster == nil, let id {
+                    poster = self.youtubePosterImage(videoID: id)
+                    if poster != nil {
+                        artKey = "ytimg:\(id)"
+                    }
+                }
+            } else {
+                poster = id.flatMap { self.youtubePosterImage(videoID: $0) }
             }
-            guard let poster, let self else { return }
+            guard let poster else { return }
             self.mediaQueue.async {
                 guard generation == self.posterFetchGeneration else { return }
                 let prepared = self.preparedArtwork(
@@ -1188,7 +1449,14 @@ final class NowPlayingService: ObservableObject {
                 let display = self.islandDisplayArtwork(prepared)
                 DispatchQueue.main.async {
                     var snap = self.snapshot
-                    guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+                    guard YouTubeTabPicker.snapshotCanAcceptYouTubePoster(
+                        snapshotTitle: snap.title,
+                        snapshotURL: snap.sourceURL,
+                        snapshotBundle: snap.bundleIdentifier,
+                        requestedTitle: title,
+                        requestedURL: sourceURL,
+                        requestedBundle: bundleID
+                    ) else { return }
                     snap.sourceURL = sourceURL
                     snap.sourcePageTitle = tab.title
                     snap.sourceTab = tab
@@ -1218,15 +1486,35 @@ final class NowPlayingService: ObservableObject {
         }
         let tabPlatform = StreamingPlatform.from(url: candidate.url)
         if tabPlatform == .youtube || tabPlatform == .youtubeMusic {
+            let liveID = YouTubeTabPicker.youtubeVideoID(from: candidate.url)
+            if let liveID,
+               !staleYouTubeVideoIDAwaitingRefresh.isEmpty,
+               liveID.caseInsensitiveCompare(staleYouTubeVideoIDAwaitingRefresh) == .orderedSame {
+                return false
+            }
             let staleOK = allowStaleDocumentTitle
                 && tabPlatform == .youtube
                 && YouTubeTabPicker.isGenericYouTubeDocumentTitle(candidate.title)
-            guard YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
+            let familyOK = YouTubeTabPicker.cachedFamilyTabCanServeNowPlaying(
                 tabTitle: candidate.title,
                 tabURL: candidate.url,
                 nowPlayingTitle: title,
                 allowStaleDocumentTitle: staleOK
-            ) else {
+            )
+            let sameBoundTab: Bool = {
+                guard let cached = lastMediaSourceTab else { return false }
+                if cached.tabID != 0, candidate.tabID != 0 {
+                    return cached.tabID == candidate.tabID
+                }
+                return cached.windowIndex == candidate.windowIndex
+                    && cached.tabIndex == candidate.tabIndex
+            }()
+            let urlRefresh = sameBoundTab
+                && !staleYouTubeVideoIDAwaitingRefresh.isEmpty
+                && (tabPlatform.map {
+                    BrowserMediaNavigator.isLikelyPlaybackURL(candidate.url, platform: $0)
+                } ?? false)
+            guard familyOK || urlRefresh else {
                 return false
             }
             guard applyYouTubePoster(
@@ -1236,7 +1524,8 @@ final class NowPlayingService: ObservableObject {
                 appName: appName,
                 artist: artist,
                 tab: candidate,
-                allowStaleDocumentTitle: staleOK
+                allowStaleDocumentTitle: staleOK,
+                allowURLIdentityRefresh: urlRefresh
             ) else {
                 return false
             }
@@ -1249,6 +1538,10 @@ final class NowPlayingService: ObservableObject {
             lastMediaSourceTab = candidate
             lastYouTubeControlURL = candidate.url
             staleClosedBrowserSessionKey = ""
+            if let boundID = YouTubeTabPicker.youtubeVideoID(from: lastMediaSourceURL),
+               boundID.caseInsensitiveCompare(staleYouTubeVideoIDAwaitingRefresh) != .orderedSame {
+                staleYouTubeVideoIDAwaitingRefresh = ""
+            }
             rememberBrowserSourceOnMediaQueue(
                 tab: candidate,
                 url: lastMediaSourceURL,
@@ -1316,6 +1609,7 @@ final class NowPlayingService: ObservableObject {
         lastMediaSourcePageTitle = ""
         lastMediaSourceTab = nil
         lastYouTubeControlURL = ""
+        staleYouTubeVideoIDAwaitingRefresh = ""
     }
 
     private func rememberBrowserSourceOnMediaQueue(
@@ -1347,12 +1641,15 @@ final class NowPlayingService: ObservableObject {
         artKey: String,
         cachedTab: BrowserMediaNavigator.Tab?
     ) {
-        let titleHint = StreamingPlatform.titleHint(
+        let metadataHint = StreamingPlatform.titleHint(
             bundleID: bundleID,
             appName: appName,
             artist: artist,
             title: title
         )
+        let titleHint = metadataHint
+            ?? cachedTab.flatMap { StreamingPlatform.from(url: $0.url) }
+            ?? StreamingPlatform.from(url: lastMediaSourceURL)
         let tryCached: () -> BrowserMediaNavigator.Tab? = {
             cachedTab.flatMap {
                 BrowserMediaNavigator.tab(
@@ -1384,7 +1681,8 @@ final class NowPlayingService: ObservableObject {
            ) {
             return
         }
-        if let active = BrowserMediaNavigator.activeTab(bundleID: bundleID) {
+        if let active = BrowserMediaNavigator.activeTab(bundleID: bundleID),
+           BrowserMediaNavigator.canFastBindActiveTab(active, titleHint: titleHint) {
             if bindFastBrowserTab(
                 active,
                 title: title,
@@ -1420,6 +1718,48 @@ final class NowPlayingService: ObservableObject {
 
         let urlPlatform = StreamingPlatform.from(url: tab.url)
         let tabPlatform = urlPlatform ?? hinted
+        let remotePixels = MediaClient.pixelSize(of: remoteArtwork)
+        if urlPlatform == .youtubeMusic,
+           MediaArtworkPolicy.remoteArtworkAlreadyMatchesBoundTab(
+            tabPlatform: urlPlatform,
+            pixelWidth: remotePixels.width,
+            pixelHeight: remotePixels.height
+           ) {
+            lastMediaSourceURL = tab.url
+            lastMediaSourcePageTitle = tab.title
+            lastMediaSourceTab = tab
+            lastYouTubeControlURL = tab.url
+            staleClosedBrowserSessionKey = ""
+            rememberBrowserSourceOnMediaQueue(
+                tab: tab,
+                url: tab.url,
+                pageTitle: tab.title,
+                youtubeControlURL: tab.url
+            )
+            let prepared = preparedArtwork(
+                remote: remoteArtwork,
+                artKey: artKey,
+                bundleID: bundleID,
+                appName: appName,
+                artist: artist,
+                title: title,
+                url: tab.url
+            )
+            let display = islandDisplayArtwork(prepared)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                var snap = self.snapshot
+                guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+                snap.sourceURL = tab.url
+                snap.sourcePageTitle = tab.title
+                snap.sourceTab = tab
+                snap.artwork = display.image
+                snap.artworkToken = display.token
+                snap.isPlaying = self.activeIsPlaying
+                self.snapshot = snap
+            }
+            return
+        }
         let sourcePageTitle = BrowserMediaNavigator.playbackTitle(
             on: tab,
             platform: tabPlatform,
@@ -1427,6 +1767,11 @@ final class NowPlayingService: ObservableObject {
         ) ?? tab.title
         let pickedMusic = urlPlatform == .youtubeMusic
         let pickedTitle = YouTubeTabPicker.titlesMatchSameTrack(tab.title, title)
+        if let liveID = YouTubeTabPicker.youtubeVideoID(from: tab.url),
+           !staleYouTubeVideoIDAwaitingRefresh.isEmpty,
+           liveID.caseInsensitiveCompare(staleYouTubeVideoIDAwaitingRefresh) == .orderedSame {
+            return
+        }
         if urlPlatform == .youtube, !pickedTitle,
            !YouTubeTabPicker.chromeTabCanBindToNowPlaying(
             tabTitle: tab.title,
@@ -1440,6 +1785,10 @@ final class NowPlayingService: ObservableObject {
         lastMediaSourcePageTitle = sourcePageTitle
         lastMediaSourceTab = tab
         staleClosedBrowserSessionKey = ""
+        if let boundID = YouTubeTabPicker.youtubeVideoID(from: tab.url),
+           boundID.caseInsensitiveCompare(staleYouTubeVideoIDAwaitingRefresh) != .orderedSame {
+            staleYouTubeVideoIDAwaitingRefresh = ""
+        }
         rememberBrowserSourceOnMediaQueue(
             tab: tab,
             url: tab.url,
@@ -1527,10 +1876,19 @@ final class NowPlayingService: ObservableObject {
             guard let self else { return }
             var snap = self.snapshot
             guard snap.title == title, snap.bundleIdentifier == bundleID else { return }
+            let previousURL = snap.sourceURL
             snap.sourceURL = tab.url
             snap.sourcePageTitle = sourcePageTitle
             snap.sourceTab = tab
             snap.isPlaying = self.activeIsPlaying
+            // Watch posters must not linger after binding Music (or another
+            // video) while the new cover is still downloading.
+            if MediaArtworkPolicy.isYouTubePosterToken(snap.artworkToken),
+               StreamingPlatform.from(url: tab.url) == .youtubeMusic
+                || !YouTubeTabPicker.videoIDsMatch(previousURL, tab.url) {
+                snap.artwork = nil
+                snap.artworkToken = "pending:youtube"
+            }
             self.snapshot = snap
         }
         if StreamingPlatform.from(url: tab.url) == .youtube
@@ -1543,7 +1901,8 @@ final class NowPlayingService: ObservableObject {
                 appName: appName,
                 artist: artist,
                 tab: tab,
-                sourceURL: lastMediaSourceURL.isEmpty ? tab.url : lastMediaSourceURL
+                sourceURL: lastMediaSourceURL.isEmpty ? tab.url : lastMediaSourceURL,
+                musicArtworkURL: musicProbe?.artworkURL
             )
             return
         }
@@ -1605,20 +1964,33 @@ final class NowPlayingService: ObservableObject {
         }
     }
 
-    private func trySilentBrowserPlayPause() -> Bool {
-        return runJavaScriptOnCachedBrowserTab(BrowserMediaNavigator.playPauseJavaScript)
+    private func trySilentBrowserPlayPause(
+        tab: BrowserMediaNavigator.Tab? = nil,
+        bundleID: String? = nil
+    ) -> Bool {
+        return runJavaScriptOnCachedBrowserTab(
+            BrowserMediaNavigator.playPauseJavaScript,
+            tab: tab,
+            bundleID: bundleID
+        )
     }
 
     private func trySilentBrowserSeek(to seconds: TimeInterval) -> Bool {
         return runJavaScriptOnCachedBrowserTab(BrowserMediaNavigator.seekJavaScript(to: seconds))
     }
 
-    private func runJavaScriptOnCachedBrowserTab(_ javascript: String) -> Bool {
-        guard let tab = lastMediaSourceTab ?? snapshot.sourceTab else { return false }
+    private func runJavaScriptOnCachedBrowserTab(
+        _ javascript: String,
+        tab: BrowserMediaNavigator.Tab? = nil,
+        bundleID: String? = nil
+    ) -> Bool {
+        let resolvedTab = tab ?? lastMediaSourceTab ?? snapshot.sourceTab
+        let resolvedBundle = bundleID ?? activeBundleID
+        guard let resolvedTab else { return false }
         switch BrowserMediaNavigator.executeJavaScript(
             javascript,
-            on: tab,
-            bundleID: activeBundleID
+            on: resolvedTab,
+            bundleID: resolvedBundle
         ) {
         case .success:
             return true
@@ -1629,6 +2001,84 @@ final class NowPlayingService: ObservableObject {
             return false
         case .failed, .missingTab:
             return false
+        }
+    }
+
+    private func applyBrowserPlayPause(
+        shouldPause: Bool,
+        target: ControlTarget,
+        tab: BrowserMediaNavigator.Tab?,
+        bundleID: String
+    ) {
+        switch target {
+        case .youtubeBrowser:
+            var applied = false
+            switch trySilentYouTubePlayPause(shouldPause: shouldPause, tab: tab, bundleID: bundleID) {
+            case .ok:
+                applied = true
+            case .needsPermission:
+                if ensureChromeJavaScriptFromAppleEventsEnabled() {
+                    Thread.sleep(forTimeInterval: 0.25)
+                    if case .ok = trySilentYouTubePlayPause(
+                        shouldPause: shouldPause,
+                        tab: tab,
+                        bundleID: bundleID
+                    ) {
+                        applied = true
+                    }
+                }
+            case .failed:
+                if shouldPause {
+                    NSLog("[NowPlaying] skip MediaRemote pause; YouTube tab JS missed")
+                } else {
+                    NSLog("[NowPlaying] skip MediaRemote play; no matching YouTube tab")
+                }
+            }
+            if !applied {
+                mediaQueue.async { self.publishOptimisticPlaying(shouldPause) }
+            }
+        case .browserMedia:
+            if !trySilentBrowserPlayPause(tab: tab, bundleID: bundleID) {
+                mediaQueue.async {
+                    self.runAdapterCommand(shouldPause ? "pause" : "play")
+                }
+            }
+        case .nativeMediaRemote:
+            break
+        }
+    }
+
+    private func applyBrowserSkip(
+        next: Bool,
+        target: ControlTarget,
+        tab: BrowserMediaNavigator.Tab?,
+        bundleID: String
+    ) {
+        switch target {
+        case .youtubeBrowser:
+            let result = trySilentYouTubeJavaScript(next: next, tab: tab, bundleID: bundleID)
+            switch result {
+            case .ok:
+                return
+            case .needsPermission:
+                if ensureChromeJavaScriptFromAppleEventsEnabled() {
+                    Thread.sleep(forTimeInterval: 0.25)
+                    if case .ok = trySilentYouTubeJavaScript(
+                        next: next,
+                        tab: tab,
+                        bundleID: bundleID
+                    ) {
+                        return
+                    }
+                }
+                showChromeJavaScriptHintIfNeeded()
+            case .failed:
+                NSLog("[NowPlaying] YouTube next/prev JS missed; not using MediaRemote")
+            }
+        case .browserMedia:
+            seekBrowserVideo(by: next ? 10 : -10)
+        case .nativeMediaRemote:
+            break
         }
     }
 
@@ -1669,9 +2119,79 @@ final class NowPlayingService: ObservableObject {
         }
     }
 
+    /// MediaRemote reports NIL for Chrome YouTube on some macOS builds.
+    /// If nothing is Now Playing, pick a live YouTube tab the same way
+    /// Spotify is probed when Chrome holds a stale session.
+    private func probeBrowserYouTubeIfMediaRemoteMissing() {
+        guard !macIsAsleep else { return }
+        guard activeTitle.isEmpty else { return }
+        let now = Date().timeIntervalSince1970
+        guard now >= preferSpotifyUntil else { return }
+        guard now - lastChromeFallbackAt >= 2.0 else { return }
+        guard !chromeFallbackInFlight, !isSourceResolveInFlight() else { return }
+        let bundleID = ChromeTabMonitor.chromeBundleID
+        guard NSWorkspace.shared.runningApplications.contains(where: {
+            $0.bundleIdentifier == bundleID
+        }) else { return }
+        lastChromeFallbackAt = now
+        chromeFallbackInFlight = true
+        AppleScriptRunLoop.media.async { [weak self] in
+            defer {
+                self?.mediaQueue.async { self?.chromeFallbackInFlight = false }
+            }
+            guard let self else { return }
+            let tabs = BrowserMediaNavigator.listTabs(bundleID: bundleID)
+            let candidates = tabs.filter { tab in
+                let platform = StreamingPlatform.from(url: tab.url)
+                guard platform == .youtube || platform == .youtubeMusic else { return false }
+                return BrowserMediaNavigator.isLikelyPlaybackURL(tab.url, platform: platform)
+            }
+            for tab in candidates.prefix(8) {
+                guard BrowserMediaNavigator.probePlaybackPlaying(on: tab, bundleID: bundleID) == true else {
+                    continue
+                }
+                var title = YouTubeTabPicker.strippingChromeNotificationBadge(tab.title)
+                if title.isEmpty || YouTubeTabPicker.isGenericYouTubeDocumentTitle(title) {
+                    title = BrowserMediaNavigator.playbackTitle(
+                        on: tab,
+                        platform: StreamingPlatform.from(url: tab.url),
+                        bundleID: bundleID
+                    ) ?? (title.isEmpty ? "YouTube" : title)
+                }
+                if title.isEmpty { title = "YouTube" }
+                let artist = StreamingPlatform.from(url: tab.url) == .youtubeMusic
+                    ? "YouTube Music"
+                    : "YouTube"
+                let timing = BrowserMediaNavigator.probePlaybackTiming(on: tab, bundleID: bundleID)
+                self.mediaQueue.async {
+                    self.lastBrowserPlayAt = Date().timeIntervalSince1970
+                    self.lastMediaSourceTab = tab
+                    self.lastMediaSourceURL = tab.url
+                    self.lastMediaSourcePageTitle = title
+                    self.lastYouTubeControlURL = tab.url
+                    self.apply(
+                        payload: AdapterPayload(
+                            title: title,
+                            artist: artist,
+                            album: "",
+                            isPlaying: true,
+                            durationMicros: (timing?.duration ?? 0) * 1_000_000,
+                            elapsedTimeMicros: (timing?.elapsed ?? 0) * 1_000_000,
+                            applicationName: "Google Chrome",
+                            bundleIdentifier: bundleID
+                        ),
+                        title: title
+                    )
+                }
+                return
+            }
+        }
+    }
+
     /// MediaRemote often keeps a paused Chrome tab as Now Playing after Spotify
     /// starts. Poll Spotify directly in that case so the island can switch.
     private func probeNativeSpotifyIfNeeded() {
+        guard !macIsAsleep else { return }
         let now = Date().timeIntervalSince1970
         guard now - lastSpotifyProbeAt >= 1.0 else { return }
         lastSpotifyProbeAt = now
@@ -1765,16 +2285,17 @@ final class NowPlayingService: ObservableObject {
     /// Chrome often leaves MediaRemote on "playing" after the page pauses.
     /// Sample the matched tab's real video/audio so the waveform can freeze.
     private func probeBrowserPlaybackIfNeeded() {
+        guard !macIsAsleep else { return }
         guard isBrowserBundle(activeBundleID), let tab = lastMediaSourceTab else { return }
         let now = Date().timeIntervalSince1970
-        guard now >= ignoreHTMLProbeUntil else { return }
+        guard !isIgnoringHTMLProbe(at: now) else { return }
         guard now - lastHTMLPlaybackProbeAt >= Self.htmlPlaybackProbeInterval else { return }
         guard !htmlProbeInFlight else { return }
         guard !isSourceResolveInFlight() else { return }
         lastHTMLPlaybackProbeAt = now
         htmlProbeInFlight = true
         let bundleID = activeBundleID
-        AppleScriptRunLoop.media.async { [weak self] in
+        AppleScriptRunLoop.probe.async { [weak self] in
             if self?.isSourceResolveInFlight() == true {
                 self?.mediaQueue.async { self?.htmlProbeInFlight = false }
                 return
@@ -1793,7 +2314,7 @@ final class NowPlayingService: ObservableObject {
                 case .unknown:
                     return
                 case .playing(let playing):
-                    if Date().timeIntervalSince1970 < self.ignoreHTMLProbeUntil { return }
+                    if self.isIgnoringHTMLProbe() { return }
                     if playing {
                         if !self.activeIsPlaying {
                             self.lastBrowserPlayAt = Date().timeIntervalSince1970
@@ -1813,35 +2334,18 @@ final class NowPlayingService: ObservableObject {
         }
     }
 
-    /// Advance YouTube without bringing the browser to the front.
-    /// Uses Chrome AppleScript JavaScript (`nextVideo` / `previousVideo`).
-    /// If needed, enables View → Developer → Allow JavaScript from Apple Events
-    /// once (briefly), then restores the previous frontmost app.
-    private func sendYouTubePlaylistKey(next: Bool) {
-        switch trySilentYouTubeJavaScript(next: next) {
-        case .ok:
-            return
-        case .needsPermission:
-            if ensureChromeJavaScriptFromAppleEventsEnabled() {
-                Thread.sleep(forTimeInterval: 0.25)
-                if case .ok = trySilentYouTubeJavaScript(next: next) {
-                    return
-                }
-            }
-            showChromeJavaScriptHintIfNeeded()
-        case .failed:
-            NSLog("[NowPlaying] YouTube next/prev failed (no tab/player)")
-        }
-    }
-
-    private enum YouTubeJSResult {
+    private enum YouTubeJSResult: Equatable {
         case ok
         case needsPermission
         case failed
     }
 
     /// Pause/play the Now Playing tab only — never the first YouTube tab in Chrome.
-    private func trySilentYouTubePlayPause(shouldPause: Bool) -> YouTubeJSResult {
+    private func trySilentYouTubePlayPause(
+        shouldPause: Bool,
+        tab: BrowserMediaNavigator.Tab? = nil,
+        bundleID: String? = nil
+    ) -> YouTubeJSResult {
         if shouldPause {
             let musicJS = """
             (() => {
@@ -1863,7 +2367,12 @@ final class NowPlayingService: ObservableObject {
               return 'already-paused';
             })()
             """
-            return runSilentBrowserMediaJavaScript(musicJS: musicJS, watchJS: watchJS, bias: .pause)
+            return runSilentBrowserMediaJavaScript(
+                musicJS: musicJS,
+                watchJS: watchJS,
+                tab: tab,
+                bundleID: bundleID
+            )
         }
 
         let musicJS = """
@@ -1871,33 +2380,48 @@ final class NowPlayingService: ObservableObject {
           const v = document.querySelector('#song-video video');
           const btn = document.querySelector('#play-pause-button');
           const label = ((btn && (btn.getAttribute('aria-label') || btn.getAttribute('title'))) || '').toLowerCase();
+          if (btn && label.indexOf('play') !== -1) { btn.click(); }
           if (v && v.paused) {
-            const p = v.play();
-            if (p && typeof p.catch === 'function') p.catch(function(){});
-            return 'ytm-played';
+            const pr = v.play();
+            if (pr && typeof pr.catch === 'function') pr.catch(function(){});
           }
-          if (btn && label.indexOf('play') !== -1) { btn.click(); return 'ytm-btn-play'; }
-          return 'already-playing';
+          if (v && !v.paused) return 'ytm-played';
+          if (btn && label.indexOf('play') !== -1) return 'ytm-btn-play';
+          return v && v.paused ? 'play-blocked' : 'already-playing';
         })()
         """
         let watchJS = """
         (() => {
           const p = document.querySelector('#movie_player, .html5-video-player');
           const v = document.querySelector('#movie_player video.html5-main-video, #movie_player video, video.html5-main-video');
-          const state = p && typeof p.getPlayerState === 'function' ? p.getPlayerState() : null;
+          const btn = document.querySelector('.ytp-play-button');
+          const large = document.querySelector('.ytp-large-play-button');
+          if (p && typeof p.playVideo === 'function') { p.playVideo(); }
+          const label = ((btn && (btn.getAttribute('aria-label') || btn.getAttribute('title'))) || '').toLowerCase();
+          if (btn && (label.indexOf('play') !== -1 || label === '')) { btn.click(); }
+          if (large) { large.click(); }
           if (v && v.paused) {
             const pr = v.play();
             if (pr && typeof pr.catch === 'function') pr.catch(function(){});
-            return 'played-video';
           }
-          if (state !== 1 && p && typeof p.playVideo === 'function') { p.playVideo(); return 'played-api'; }
-          return 'already-playing';
+          const state = p && typeof p.getPlayerState === 'function' ? p.getPlayerState() : null;
+          if (state === 1 || (v && !v.paused)) return 'played';
+          return v ? 'play-blocked' : 'no-player';
         })()
         """
-        return runSilentBrowserMediaJavaScript(musicJS: musicJS, watchJS: watchJS, bias: .play)
+        return runSilentBrowserMediaJavaScript(
+            musicJS: musicJS,
+            watchJS: watchJS,
+            tab: tab,
+            bundleID: bundleID
+        )
     }
 
-    private func trySilentYouTubeSeek(to seconds: TimeInterval) -> YouTubeJSResult {
+    private func trySilentYouTubeSeek(
+        to seconds: TimeInterval,
+        tab: BrowserMediaNavigator.Tab? = nil,
+        bundleID: String? = nil
+    ) -> YouTubeJSResult {
         let safe = String(format: "%.3f", seconds)
         let musicJS = """
         (() => {
@@ -1915,77 +2439,46 @@ final class NowPlayingService: ObservableObject {
           const p = document.querySelector('#movie_player, .html5-video-player');
           if (p && typeof p.seekTo === 'function') {
             p.seekTo(seconds, true);
-            return 'seekTo';
           }
-          const v = document.querySelector('video');
-          if (!v) return 'no-video';
-          const dur = Number.isFinite(v.duration) ? v.duration : seconds;
-          v.currentTime = Math.min(Math.max(0, seconds), Math.max(dur - 0.05, 0));
-          return 'video';
+          const v = document.querySelector('#movie_player video.html5-main-video, #movie_player video, video');
+          if (v) {
+            const dur = Number.isFinite(v.duration) ? v.duration : seconds;
+            v.currentTime = Math.min(Math.max(0, seconds), Math.max(dur - 0.05, 0));
+          }
+          if (p && typeof p.seekTo === 'function') { return 'seekTo'; }
+          if (v) { return 'video'; }
+          return 'no-video';
         })()
         """
-        return runSilentBrowserMediaJavaScript(musicJS: musicJS, watchJS: watchJS, bias: .sameSession)
+        return runSilentBrowserMediaJavaScript(
+            musicJS: musicJS,
+            watchJS: watchJS,
+            tab: tab,
+            bundleID: bundleID
+        )
     }
 
     /// Next/prev — YouTube Music player-bar buttons first, then classic YouTube.
-    private func trySilentYouTubeJavaScript(next: Bool) -> YouTubeJSResult {
-        let musicJS: String
-        let watchJS: String
+    /// Previous goes to the prior item on the first click (not restart-then-skip).
+    private func trySilentYouTubeJavaScript(
+        next: Bool,
+        tab: BrowserMediaNavigator.Tab? = nil,
+        bundleID: String? = nil
+    ) -> YouTubeJSResult {
         if next {
-            musicJS = """
-            (() => {
-              const b = document.querySelector('.next-button, ytmusic-player-bar .next-button');
-              if (b) { b.click(); return 'ytm-next'; }
-              return 'no-player';
-            })()
-            """
-            watchJS = """
-            (() => {
-              const p = document.querySelector('#movie_player, .html5-video-player');
-              if (p && typeof p.nextVideo === 'function') { p.nextVideo(); return 'api'; }
-              const b = document.querySelector('.ytp-next-button');
-              if (b) { b.click(); return 'click'; }
-              return 'no-player';
-            })()
-            """
-        } else {
-            musicJS = """
-            (() => {
-              const b = document.querySelector('.previous-button, ytmusic-player-bar .previous-button');
-              if (!b) return 'no-player';
-              const v = document.querySelector('#song-video video, video');
-              // Mid-track: YT Music prev often restarts; seek to 0 then prev again.
-              if (v && v.currentTime > 2.5) {
-                v.currentTime = 0;
-                setTimeout(() => { try { b.click(); } catch (e) {} }, 120);
-                return 'ytm-seek-then-prev';
-              }
-              b.click();
-              return 'ytm-prev';
-            })()
-            """
-            watchJS = """
-            (() => {
-              const p = document.querySelector('#movie_player, .html5-video-player');
-              if (p && typeof p.previousVideo === 'function') { p.previousVideo(); return 'api'; }
-              const b = document.querySelector('.ytp-prev-button');
-              const disabled = !b || b.getAttribute('aria-disabled') === 'true';
-              const v = document.querySelector('video');
-              if (!disabled && b) {
-                if (v && v.currentTime > 2.5) {
-                  v.currentTime = 0;
-                  setTimeout(() => { try { b.click(); } catch (e) {} }, 120);
-                  return 'seek-then-click';
-                }
-                b.click();
-                return 'click';
-              }
-              if (history.length > 1) { history.back(); return 'history-back'; }
-              return 'no-player';
-            })()
-            """
+            return runSilentBrowserMediaJavaScript(
+                musicJS: BrowserMediaNavigator.youtubeMusicNextJavaScript,
+                watchJS: BrowserMediaNavigator.youtubeWatchNextJavaScript,
+                tab: tab,
+                bundleID: bundleID
+            )
         }
-        return runSilentBrowserMediaJavaScript(musicJS: musicJS, watchJS: watchJS, bias: .sameSession)
+        return runSilentBrowserMediaJavaScript(
+            musicJS: BrowserMediaNavigator.youtubeMusicPreviousJavaScript,
+            watchJS: BrowserMediaNavigator.youtubeWatchPreviousJavaScript,
+            tab: tab,
+            bundleID: bundleID
+        )
     }
 
     /// Runs JS only on the YouTube tab that matches Now Playing (or the last
@@ -1993,29 +2486,62 @@ final class NowPlayingService: ObservableObject {
     private func runSilentBrowserMediaJavaScript(
         musicJS: String,
         watchJS: String,
-        bias: YouTubeTabPicker.Bias
+        tab: BrowserMediaNavigator.Tab? = nil,
+        bundleID: String? = nil
     ) -> YouTubeJSResult {
-        let tab = lastMediaSourceTab ?? snapshot.sourceTab
-        if let tab {
-            let js = tab.url.contains("music.youtube.com") ? musicJS : watchJS
-            switch BrowserMediaNavigator.executeJavaScript(
-                js,
-                on: tab,
-                bundleID: activeBundleID
-            ) {
-            case .success:
-                lastYouTubeControlURL = tab.url
-                return .ok
-            case .needsPermission:
-                return .needsPermission
-            case .failed, .missingTab:
-                break
+        let resolvedBundle = bundleID ?? activeBundleID
+        let candidate = tab ?? lastMediaSourceTab ?? snapshot.sourceTab
+        if let candidate {
+            let result = executeYouTubeJavaScript(
+                musicJS: musicJS,
+                watchJS: watchJS,
+                tab: candidate,
+                bundleID: resolvedBundle
+            )
+            if result == .ok || result == .needsPermission {
+                return result
+            }
+            let tabs = BrowserMediaNavigator.listTabs(bundleID: resolvedBundle)
+            if let live = BrowserMediaNavigator.resolveLiveTab(candidate, from: tabs) {
+                let retried = executeYouTubeJavaScript(
+                    musicJS: musicJS,
+                    watchJS: watchJS,
+                    tab: live,
+                    bundleID: resolvedBundle
+                )
+                if retried != .failed {
+                    return retried
+                }
             }
         }
-        // A full YouTube tab scan runs JS in every watch/Music tab and blocked
-        // skip/play for seconds. Cached-tab failure falls through to MediaRemote.
-        NSLog("[NowPlaying] YouTube JS missed cached tab; skipping full tab scan")
+        NSLog("[NowPlaying] YouTube JS missed cached tab")
         return .failed
+    }
+
+    private func executeYouTubeJavaScript(
+        musicJS: String,
+        watchJS: String,
+        tab: BrowserMediaNavigator.Tab,
+        bundleID: String
+    ) -> YouTubeJSResult {
+        let js = tab.url.contains("music.youtube.com") ? musicJS : watchJS
+        switch BrowserMediaNavigator.executeJavaScript(
+            js,
+            on: tab,
+            bundleID: bundleID
+        ) {
+        case .success(let value):
+            if value == "play-blocked" {
+                return .failed
+            }
+            lastYouTubeControlURL = tab.url
+            lastMediaSourceTab = tab
+            return .ok
+        case .needsPermission:
+            return .needsPermission
+        case .failed, .missingTab:
+            return .failed
+        }
     }
 
     /// Enables Chrome's Developer → Allow JavaScript from Apple Events when off.

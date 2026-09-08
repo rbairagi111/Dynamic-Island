@@ -1,0 +1,3 @@
+{"message":"reveal collapsed and locked hover","location":"NotchViewModel.swift:openNowPlayingSource","sessionId":"5717f8","hypothesisId":"A","runId":"post-fix","timestamp":1788771627516,"data":{"expanded":false,"suppressHover":true}}
+{"location":"NotchViewModel.swift:openNowPlayingSource","message":"reveal collapsed and locked hover","sessionId":"5717f8","timestamp":1788771637615,"data":{"expanded":false,"suppressHover":true},"hypothesisId":"A","runId":"post-fix"}
+{"location":"NotchViewModel.swift:expandLiveActivity","message":"hover expand blocked after reveal","sessionId":"5717f8","timestamp":1788771637616,"data":{"fromClick":false},"hypothesisId":"A","runId":"post-fix"}

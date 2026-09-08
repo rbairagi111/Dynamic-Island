@@ -30,6 +30,7 @@ final class VolumeBrightnessMonitor {
     static let shared = VolumeBrightnessMonitor()
 
     var onEvent: ((LevelHUDEvent) -> Void)?
+    var onTransport: ((IslandKeyboardTransport) -> Void)?
 
     private var volumeBaseline = true
     private var brightnessBaseline = true
@@ -53,8 +54,13 @@ final class VolumeBrightnessMonitor {
     private var hidRedirectActive = false
     private var lastRedirectAt: TimeInterval = 0
     private var lastRedirectKey: RedirectedMediaKey?
+    private var lastTransportAt: TimeInterval = 0
+    private var lastTransportKey: IslandKeyboardTransport?
     private var lastHIDApplyAt: TimeInterval = 0
     private var wakeObserver: NSObjectProtocol?
+    private let bindingLock = NSLock()
+    private var captureMediaKeys = false
+    private var captureArrowKeys = false
 
     private let listenerQueue = DispatchQueue(label: "island.audio-level")
 
@@ -95,6 +101,19 @@ final class VolumeBrightnessMonitor {
         installMediaKeyTap()
     }
 
+    func updateKeyboardBinding(mediaKeys: Bool, arrowKeys: Bool) {
+        bindingLock.lock()
+        captureMediaKeys = mediaKeys
+        captureArrowKeys = arrowKeys
+        bindingLock.unlock()
+    }
+
+    private func keyboardBinding() -> (mediaKeys: Bool, arrowKeys: Bool) {
+        bindingLock.lock()
+        defer { bindingLock.unlock() }
+        return (captureMediaKeys, captureArrowKeys)
+    }
+
     /// Put volume/brightness keys back so they are not left as F-keys.
     func restoreMediaKeyMappings() {
         HIDMediaKeyRedirect.shared.restore()
@@ -126,17 +145,27 @@ final class VolumeBrightnessMonitor {
         }
 
         if type == .keyDown || type == .keyUp {
-            guard hidRedirectActive || HIDMediaKeyRedirect.shared.isApplied else {
-                return Unmanaged.passUnretained(event)
-            }
             let code = event.getIntegerValueField(.keyboardEventKeycode)
-            guard let key = RedirectedMediaKey.fromCGKeyCode(code) else {
-                return Unmanaged.passUnretained(event)
+            if hidRedirectActive || HIDMediaKeyRedirect.shared.isApplied,
+               let key = RedirectedMediaKey.fromCGKeyCode(code) {
+                if type == .keyDown {
+                    _ = perform(key)
+                }
+                return nil
             }
-            if type == .keyDown {
-                _ = perform(key)
+            let flags = event.flags
+            if let transport = IslandKeyboardTransport.fromCGKeyCode(code, flags: flags) {
+                let binding = keyboardBinding()
+                guard binding.arrowKeys else {
+                    return Unmanaged.passUnretained(event)
+                }
+                if type == .keyDown,
+                   event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    emitTransport(transport)
+                }
+                return nil
             }
-            return nil
+            return Unmanaged.passUnretained(event)
         }
 
         guard type.rawValue == nxSysDefinedEvent else {
@@ -148,6 +177,15 @@ final class VolumeBrightnessMonitor {
 
         let keyCode = Int64((nsEvent.data1 & 0xFFFF0000) >> 16)
         let keyState = (nsEvent.data1 & 0x0000FF00) >> 8
+        if let transport = IslandKeyboardTransport.fromNXKeyCode(keyCode) {
+            guard keyboardBinding().mediaKeys else {
+                return Unmanaged.passUnretained(event)
+            }
+            if keyState == nxKeyDownState {
+                emitTransport(transport)
+            }
+            return nil
+        }
         guard let key = RedirectedMediaKey.fromNXKeyCode(keyCode) else {
             return Unmanaged.passUnretained(event)
         }
@@ -158,6 +196,22 @@ final class VolumeBrightnessMonitor {
             return Unmanaged.passUnretained(event)
         }
         return nil
+    }
+
+    private func emitTransport(_ key: IslandKeyboardTransport) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if lastTransportKey == key, now - lastTransportAt < 0.18 {
+            return
+        }
+        lastTransportKey = key
+        lastTransportAt = now
+        if Thread.isMainThread {
+            onTransport?(key)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.onTransport?(key)
+            }
+        }
     }
 
     @discardableResult
@@ -211,10 +265,8 @@ final class VolumeBrightnessMonitor {
 
         didAttemptTapCreate = true
         var mask = CGEventMask(1 << nxSysDefinedEvent)
-        if IslandSurfacePolicy.shouldRemapMediaKeysToFunctionKeys {
-            mask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
-            mask |= CGEventMask(1 << CGEventType.keyUp.rawValue)
-        }
+        mask |= CGEventMask(1 << CGEventType.keyDown.rawValue)
+        mask |= CGEventMask(1 << CGEventType.keyUp.rawValue)
         guard let tap = CGEvent.tapCreate(
             tap: .cghidEventTap,
             place: .headInsertEventTap,

@@ -286,6 +286,7 @@ final class NotchWindowController: NSWindowController {
     private var outsideClickThroughStreak = 0
     /// Previous sample so a fast swipe that tunnels through the island still expands.
     private var lastPointerScreenPoint: NSPoint?
+    private var isScrubbingFromClick = false
 
     convenience init() {
         let window = NotchWindowController.makeWindow()
@@ -381,6 +382,26 @@ final class NotchWindowController: NSWindowController {
             name: NSWindow.didChangeScreenNotification,
             object: window
         )
+        // Reposition on wake — display topology may have changed and
+        // didChangeScreenParameters is not guaranteed on every wake path.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self?.positionWindow()
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self?.positionWindow()
+            }
+        }
     }
 
     private func observeSpaceTransitions() {
@@ -989,6 +1010,12 @@ final class NotchWindowController: NSWindowController {
                 return true
             }
         }
+        if isScrubbingFromClick,
+           event.type == .leftMouseDragged || event.type == .leftMouseUp {
+            applyScrub(at: screenPoint, ended: event.type == .leftMouseUp)
+            updateClickThrough(withScreenPoint: screenPoint)
+            return true
+        }
         updateClickThrough(withScreenPoint: screenPoint)
         return false
     }
@@ -1040,8 +1067,28 @@ final class NotchWindowController: NSWindowController {
             viewModel.skipBackward()
         case .skipForward:
             viewModel.skipForward()
+        case .seek:
+            isScrubbingFromClick = true
+            applyScrub(at: screenPoint, ended: false)
         }
         return true
+    }
+
+    private func applyScrub(at screenPoint: NSPoint, ended: Bool) {
+        guard let window, let hosting = hostingView else { return }
+        let islandInView = islandRect(in: hosting)
+        let inWindow = hosting.convert(islandInView, to: nil)
+        let inScreen = window.convertToScreen(inWindow)
+        let x = screenPoint.x - inScreen.minX
+        let fraction = IslandClickPolicy.seekFraction(x: x, islandWidth: inScreen.width)
+        if ended {
+            viewModel.endScrubbing(fraction: fraction)
+            isScrubbingFromClick = false
+        } else if viewModel.isScrubbing {
+            viewModel.updateScrubbing(fraction: fraction)
+        } else {
+            viewModel.beginScrubbing(at: fraction)
+        }
     }
 
     /// Mirrors RecordingStopControl in screen coordinates, with 4pt hit slop.
@@ -1099,6 +1146,7 @@ final class NotchWindowController: NSWindowController {
                 radius: radius
             )
             lastPointerScreenPoint = screenPoint
+            bindKeyboardTransport(pointerOverIsland: inside)
             if inside {
                 if window.ignoresMouseEvents {
                     window.ignoresMouseEvents = false
@@ -1118,14 +1166,11 @@ final class NotchWindowController: NSWindowController {
             return
         }
 
-        let islandInView = islandRect(in: hosting)
         // Exact island bounds so the arrow cursor does not appear over the
         // transparent window around the notch. A larger pad while dragging
         // still lets the compact island become a drop target.
         let pad: CGFloat = NSEvent.pressedMouseButtons != 0 ? 16 : 0
-        let paddedInView = islandInView.insetBy(dx: -pad, dy: -pad)
-        let inWindow = hosting.convert(paddedInView, to: nil)
-        let inScreen = window.convertToScreen(inWindow)
+        let inScreen = hoverIslandScreenRect(in: hosting, window: window, pad: pad)
         let previous = lastPointerScreenPoint
         let radius = IslandSurfacePolicy.islandHoverRadius(islandSize: inScreen.size)
         let inside = IslandSurfacePolicy.pointerIsOverIsland(
@@ -1135,16 +1180,17 @@ final class NotchWindowController: NSWindowController {
             radius: radius
         )
         lastPointerScreenPoint = screenPoint
+        bindKeyboardTransport(pointerOverIsland: inside)
 
         if inside || viewModel.isDropTargeted || viewModel.isDraggingShelfItem {
             outsideClickThroughStreak = 0
-            NSCursor.arrow.set()
             if window.ignoresMouseEvents {
                 window.ignoresMouseEvents = false
                 window.enableCursorRects()
                 window.invalidateCursorRects(for: hosting)
+                NSCursor.arrow.set()
             }
-            if !viewModel.isOverlayActive {
+            if !viewModel.isOverlayActive, !viewModel.isExpanded {
                 viewModel.expand()
             }
             if needsLiveActivityElevation {
@@ -1153,15 +1199,29 @@ final class NotchWindowController: NSWindowController {
             }
         } else {
             outsideClickThroughStreak += 1
-            if outsideClickThroughStreak >= 2, !window.ignoresMouseEvents {
-                window.disableCursorRects()
-                window.ignoresMouseEvents = true
-                // SwiftUI onHover may not fire once we go click-through.
-                if viewModel.isExpanded && !viewModel.isOverlayActive {
-                    viewModel.collapse()
+            if outsideClickThroughStreak >= 2 {
+                viewModel.releaseHoverExpandLockIfExpired()
+                if !window.ignoresMouseEvents {
+                    window.disableCursorRects()
+                    window.ignoresMouseEvents = true
+                    // SwiftUI onHover may not fire once we go click-through.
+                    if viewModel.isExpanded && !viewModel.isOverlayActive {
+                        viewModel.collapse()
+                    }
                 }
             }
         }
+    }
+
+    private func bindKeyboardTransport(pointerOverIsland: Bool) {
+        VolumeBrightnessMonitor.shared.updateKeyboardBinding(
+            mediaKeys: viewModel.hasMedia,
+            arrowKeys: IslandSurfacePolicy.shouldBindArrowKeysToIsland(
+                isExpanded: viewModel.isExpanded,
+                hasMedia: viewModel.hasMedia,
+                pointerOverIsland: pointerOverIsland
+            )
+        )
     }
 
     // MARK: - Real notch geometry
@@ -1246,6 +1306,22 @@ final class NotchWindowController: NSWindowController {
         let x = (bounds.width - width) / 2
         let y: CGFloat = hosting.isFlipped ? topOffset : (bounds.height - height - topOffset)
         return NSRect(x: x, y: y, width: width, height: height)
+    }
+
+    /// Hover uses the resting notch frame. After Chrome `activate`, the space
+    /// compositor can lift this window so `convertToScreen` no longer matches
+    /// the pointer — that collapse/expand fight is the hover lag.
+    private func hoverIslandScreenRect(in hosting: NSView, window: NSWindow, pad: CGFloat) -> NSRect {
+        if spaceRestingFrame.width > 1 {
+            let width = viewModel.islandShapeWidth
+            let height = viewModel.islandShapeHeight
+            let x = spaceRestingFrame.minX + (spaceRestingFrame.width - width) / 2 - pad
+            let y = spaceRestingFrame.maxY - height - viewModel.islandTopOffset - pad
+            return NSRect(x: x, y: y, width: width + pad * 2, height: height + pad * 2)
+        }
+        let padded = islandRect(in: hosting).insetBy(dx: -pad, dy: -pad)
+        let inWindow = hosting.convert(padded, to: nil)
+        return window.convertToScreen(inWindow)
     }
 
     // MARK: - Window positioning

@@ -258,7 +258,7 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
 
     /// A cached or listed tab must not stay bound when Now Playing moved to another service.
     static func sourceURLCompatible(_ url: String, withTitleHint hint: StreamingPlatform?) -> Bool {
-        guard let fromURL = from(url: url) else { return true }
+        guard let fromURL = from(url: url) else { return hint == nil }
         guard let hint else {
             // YouTube MediaRemote titles usually omit "YouTube". Keep only that family.
             return fromURL == .youtube || fromURL == .youtubeMusic
@@ -489,10 +489,10 @@ enum MediaArtworkPolicy {
         return false
     }
 
-    /// Chrome's Now Playing artwork is a square app/favicon JPEG, or a tiny
-    /// 16:9 preview (≈150×83). YouTube posters are wider and much larger.
+    /// Chrome's 150×83 MediaRemote image is already the video's 16:9 preview.
+    /// Accept it immediately; square app/favicon JPEGs are classified elsewhere.
     static func isLikelyVideoThumbnail(pixelWidth: Int, pixelHeight: Int) -> Bool {
-        guard pixelWidth >= 240, pixelHeight >= 140 else { return false }
+        guard pixelWidth >= 140, pixelHeight >= 75 else { return false }
         let aspect = Double(pixelWidth) / Double(pixelHeight)
         return aspect >= 1.25 && aspect <= 2.4
     }
@@ -501,10 +501,65 @@ enum MediaArtworkPolicy {
         token.contains("ytimg:")
     }
 
-    /// YouTube Music publishes square album covers (MediaRemote and the
-    /// player-bar image), not 16:9 watch posters.
+    /// Watch posters (`ytimg:`) and Music player-bar images (`ytmimg:`).
+    static func shouldKeepResolvedYouTubeArtwork(_ token: String) -> Bool {
+        isYouTubePosterToken(token) || token.contains("ytmimg:")
+    }
+
+    static func isAllowedYouTubeArtworkDownloadHost(_ host: String) -> Bool {
+        let h = host.lowercased()
+        if h.contains("yt3.ggpht.") || h.contains("yt3.googleusercontent.") {
+            return false
+        }
+        return h.contains("ytimg.com")
+            || h.contains("ggpht.com")
+            || h.contains("googleusercontent.com")
+            || h.contains("youtube.com")
+    }
+
+    /// Music player-bar / MediaSession images often live on `yt3.*`. Watch
+    /// posters still use `i.ytimg.com` only; this host list is for Music covers.
+    static func isAllowedYouTubeMusicArtworkDownloadHost(_ host: String) -> Bool {
+        let h = host.lowercased()
+        if h.contains("yt3.ggpht.") || h.contains("yt3.googleusercontent.") {
+            return true
+        }
+        return isAllowedYouTubeArtworkDownloadHost(h)
+    }
+
+    /// Prefer MediaSession / non-avatar URLs over the channel badge in the bar.
+    static func preferredYouTubeMusicArtworkURL(playerBarURL: String, sessionURL: String = "") -> String {
+        let bar = playerBarURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let session = sessionURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        func isAvatar(_ raw: String) -> Bool {
+            guard let host = URL(string: raw)?.host?.lowercased() else { return false }
+            return host.contains("yt3.ggpht.") || host.contains("yt3.googleusercontent.")
+        }
+        if !bar.isEmpty, !isAvatar(bar) { return bar }
+        if !session.isEmpty { return session }
+        return bar
+    }
+
+    static func shouldAcceptYouTubeMusicRemoteImage(pixelWidth: Int, pixelHeight: Int) -> Bool {
+        isLikelyAlbumArtwork(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+            || isLikelyVideoThumbnail(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+    }
+
+    /// Music player-bar / MediaSession art is already on the page. Fetch it
+    /// before `i.ytimg.com` so we do not wait on two watch-poster timeouts.
+    /// With only a video id, Music uses the same ytimg path as youtube.com.
+    static func youtubeMusicShouldTryPlayerBarArtworkBeforeWatchPoster(
+        hasPlayerBarImageURL: Bool,
+        hasVideoID: Bool
+    ) -> Bool {
+        _ = hasVideoID
+        return hasPlayerBarImageURL
+    }
+
+    /// YouTube Music publishes square album covers. Chrome Now Playing first
+    /// sends a 120×120 site/app JPEG that is not cover art.
     static func isLikelyAlbumArtwork(pixelWidth: Int, pixelHeight: Int) -> Bool {
-        guard pixelWidth >= 120, pixelHeight >= 120 else { return false }
+        guard pixelWidth >= 150, pixelHeight >= 150 else { return false }
         let aspect = Double(pixelWidth) / Double(pixelHeight)
         return aspect >= 0.8 && aspect <= 1.25
     }
@@ -516,7 +571,8 @@ enum MediaArtworkPolicy {
     }
 
     /// Keep the last real mark/poster while YouTube's thumbnail downloads.
-    /// Do not keep a Chrome favicon or 150×83 MediaRemote preview.
+    /// Chrome's 120×120 JPEG is never stored as the previous token (it is
+    /// `pending:`), so a `remote:` JPEG here is already a shown album cover.
     /// Do not keep a watch poster after Now Playing moved to another item.
     static func shouldHoldArtworkWhilePosterLoads(
         previousToken: String,
@@ -527,10 +583,48 @@ enum MediaArtworkPolicy {
         guard policyToken.hasPrefix("pending:") else { return false }
         guard !previousToken.isEmpty else { return false }
         if previousToken.hasPrefix("pending:") { return false }
-        if previousToken.hasPrefix("remote:"), !isYouTubePosterToken(previousToken) {
+        return true
+    }
+
+    /// Stale youtube.com bindings still `videoIDsMatch` themselves after Now
+    /// Playing already moved to another track (e.g. YouTube Music). Drop the
+    /// held watch poster in that case; keep it only for same-track title
+    /// flicker (including generic "YouTube" MediaRemote titles).
+    static func shouldDropHeldYouTubeArtwork(
+        identityChanged: Bool,
+        sameYouTubeVideo: Bool,
+        previousTitle: String,
+        nextTitle: String
+    ) -> Bool {
+        guard identityChanged else { return false }
+        if !sameYouTubeVideo { return true }
+        if YouTubeTabPicker.titlesMatch(previousTitle, nextTitle) { return false }
+        if YouTubeTabPicker.isGenericYouTubeDocumentTitle(previousTitle)
+            || YouTubeTabPicker.isGenericYouTubeDocumentTitle(nextTitle) {
             return false
         }
         return true
+    }
+
+    /// Player-bar / MediaSession URLs are often 60px. Request a cover-sized file.
+    static func upgradedYouTubeMusicArtworkURL(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), let host = url.host?.lowercased() else {
+            return trimmed
+        }
+        if host.contains("yt3.ggpht.") || host.contains("yt3.googleusercontent.") {
+            return trimmed
+        }
+        guard host.contains("googleusercontent.com") || host.contains("ggpht.com") else {
+            return trimmed
+        }
+        var value = trimmed
+        if let range = value.range(of: #"=s\d+"#, options: .regularExpression) {
+            value.replaceSubrange(range, with: "=s544")
+        } else if let range = value.range(of: #"=w\d+-h\d+"#, options: .regularExpression) {
+            value.replaceSubrange(range, with: "=w544-h544")
+        }
+        return value
     }
 
     /// A youtube.com 16:9 preview is not YouTube Music cover art.
@@ -550,22 +644,32 @@ enum MediaArtworkPolicy {
         }
     }
 
-    /// Show MediaRemote art immediately when it is already a poster. Hold
-    /// square browser icons until YouTube's thumbnail (or tab URL) arrives.
+    /// Show MediaRemote art immediately when it is already a poster or a
+    /// square album cover. YouTube watch stays 16:9-only so a Music cover
+    /// cannot replace a video thumbnail. While a fresh browser source is
+    /// unbound, defer square art until the active tab identifies watch vs Music.
     static func shouldShowBrowserRemoteArtwork(
         platform: StreamingPlatform?,
         resemblesBrowserIcon: Bool,
         isLikelyVideoThumbnail: Bool,
         hasRemote: Bool,
         pixelWidth: Int = 0,
-        pixelHeight: Int = 0
+        pixelHeight: Int = 0,
+        sourceURL: String = ""
     ) -> Bool {
         guard hasRemote, !resemblesBrowserIcon else { return false }
-        if isLikelyVideoThumbnail { return true }
-        if platform == .youtubeMusic {
+        let resolvedPlatform = platform ?? StreamingPlatform.from(url: sourceURL)
+        if resolvedPlatform == .youtubeMusic {
             return isLikelyAlbumArtwork(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
         }
-        return false
+        if resolvedPlatform == .youtube {
+            return isLikelyVideoThumbnail
+        }
+        if resolvedPlatform == nil, sourceURL.isEmpty {
+            return isLikelyVideoThumbnail
+        }
+        if isLikelyVideoThumbnail { return true }
+        return isLikelyAlbumArtwork(pixelWidth: pixelWidth, pixelHeight: pixelHeight)
     }
 }
 
