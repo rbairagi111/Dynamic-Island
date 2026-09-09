@@ -1092,7 +1092,8 @@ final class NotchWindowController: NSWindowController {
             isScreenRecording: viewModel.isScreenRecording,
             showsIdleGlance: viewModel.showsIdleGlance,
             idleDestinationCount: viewModel.idleDestinations.count,
-            showsDualNowPlaying: viewModel.showsDualNowPlaying,
+            showsDualNowPlaying: (viewModel.isExpanded || viewModel.isOverlayActive)
+                && viewModel.hasDualLiveNowPlayingSessions,
             dualNowPlayingSwapsTiles: viewModel.dualNowPlayingSwapsTiles
         )
         switch action {

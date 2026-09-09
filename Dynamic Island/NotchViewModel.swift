@@ -692,7 +692,7 @@ final class NotchViewModel: ObservableObject {
     }
 
     /// Shared live-session gate for expanded dual tiles and compact stacked art.
-    private var hasDualLiveNowPlayingSessions: Bool {
+    var hasDualLiveNowPlayingSessions: Bool {
         DualNowPlayingSurfacePolicy.hasLiveDualSessions(
             featureEnabled: IslandFeatures.dualNowPlayingEnabled,
             hasMedia: hasMedia,

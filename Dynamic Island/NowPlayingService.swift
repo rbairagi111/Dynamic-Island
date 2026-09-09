@@ -128,6 +128,11 @@ final class NowPlayingService: ObservableObject {
     /// read a stale empty value and clear dual art.
     private var secondaryLatch: Snapshot = Snapshot()
     private var lastPrimaryDualPlayingRecheckAt: TimeInterval = 0
+    /// After promoting Watch over paused Music (or the reverse), ignore MediaRemote
+    /// updates for the paused opposite format so the island does not snap back to
+    /// Music metadata without art while Watch keeps playing.
+    private var ignoreOppositePausedUntil: TimeInterval = 0
+    private var ignoreOppositePausedIsMusic: Bool = false
 
     private static let mediaQueueKey = DispatchSpecificKey<UInt8>()
     private let mediaQueue: DispatchQueue = {
@@ -454,9 +459,17 @@ final class NowPlayingService: ObservableObject {
         // never promotes — dual can come back when both tabs play again.
         let promoteSecondary = wasPlaying
             && IslandFeatures.dualNowPlayingEnabled
-            && secondarySnapshot.hasMedia
-            && secondarySnapshot.isPlaying
-        let secondaryToPromote = promoteSecondary ? secondarySnapshot : nil
+            && (
+                (secondarySnapshot.hasMedia && secondarySnapshot.isPlaying)
+                    || (secondaryLatch.hasMedia && secondaryLatch.isPlaying)
+            )
+        let secondaryToPromote: Snapshot? = {
+            guard promoteSecondary else { return nil }
+            if secondarySnapshot.hasMedia, secondarySnapshot.isPlaying {
+                return secondarySnapshot
+            }
+            return secondaryLatch
+        }()
         mediaQueue.async { [weak self] in
             if let secondaryToPromote, secondaryToPromote.hasMedia {
                 self?.promoteSecondaryAfterPrimaryPause(secondaryToPromote)
@@ -905,6 +918,39 @@ final class NowPlayingService: ObservableObject {
         return YouTubeTabPicker.titlesMatch(title, lastBoundWatchTitle)
     }
 
+    /// After dual collapse promotes Watch over paused Music (or the reverse),
+    /// MediaRemote keeps advertising the paused session and would put its
+    /// title/artist back on the island without artwork.
+    private func shouldIgnoreOppositePausedAfterDualPromote(
+        title: String,
+        artist: String,
+        bundleID: String,
+        appName: String,
+        remotePlaying: Bool
+    ) -> Bool {
+        guard IslandFeatures.dualNowPlayingEnabled else { return false }
+        guard Date().timeIntervalSince1970 < ignoreOppositePausedUntil else { return false }
+        guard !remotePlaying else {
+            // A real play of the opposite format ends the suppress window.
+            ignoreOppositePausedUntil = 0
+            return false
+        }
+        guard isBrowserBundle(bundleID) else { return false }
+        let hint = StreamingPlatform.titleHint(
+            bundleID: bundleID,
+            appName: appName,
+            artist: artist,
+            title: title
+        )
+        let incomingMusic = hint == .youtubeMusic
+            || title.localizedCaseInsensitiveContains("youtube music")
+        let incomingWatch = hint == .youtube && !incomingMusic
+        if ignoreOppositePausedIsMusic {
+            return incomingMusic
+        }
+        return incomingWatch
+    }
+
     /// MediaRemote only reports one session. When primary flips Watch↔Music,
     /// immediately park the outgoing snapshot as secondary so compact dual art
     /// appears in the same tick — do not wait for the AppleScript secondary probe.
@@ -1036,22 +1082,13 @@ final class NowPlayingService: ObservableObject {
         secondaryHoldUntil = Date().timeIntervalSince1970
             + DualNowPlayingSurfacePolicy.secondaryHoldDuration()
         secondaryLatch = demoted
-        // Publish immediately — demote only runs when incoming is the opposite
-        // YouTube format, so Watch+Watch / Music+Music cannot land here.
-        // Waiting for published primary URL to flip was the multi-second gap
-        // before compact dual art (debug-6ca0b4: latch then secHas false).
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            if !self.secondarySnapshot.hasMedia
-                || self.secondarySnapshot.sourceURL != demoted.sourceURL
-                || self.secondarySnapshot.sourceTab?.tabID != demoted.sourceTab?.tabID {
-                self.secondarySnapshot = demoted
-            }
-        }
+        // Latch only — publishing Watch secondary while primary UI is still Watch
+        // paints Watch+Watch (placeholder/video stack), then Music replaces the
+        // front tile. Flush Watch secondary in the same main tick as Music primary.
         // #region agent log
         DebugLog.write(
             "NowPlayingService.demote",
-            "secondary published on demote",
+            "secondary latched pending opposite primary",
             [
                 "secPlat": outgoingPlatform?.rawValue ?? "nil",
                 "secArtNil": demoted.artwork == nil,
@@ -1170,6 +1207,15 @@ final class NowPlayingService: ObservableObject {
         if shouldIgnoreStaleYouTubeWatchNowPlaying(title: title, bundleID: bundleID) {
             return
         }
+        if shouldIgnoreOppositePausedAfterDualPromote(
+            title: title,
+            artist: artist,
+            bundleID: bundleID,
+            appName: appName,
+            remotePlaying: remotePlaying
+        ) {
+            return
+        }
 
         let artKey = payload.artworkDataBase64.map { String($0.prefix(64)) + "|\($0.count)" } ?? ""
         var artwork = lastArtwork
@@ -1235,13 +1281,14 @@ final class NowPlayingService: ObservableObject {
         lastElapsedWallTime = Date().timeIntervalSince1970
 
         // MediaRemote often drops Music to paused while Watch secondary is still
-        // live. Do NOT auto-promote here — a false pause would wipe dual while
-        // both tabs still play. User island pause promotes in togglePlayPause;
-        // the secondary probe HTML-confirms a real stop before promoting.
+        // live. Reassert false pauses; if primary really stopped, promote the
+        // still-playing opposite secondary so the island never sits on paused
+        // Music metadata while Watch keeps playing.
         if IslandFeatures.dualNowPlayingEnabled,
            !isPlaying,
            primaryWasPlaying {
             reassertPrimaryPlayingForDualIfNeeded()
+            schedulePromoteSecondaryIfPrimaryHTMLStopped()
         }
 
         let identity = "\(bundleID)|\(title)|\(artist)"
@@ -1480,6 +1527,7 @@ final class NowPlayingService: ObservableObject {
                 ?? (snapshot.bundleIdentifier == bundleID ? snapshot.sourceTab : nil),
             artworkToken: prepared.token
         )
+        let latchForMain = secondaryLatch
         DispatchQueue.main.async {
             var merged = next
             if merged.sourceTab == nil,
@@ -1508,7 +1556,7 @@ final class NowPlayingService: ObservableObject {
             }
             // #region agent log
             let sec = self.secondarySnapshot
-            let latch = self.secondaryLatch
+            let latch = latchForMain
             let primaryIsMusic = merged.sourceURL.contains("music.youtube.com")
             let primaryIsWatch = !primaryIsMusic
                 && (merged.sourceURL.contains("youtube.com/watch")
@@ -1539,25 +1587,77 @@ final class NowPlayingService: ObservableObject {
                 runId: "post-fix"
             )
             // #endregion
+            // Pausing Music while Watch secondary is live must not leave Music
+            // title/artist on the island (often without art). Promote owns UI.
+            let hint = StreamingPlatform.titleHint(
+                bundleID: merged.bundleIdentifier,
+                appName: merged.appName,
+                artist: merged.artist,
+                title: merged.title
+            )
+            if !merged.isPlaying,
+               latch.hasMedia,
+               latch.isPlaying,
+               DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+                primaryURL: merged.sourceURL,
+                primaryTitleHintIsMusic: hint == .youtubeMusic,
+                primaryTitleHintIsWatch: hint == .youtube,
+                secondaryIsYouTubeWatch: latchPlat == .youtube,
+                secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
+               ) {
+                return
+            }
             self.snapshot = merged
-            self.flushSecondaryLatchOntoMainIfNeeded(primaryURL: merged.sourceURL)
+            if DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+                primaryURL: merged.sourceURL,
+                primaryTitleHintIsMusic: hint == .youtubeMusic,
+                primaryTitleHintIsWatch: hint == .youtube,
+                secondaryIsYouTubeWatch: latchPlat == .youtube,
+                secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
+            ), latch.hasMedia, latch.isPlaying {
+                if !self.secondarySnapshot.hasMedia
+                    || self.secondarySnapshot.sourceURL != latch.sourceURL {
+                    self.secondarySnapshot = latch
+                }
+            } else {
+                self.flushSecondaryLatchOntoMainIfNeeded(
+                    primaryURL: merged.sourceURL,
+                    primaryTitle: merged.title,
+                    primaryArtist: merged.artist,
+                    primaryAppName: merged.appName,
+                    primaryBundleID: merged.bundleIdentifier
+                )
+            }
         }
     }
 
-    /// Main-queue: publish a latched opposite secondary once primary URL is the
-    /// other YouTube format (avoids Watch+Watch flash, then dual after Music binds).
-    private func flushSecondaryLatchOntoMainIfNeeded(primaryURL: String) {
+    /// Main-queue: publish a latched opposite secondary once primary is the
+    /// other YouTube format (URL or title hint). Same tick as Music primary
+    /// bind so compact dual never flashes Watch+Watch then Music-only.
+    private func flushSecondaryLatchOntoMainIfNeeded(
+        primaryURL: String,
+        primaryTitle: String = "",
+        primaryArtist: String = "",
+        primaryAppName: String = "",
+        primaryBundleID: String = ""
+    ) {
         let latch = secondaryLatch
         guard latch.hasMedia, latch.isPlaying else { return }
-        let primaryIsMusic = primaryURL.contains("music.youtube.com")
-        let primaryIsWatch = !primaryIsMusic
-            && (primaryURL.contains("youtube.com/watch")
-                || primaryURL.contains("youtu.be/")
-                || StreamingPlatform.from(url: primaryURL) == .youtube)
+        let title = primaryTitle.isEmpty ? activeTitle : primaryTitle
+        let artist = primaryArtist.isEmpty ? activeArtist : primaryArtist
+        let appName = primaryAppName.isEmpty ? activeAppName : primaryAppName
+        let bundleID = primaryBundleID.isEmpty ? activeBundleID : primaryBundleID
+        let hint = StreamingPlatform.titleHint(
+            bundleID: bundleID,
+            appName: appName,
+            artist: artist,
+            title: title
+        )
         let latchPlat = StreamingPlatform.from(url: latch.sourceURL)
-        guard DualNowPlayingSurfacePolicy.shouldPublishOppositeSecondaryToUI(
-            primaryIsYouTubeWatch: primaryIsWatch,
-            primaryIsYouTubeMusic: primaryIsMusic,
+        guard DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+            primaryURL: primaryURL,
+            primaryTitleHintIsMusic: hint == .youtubeMusic,
+            primaryTitleHintIsWatch: hint == .youtube,
             secondaryIsYouTubeWatch: latchPlat == .youtube,
             secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
         ) else { return }
@@ -1567,9 +1667,10 @@ final class NowPlayingService: ObservableObject {
                 "NowPlayingService.flushSecondaryLatch",
                 "flushed latch on primary bind",
                 [
-                    "primaryMusic": primaryIsMusic,
+                    "primaryMusic": primaryURL.contains("music.youtube") || hint == .youtubeMusic,
                     "latchWatch": latchPlat == .youtube,
-                    "secHad": secondarySnapshot.hasMedia
+                    "secHad": secondarySnapshot.hasMedia,
+                    "hint": hint?.rawValue ?? "nil"
                 ],
                 hypothesisId: "H",
                 runId: "post-fix"
@@ -3058,9 +3159,38 @@ final class NowPlayingService: ObservableObject {
             // Never replace a demoted opposite latch with a same-format probe.
             guard publishOpposite else { return }
             secondaryLatch = next
-            // Publish as soon as formats are opposite. Do not wait for the
-            // main-queue primary URL to flip — that race left compact dual off
-            // for seconds after seed/demote.
+            // Only paint secondary once primary UI is the opposite format
+            // (bound URL or Music/Watch title hint). Publishing earlier causes
+            // Watch+Watch placeholder stacks, then Music replacing the front tile.
+            let publishedURL = snapshot.sourceURL
+            let publishedHint = StreamingPlatform.titleHint(
+                bundleID: snapshot.bundleIdentifier.isEmpty ? activeBundleID : snapshot.bundleIdentifier,
+                appName: snapshot.appName.isEmpty ? activeAppName : snapshot.appName,
+                artist: snapshot.artist.isEmpty ? activeArtist : snapshot.artist,
+                title: snapshot.title.isEmpty ? activeTitle : snapshot.title
+            )
+            let uiReady = DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+                primaryURL: publishedURL.isEmpty ? primaryURL : publishedURL,
+                primaryTitleHintIsMusic: publishedHint == .youtubeMusic || primaryIsMusic,
+                primaryTitleHintIsWatch: publishedHint == .youtube || primaryIsWatch,
+                secondaryIsYouTubeWatch: platform == .youtube,
+                secondaryIsYouTubeMusic: platform == .youtubeMusic
+            )
+            // #region agent log
+            DebugLog.write(
+                "NowPlayingService.applySecondaryDetails",
+                uiReady ? "publish opposite to main" : "latch only waiting primary UI",
+                [
+                    "publishedMusic": publishedURL.contains("music.youtube") || publishedHint == .youtubeMusic,
+                    "publishedWatch": publishedHint == .youtube,
+                    "secWatch": platform == .youtube,
+                    "dualPrimary": dualPrimaryURL != nil
+                ],
+                hypothesisId: "H",
+                runId: "post-fix"
+            )
+            // #endregion
+            guard uiReady else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.secondarySnapshot = next
             }
@@ -3503,10 +3633,8 @@ final class NowPlayingService: ObservableObject {
                     self.publishOptimisticPlaying(true)
                     return
                 }
-                // Unknown HTML — keep secondary through hold; don't clear dual.
-                if Date().timeIntervalSince1970 < self.secondaryHoldUntil {
-                    return
-                }
+                // HTML nil + MR paused: policy already allows promote above.
+                // If we did not promote (no opposite secondary), clear empty secondary.
                 self.publishEmptySecondaryIfNeeded()
             }
         }
@@ -3573,6 +3701,14 @@ final class NowPlayingService: ObservableObject {
         secondaryScanGeneration += 1
         secondaryTransportGraceUntil = Date().timeIntervalSince1970 + 2.5
         lastSecondaryScanAt = Date().timeIntervalSince1970
+        // Suppress MediaRemote's paused opposite session (usually Music) so the
+        // island keeps the promoted Watch title/art instead of Music-without-thumbnail.
+        let promotedIsWatch = StreamingPlatform.from(url: secondary.sourceURL) == .youtube
+            || (!secondary.sourceURL.contains("music.youtube.com")
+                && (secondary.sourceURL.contains("youtube.com/watch")
+                    || secondary.sourceURL.contains("youtu.be/")))
+        ignoreOppositePausedIsMusic = promotedIsWatch
+        ignoreOppositePausedUntil = Date().timeIntervalSince1970 + 8.0
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             var next = secondary
@@ -4028,7 +4164,17 @@ final class NowPlayingService: ObservableObject {
         bundleID: String? = nil
     ) -> YouTubeJSResult {
         let resolvedBundle = bundleID ?? activeBundleID
-        let candidate = tab ?? lastMediaSourceTab ?? snapshot.sourceTab
+        var candidate = tab ?? lastMediaSourceTab ?? snapshot.sourceTab
+        let fallbackURL = snapshot.sourceURL.isEmpty ? lastMediaSourceURL : snapshot.sourceURL
+        if candidate == nil, !fallbackURL.isEmpty, isBrowserBundle(resolvedBundle) {
+            let tabs = BrowserMediaNavigator.listTabs(bundleID: resolvedBundle)
+            candidate = tabs.first(where: { YouTubeTabPicker.urlsMatch($0.url, fallbackURL) })
+                ?? tabs.first(where: {
+                    let plat = StreamingPlatform.from(url: $0.url)
+                    let wantMusic = fallbackURL.contains("music.youtube.com")
+                    return wantMusic ? plat == .youtubeMusic : plat == .youtube
+                })
+        }
         if let candidate {
             let result = executeYouTubeJavaScript(
                 musicJS: musicJS,
@@ -4040,7 +4186,8 @@ final class NowPlayingService: ObservableObject {
                 return result
             }
             let tabs = BrowserMediaNavigator.listTabs(bundleID: resolvedBundle)
-            if let live = BrowserMediaNavigator.resolveLiveTab(candidate, from: tabs) {
+            if let live = BrowserMediaNavigator.resolveLiveTab(candidate, from: tabs)
+                ?? tabs.first(where: { YouTubeTabPicker.urlsMatch($0.url, fallbackURL) }) {
                 let retried = executeYouTubeJavaScript(
                     musicJS: musicJS,
                     watchJS: watchJS,
@@ -4052,7 +4199,7 @@ final class NowPlayingService: ObservableObject {
                 }
             }
         }
-        NSLog("[NowPlaying] YouTube JS missed cached tab")
+        NSLog("[NowPlaying] YouTube JS missed cached tab url=%@", fallbackURL)
         return .failed
     }
 

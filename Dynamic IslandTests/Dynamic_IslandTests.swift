@@ -5168,8 +5168,10 @@ struct Dynamic_IslandTests {
                 htmlSaysPrimaryPlaying: true
             )
         )
+        // nil HTML must still promote — otherwise paused Music stays on the
+        // island while Watch keeps playing in the background.
         #expect(
-            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+            DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
                 mediaRemoteSaysPrimaryPlaying: false,
                 htmlSaysPrimaryPlaying: nil
             )
@@ -5178,6 +5180,24 @@ struct Dynamic_IslandTests {
             !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
                 mediaRemoteSaysPrimaryPlaying: true,
                 htmlSaysPrimaryPlaying: false
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+                primaryURL: "",
+                primaryTitleHintIsMusic: true,
+                primaryTitleHintIsWatch: false,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+                primaryURL: "https://www.youtube.com/watch?v=abc",
+                primaryTitleHintIsMusic: false,
+                primaryTitleHintIsWatch: true,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false
             )
         )
     }

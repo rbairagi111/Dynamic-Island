@@ -144,15 +144,40 @@ enum DualNowPlayingSurfacePolicy {
     }
 
     /// MediaRemote often blips primary to paused while both tabs still play.
-    /// Only promote secondary after HTML confirms primary actually stopped
-    /// (or the user paused from the island). A nil HTML result means "unknown"
-    /// — do not promote on unknown.
+    /// Promote the still-playing opposite secondary unless HTML positively says
+    /// primary is still playing (false MediaRemote pause). `nil` HTML must not
+    /// leave a paused Music tile on screen while Watch keeps playing.
     static func shouldPromoteSecondaryAfterPrimaryPause(
         mediaRemoteSaysPrimaryPlaying: Bool,
         htmlSaysPrimaryPlaying: Bool?
     ) -> Bool {
         guard !mediaRemoteSaysPrimaryPlaying else { return false }
-        guard let htmlSaysPrimaryPlaying else { return false }
-        return !htmlSaysPrimaryPlaying
+        if htmlSaysPrimaryPlaying == true { return false }
+        return true
+    }
+
+    /// True when a latched/demoted secondary may be shown with this primary
+    /// without painting Watch+Watch or Music+Music. Accepts URL or title-hint
+    /// Music so dual can land in the same main-queue tick as the Music bind.
+    static func primaryAllowsOppositeSecondaryPublish(
+        primaryURL: String,
+        primaryTitleHintIsMusic: Bool,
+        primaryTitleHintIsWatch: Bool,
+        secondaryIsYouTubeWatch: Bool,
+        secondaryIsYouTubeMusic: Bool
+    ) -> Bool {
+        let urlMusic = primaryURL.contains("music.youtube.com")
+        let urlWatch = !urlMusic
+            && (primaryURL.contains("youtube.com/watch")
+                || primaryURL.contains("youtu.be/")
+                || primaryURL.contains("youtube.com/shorts"))
+        let primaryMusic = urlMusic || primaryTitleHintIsMusic
+        let primaryWatch = !primaryMusic && (urlWatch || primaryTitleHintIsWatch)
+        return shouldPublishOppositeSecondaryToUI(
+            primaryIsYouTubeWatch: primaryWatch,
+            primaryIsYouTubeMusic: primaryMusic,
+            secondaryIsYouTubeWatch: secondaryIsYouTubeWatch,
+            secondaryIsYouTubeMusic: secondaryIsYouTubeMusic
+        )
     }
 }
