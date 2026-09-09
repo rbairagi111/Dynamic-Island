@@ -13,6 +13,7 @@ final class AppSettings: ObservableObject {
         static let shelfEnabled = "shelfEnabled"
         static let shelfAutoExpireEnabled = "shelfAutoExpireEnabled"
         static let shelfAutoExpireMinutes = "shelfAutoExpireMinutes"
+        static let idleGlanceEnabled = "idleGlanceEnabled"
     }
 
     @Published var automationDenied: Bool {
@@ -45,6 +46,11 @@ final class AppSettings: ObservableObject {
     /// Minutes before unused shelf items are removed (files are never deleted).
     @Published var shelfAutoExpireMinutes: Int {
         didSet { UserDefaults.standard.set(shelfAutoExpireMinutes, forKey: Keys.shelfAutoExpireMinutes) }
+    }
+
+    /// Compact idle glance: weather/AQI + ranked YouTube / AI destinations.
+    @Published var idleGlanceEnabled: Bool {
+        didSet { UserDefaults.standard.set(idleGlanceEnabled, forKey: Keys.idleGlanceEnabled) }
     }
 
     var shelfAutoExpireInterval: TimeInterval {
@@ -90,6 +96,11 @@ final class AppSettings: ObservableObject {
         shelfAutoExpireEnabled = UserDefaults.standard.bool(forKey: Keys.shelfAutoExpireEnabled)
         let storedExpire = UserDefaults.standard.integer(forKey: Keys.shelfAutoExpireMinutes)
         shelfAutoExpireMinutes = storedExpire > 0 ? storedExpire : 60
+        if UserDefaults.standard.object(forKey: Keys.idleGlanceEnabled) == nil {
+            idleGlanceEnabled = true
+        } else {
+            idleGlanceEnabled = UserDefaults.standard.bool(forKey: Keys.idleGlanceEnabled)
+        }
     }
 
     func markAutomationGranted() {

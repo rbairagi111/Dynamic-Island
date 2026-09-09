@@ -115,6 +115,15 @@ struct NotchView: View {
                         isSelectingRecord: model.isSelectingScreenToRecord
                     )
                     .frame(width: shapeWidth, height: shapeHeight)
+                } else if model.showsIdleGlance {
+                    IdleGlanceContent(
+                        isExpanded: model.isExpanded,
+                        notchWidth: model.notchWidth,
+                        notchHeight: model.notchHeight,
+                        weather: model.idleWeather,
+                        destinations: model.idleDestinations
+                    )
+                    .frame(width: shapeWidth, height: shapeHeight)
                 } else {
                     nowPlayingContent
                 }
@@ -175,6 +184,8 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.isScreenRecording)
         .animation(IslandMetrics.motion, value: model.isSelectingScreenToRecord)
         .animation(IslandMetrics.motion, value: model.persistentState)
+        .animation(IslandMetrics.motion, value: model.showsShelfRow)
+        .animation(IslandMetrics.motion, value: model.shelfItems.count)
         .notchFTUEGlow(
             isActive: model.isFTUEGlowActive,
             bottomLeadingRadius: bottomRadius,
@@ -407,26 +418,7 @@ struct NotchView: View {
                     .frame(maxHeight: .infinity)
 
                 Rectangle()
-                    .fill(
-                        LinearGradient(
-                            stops: [
-                                .init(color: .black, location: 0.0),
-                                .init(
-                                    color: Color(
-                                        .sRGB,
-                                        red: 0.8,
-                                        green: 0.8,
-                                        blue: 0.8,
-                                        opacity: 1
-                                    ),
-                                    location: 0.5
-                                ),
-                                .init(color: .black, location: 1.0)
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
+                    .fill(IslandGradientDivider.gradient)
                     .frame(width: dividerWidth)
                     .frame(maxHeight: .infinity)
 

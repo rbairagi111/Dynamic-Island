@@ -18,6 +18,8 @@ enum IslandClickPolicy {
         case seek
         /// Compact recording pill — expand so Stop is reachable.
         case expandRecording
+        /// Behavior-ranked idle destination icon.
+        case openIdleDestination(Int)
     }
 
     /// Bottom band reserved for play/pause, scrubbing, and the file shelf.
@@ -40,7 +42,9 @@ enum IslandClickPolicy {
         hasMedia: Bool,
         persistentIsMusic: Bool,
         showsShelf: Bool = false,
-        isScreenRecording: Bool = false
+        isScreenRecording: Bool = false,
+        showsIdleGlance: Bool = false,
+        idleDestinationCount: Int = 0
     ) -> Action {
         let bounds = CGRect(origin: .zero, size: islandSize)
         guard bounds.width > 1, bounds.height > 1, bounds.contains(pointFromTopLeft) else {
@@ -121,6 +125,21 @@ enum IslandClickPolicy {
             return .passthrough
         }
 
+        if showsIdleGlance, !hasMedia, idleDestinationCount > 0 {
+            // Shelf hang is below the standard expanded shell — leave it to AppKit.
+            if showsShelf, isExpanded, pointFromTopLeft.y >= IslandMetrics.expandedHeight {
+                return .passthrough
+            }
+            return idleGlanceAction(
+                point: pointFromTopLeft,
+                islandSize: islandSize,
+                notchHeight: notchHeight,
+                destinationCount: idleDestinationCount,
+                isExpanded: isExpanded,
+                showsShelf: showsShelf
+            )
+        }
+
         return musicAction(
             point: pointFromTopLeft,
             islandSize: islandSize,
@@ -130,6 +149,101 @@ enum IslandClickPolicy {
             showsShelf: showsShelf,
             bandLeft: 0,
             bandWidth: islandSize.width
+        )
+    }
+
+    /// Right side hosts destination icons; left (weather) is non-interactive.
+    static func idleGlanceAction(
+        point: CGPoint,
+        islandSize: CGSize,
+        notchHeight: CGFloat,
+        destinationCount: Int,
+        isExpanded: Bool,
+        showsShelf: Bool = false
+    ) -> Action {
+        guard destinationCount > 0 else { return .passthrough }
+        if isExpanded {
+            return expandedIdleGlanceAction(
+                point: point,
+                islandSize: islandSize,
+                notchHeight: notchHeight,
+                destinationCount: destinationCount,
+                showsShelf: showsShelf
+            )
+        }
+        let stripLeft = islandSize.width - IslandMetrics.idleGlanceCompactRightEar
+        guard point.x >= stripLeft else { return .passthrough }
+        let stripWidth = max(IslandMetrics.idleGlanceCompactRightEar - 8, 1)
+        let visible = min(destinationCount, 2)
+        let slot = stripWidth / CGFloat(visible)
+        let index = Int((point.x - stripLeft) / slot)
+        let clamped = min(max(index, 0), visible - 1)
+        return .openIdleDestination(clamped)
+    }
+
+    /// 1pt divider + `.padding(.horizontal, 10)` on each side in `IdleGlanceContent`.
+    static let idleGlanceExpandedDividerReserve: CGFloat = 21
+
+    /// Equal left/right columns inside the expanded shell (after outer padding).
+    static func idleGlanceExpandedColumnWidth(islandWidth: CGFloat) -> CGFloat {
+        let content = islandWidth - IslandMetrics.expandedHorizontalPadding * 2
+        return max((content - idleGlanceExpandedDividerReserve) / 2, 1)
+    }
+
+    /// Leading edge of the shortcut column — mirrors the flexible right half.
+    static func idleGlanceExpandedGridLeadingX(islandWidth: CGFloat) -> CGFloat {
+        IslandMetrics.expandedHorizontalPadding
+            + idleGlanceExpandedColumnWidth(islandWidth: islandWidth)
+            + idleGlanceExpandedDividerReserve
+    }
+
+    /// Matches `IdleGlanceContent` expanded grid on the trailing half.
+    static func expandedIdleGlanceAction(
+        point: CGPoint,
+        islandSize: CGSize,
+        notchHeight: CGFloat,
+        destinationCount: Int,
+        showsShelf: Bool = false
+    ) -> Action {
+        let gridWidth = idleGlanceExpandedColumnWidth(islandWidth: islandSize.width)
+        let stripLeft = idleGlanceExpandedGridLeadingX(islandWidth: islandSize.width)
+        let stripTop = IslandMetrics.expandedContentTopInset(notchHeight: notchHeight)
+        // When the file tray hangs below, destination hits stay in the 178pt shell.
+        let stripBottom = showsShelf
+            ? IslandMetrics.expandedHeight
+            : islandSize.height - IslandMetrics.expandedVerticalPadding
+        guard point.x >= stripLeft,
+              point.y >= stripTop,
+              point.y <= stripBottom
+        else {
+            return .passthrough
+        }
+        let visible = min(max(destinationCount, 1), 4)
+        let columns = 2
+        let rows = (visible + columns - 1) / columns
+        let relX = point.x - stripLeft
+        let relY = point.y - stripTop
+        let cellWidth = gridWidth / CGFloat(columns)
+        let cellHeight = max(stripBottom - stripTop, 1) / CGFloat(rows)
+        let col = min(max(Int(relX / cellWidth), 0), columns - 1)
+        let row = min(max(Int(relY / cellHeight), 0), rows - 1)
+        let index = row * columns + col
+        guard index < visible else { return .passthrough }
+        return .openIdleDestination(index)
+    }
+
+    /// Back-compat for tests that only pass width.
+    static func idleGlanceAction(
+        point: CGPoint,
+        islandWidth: CGFloat,
+        destinationCount: Int
+    ) -> Action {
+        idleGlanceAction(
+            point: point,
+            islandSize: CGSize(width: islandWidth, height: 33),
+            notchHeight: 32,
+            destinationCount: destinationCount,
+            isExpanded: false
         )
     }
 
