@@ -42,6 +42,14 @@ enum IslandMetrics {
         max(notchWidth, 1) + idleGlanceCompactLeftEar + idleGlanceCompactRightEar
     }
     static let compactArt: CGFloat = 16.94
+    /// Dual compact stack uses a larger tile than single-source art so the
+    /// second thumbnail is obvious in the notch ears (~34px @2x).
+    static let compactDualArtSize: CGFloat = 20
+    /// Horizontal fan of the back tile — the primary cue that two sources play.
+    static let compactDualArtOverlapX: CGFloat = 9
+    static let compactDualArtOverlapY: CGFloat = 4
+    /// Extra compact width so the fan does not crowd the camera band.
+    static let compactDualWidthBoost: CGFloat = 18
     static let compactBottomRadius: CGFloat = 12
 
     static let motion = Animation.spring(response: 0.4, dampingFraction: 0.75)
@@ -209,6 +217,20 @@ final class NotchViewModel: ObservableObject {
     /// Keep the last track while locked — MediaRemote goes silent.
     @Published var holdLastMedia = false
 
+    // MARK: Secondary Now Playing (dual-tile) — additive; never replaces primary.
+    @Published private(set) var secondaryHasMedia = false
+    @Published private(set) var secondaryIsPlaying = false
+    @Published private(set) var secondarySongTitle = ""
+    @Published private(set) var secondaryArtistName = ""
+    @Published private(set) var secondaryCurrentTime: TimeInterval = 0
+    @Published private(set) var secondaryDuration: TimeInterval = 0
+    @Published private(set) var secondaryArtwork: NSImage? = nil
+    @Published private(set) var secondaryMediaPlatform: StreamingPlatform? = nil
+    @Published private(set) var secondaryUsesPlatformLogo = false
+    @Published private(set) var secondaryWaveformGradient: ArtworkTint.Gradient = .fallback
+    let secondaryWaveform = SimulatedWaveform()
+    private var lastSecondaryTintedArtwork: ObjectIdentifier?
+
     /// While the user drags the timeline, freeze live updates and show this time.
     @Published var isScrubbing = false
     @Published var scrubTime: TimeInterval = 0
@@ -341,11 +363,18 @@ final class NotchViewModel: ObservableObject {
         if isScreenRecording && isExpanded {
             return IslandMetrics.batteryBannerWidth
         }
+        if showsDualNowPlaying {
+            return IslandMetrics.dualWidthFixed
+        }
         if isExpanded {
             return IslandMetrics.expandedWidth(notchWidth: notchWidth)
         }
         if showsCompactIdleGlance {
             return IslandMetrics.idleGlanceCompactWidth(notchWidth: notchWidth)
+        }
+        if showsCompactDualNowPlaying {
+            return IslandMetrics.compactWidth(notchWidth: notchWidth)
+                + IslandMetrics.compactDualWidthBoost
         }
         return IslandMetrics.compactWidth(notchWidth: notchWidth)
     }
@@ -364,6 +393,9 @@ final class NotchViewModel: ObservableObject {
         }
         if isScreenRecording && isExpanded {
             return IslandMetrics.recordingBannerHeight(notchHeight: notchHeight)
+        }
+        if showsDualNowPlaying {
+            return IslandMetrics.dualHeight(notchHeight: notchHeight)
         }
         if isExpanded {
             if showsShelfRow {
@@ -659,7 +691,145 @@ final class NotchViewModel: ObservableObject {
         }
     }
 
+    /// Shared live-session gate for expanded dual tiles and compact stacked art.
+    private var hasDualLiveNowPlayingSessions: Bool {
+        DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+            featureEnabled: IslandFeatures.dualNowPlayingEnabled,
+            hasMedia: hasMedia,
+            isPlaying: isPlaying,
+            secondaryHasMedia: secondaryHasMedia,
+            secondaryIsPlaying: secondaryIsPlaying,
+            overlayActive: transientOverlay != nil,
+            isScreenRecording: isScreenRecording,
+            isSelectingScreenToRecord: isSelectingScreenToRecord
+        )
+    }
+
+    /// True only when *both* tiles are actively playing. Pausing either side
+    /// collapses back to the single-tile player of the session that is still live.
+    var showsDualNowPlaying: Bool {
+        DualNowPlayingSurfacePolicy.showsExpandedSplit(
+            hasLiveDualSessions: hasDualLiveNowPlayingSessions,
+            isExpanded: isExpanded
+        )
+    }
+
+    /// Compact (collapsed) island: both sessions live → stacked overlapping art.
+    var showsCompactDualNowPlaying: Bool {
+        DualNowPlayingSurfacePolicy.showsCompactStackedArt(
+            hasLiveDualSessions: hasDualLiveNowPlayingSessions,
+            isExpanded: isExpanded
+        )
+    }
+
+    /// MediaRemote often keeps YT Music as primary while a YouTube watch tab is
+    /// secondary. Product layout is Watch left / Music right — swap tiles (and
+    /// click routing) when that happens so pause-on-left stops the video.
+    /// Same swap decides which thumbnail sits in front of the compact stack.
+    var dualNowPlayingSwapsTiles: Bool {
+        DualNowPlayingSurfacePolicy.swapsTiles(
+            hasLiveDualSessions: hasDualLiveNowPlayingSessions,
+            primaryIsYouTubeMusic: mediaPlatform == .youtubeMusic,
+            secondaryIsYouTubeWatch: secondaryMediaPlatform == .youtube
+        )
+    }
+
+    // MARK: Secondary controls — routed to the second browser tab only.
+    func toggleSecondaryPlayPause() { nowPlaying.secondaryTogglePlayPause() }
+    func skipSecondaryBackward()    { nowPlaying.secondarySkipBackward() }
+    func skipSecondaryForward()     { nowPlaying.secondarySkipForward() }
+    func openSecondaryNowPlayingSource() {
+        guard secondaryHasMedia else { return }
+        suppressHoverExpand = true
+        collapse()
+        nowPlaying.secondaryRevealSource()
+    }
+
+    private func applySecondarySnapshot(_ snap: NowPlayingService.Snapshot) {
+        let live = snap.hasMedia || snap.isPlaying
+        secondaryHasMedia = live
+        secondaryIsPlaying = live && snap.isPlaying
+        secondaryWaveform.setPlaying(secondaryIsPlaying)
+        guard live else {
+            secondarySongTitle = ""
+            secondaryArtistName = ""
+            secondaryCurrentTime = 0
+            secondaryDuration = 0
+            secondaryArtwork = nil
+            secondaryMediaPlatform = nil
+            secondaryUsesPlatformLogo = false
+            secondaryWaveformGradient = .fallback
+            lastSecondaryTintedArtwork = nil
+            return
+        }
+        let platform = StreamingPlatform.resolve(
+            bundleID: snap.bundleIdentifier,
+            appName: snap.appName,
+            artist: snap.artist,
+            title: snap.title,
+            url: snap.sourceURL
+        )
+        let displayTitle = StreamingPlatform.displayTitle(
+            mediaTitle: snap.title,
+            pageTitle: snap.sourcePageTitle,
+            metadataTitle: snap.album,
+            platform: platform
+        )
+        secondarySongTitle = displayTitle.isEmpty ? "Now Playing" : displayTitle
+        secondaryArtistName = snap.artist.isEmpty ? "—" : snap.artist
+        secondaryCurrentTime = snap.elapsed
+        secondaryDuration = snap.duration
+        secondaryArtwork = snap.artwork
+        secondaryMediaPlatform = platform
+        secondaryUsesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
+        // #region agent log
+        DebugLog.write(
+            "NotchViewModel.applySecondarySnapshot",
+            "secondary UI applied",
+            [
+                "plat": platform?.rawValue ?? "nil",
+                "artNil": snap.artwork == nil,
+                "token": snap.artworkToken,
+                "playing": secondaryIsPlaying,
+                "primaryPlat": mediaPlatform?.rawValue ?? "nil",
+                "primaryArtNil": artwork == nil,
+                "compactDual": showsCompactDualNowPlaying,
+                "swap": dualNowPlayingSwapsTiles,
+                "frontIsSecondary": dualNowPlayingSwapsTiles
+            ],
+            hypothesisId: "B,C,D",
+            runId: "post-fix"
+        )
+        // #endregion
+        refreshSecondaryTint(from: snap.artwork)
+    }
+
+    private func refreshSecondaryTint(from image: NSImage?) {
+        guard let image else {
+            lastSecondaryTintedArtwork = nil
+            secondaryWaveformGradient = .fallback
+            return
+        }
+        let identity = ObjectIdentifier(image)
+        if identity == lastSecondaryTintedArtwork { return }
+        lastSecondaryTintedArtwork = identity
+        artworkTintQueue.async { [weak self] in
+            let gradient = ArtworkTint.waveformGradient(from: image)
+            DispatchQueue.main.async {
+                guard let self, self.secondaryArtwork === image else { return }
+                self.secondaryWaveformGradient = gradient
+            }
+        }
+    }
+
     private func bindNowPlaying() {
+        nowPlaying.$secondarySnapshot
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] snap in
+                self?.applySecondarySnapshot(snap)
+            }
+            .store(in: &cancellables)
+
         nowPlaying.$snapshot
             .receive(on: DispatchQueue.main)
             .sink { [weak self] snap in
@@ -776,6 +946,25 @@ final class NotchViewModel: ObservableObject {
         }
         mediaPlatform = platform
         usesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
+        // #region agent log
+        DebugLog.write(
+            "NotchViewModel.applySnapshot",
+            "primary UI applied",
+            [
+                "plat": platform?.rawValue ?? "nil",
+                "artNil": artwork == nil,
+                "token": snap.artworkToken,
+                "playing": isPlaying,
+                "secHas": secondaryHasMedia,
+                "secPlaying": secondaryIsPlaying,
+                "compactDual": showsCompactDualNowPlaying,
+                "swap": dualNowPlayingSwapsTiles,
+                "expanded": isExpanded
+            ],
+            hypothesisId: "C,D,E",
+            runId: "post-fix"
+        )
+        // #endregion
         refreshWaveformTint(from: snap.artwork)
         persistentState = hasMedia ? .musicPlaying : .idle
         if hasMedia, let destination = IslandIdleDestination.from(platform: platform) {

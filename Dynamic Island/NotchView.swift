@@ -54,12 +54,14 @@ struct NotchView: View {
     }
 
     /// YouTube Music metadata is already on the view model in compact; watch
-    /// compact stays art + waveform only.
+    /// compact stays art + waveform only. Hidden when dual stack is showing so
+    /// the overlapping thumbnails stay the clear dual signal.
     private var showsCompactMusicText: Bool {
         !model.isExpanded
             && !model.isOverlayActive
             && model.hasMedia
             && model.mediaPlatform == .youtubeMusic
+            && !model.showsCompactDualNowPlaying
     }
 
     private var compactRecordingMediaSpacing: CGFloat {
@@ -102,6 +104,8 @@ struct NotchView: View {
                     overlayContent
                 } else if model.showsMediaRecordingDual {
                     mediaRecordingDual
+                } else if model.showsDualNowPlaying {
+                    dualNowPlayingContent
                 } else if model.showsRecordingExpanded {
                     ScreenRecordingIsland(
                         elapsed: model.recordingElapsed,
@@ -186,6 +190,7 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.persistentState)
         .animation(IslandMetrics.motion, value: model.showsShelfRow)
         .animation(IslandMetrics.motion, value: model.shelfItems.count)
+        .animation(IslandMetrics.motion, value: model.showsCompactDualNowPlaying)
         .notchFTUEGlow(
             isActive: model.isFTUEGlowActive,
             bottomLeadingRadius: bottomRadius,
@@ -208,12 +213,19 @@ struct NotchView: View {
 
             VStack(spacing: model.isExpanded ? 12 : 0) {
                 HStack(alignment: .center, spacing: compactRecordingMediaSpacing) {
-                    albumArtwork(
-                        size: model.isExpanded ? 48 : IslandMetrics.compactArt,
-                        cornerRadius: model.isExpanded ? 12 : 5
-                    )
-                    .matchedGeometryEffect(id: "artwork", in: island)
-                    .padding(.leading, model.isExpanded ? 0 : 8)
+                    if !model.isExpanded, model.showsCompactDualNowPlaying {
+                        // No matchedGeometryEffect here — morphing into the
+                        // single-art id collapses the fan into one square.
+                        compactDualArtworkStack
+                            .padding(.leading, 10)
+                    } else {
+                        albumArtwork(
+                            size: model.isExpanded ? 48 : IslandMetrics.compactArt,
+                            cornerRadius: model.isExpanded ? 12 : 5
+                        )
+                        .matchedGeometryEffect(id: "artwork", in: island)
+                        .padding(.leading, model.isExpanded ? 0 : 8)
+                    }
 
                     if model.isExpanded {
                         VStack(alignment: .leading, spacing: 2) {
@@ -400,6 +412,83 @@ struct NotchView: View {
         }
         .padding(.bottom, IslandMetrics.chatOverlayBottomPadding)
         .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+    }
+
+    /// Two Now Playing tiles side-by-side (e.g. YouTube video + YT Music).
+    /// Additive: only rendered when the secondary reader has a live tab.
+    /// Both columns are equal width — the media/chat 35/65 split is deliberately
+    /// not reused, so both tiles get identical layout, artwork size, and title space.
+    private var dualNowPlayingContent: some View {
+        VStack(spacing: 0) {
+            Color.clear
+                .frame(height: IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
+
+            GeometryReader { geo in
+                let dividerWidth: CGFloat = 1
+                let columnWidth = max(0, (geo.size.width - dividerWidth) / 2)
+                let swap = model.dualNowPlayingSwapsTiles
+
+                HStack(alignment: .top, spacing: 0) {
+                    Group {
+                        if swap { secondaryDualTile } else { primaryDualTile }
+                    }
+                    .padding(.trailing, IslandMetrics.chatOverlayColumnSpacing / 2)
+                    .frame(width: columnWidth)
+                    .frame(maxHeight: .infinity)
+
+                    Rectangle()
+                        .fill(IslandGradientDivider.gradient)
+                        .frame(width: dividerWidth)
+                        .frame(maxHeight: .infinity)
+
+                    Group {
+                        if swap { primaryDualTile } else { secondaryDualTile }
+                    }
+                    .padding(.leading, IslandMetrics.chatOverlayColumnSpacing / 2)
+                    .frame(width: columnWidth)
+                    .frame(maxHeight: .infinity)
+                }
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            }
+            .padding(.horizontal, IslandMetrics.chatOverlayHorizontalPadding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .padding(.bottom, IslandMetrics.chatOverlayBottomPadding)
+        .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+    }
+
+    private var primaryDualTile: some View {
+        DualNowPlayingTile(
+            title: model.songTitle,
+            artist: model.artistName,
+            isPlaying: model.isPlaying,
+            artwork: model.artwork,
+            usesPlatformLogo: model.usesPlatformLogo,
+            hasMedia: model.hasMedia,
+            waveform: model.waveform,
+            gradient: model.hasMedia ? model.waveformGradient : .idle,
+            onPlayPause: model.togglePlayPause,
+            onSkipBackward: model.skipBackward,
+            onSkipForward: model.skipForward,
+            onArtworkTap: model.openNowPlayingSource
+        )
+    }
+
+    private var secondaryDualTile: some View {
+        DualNowPlayingTile(
+            title: model.secondarySongTitle,
+            artist: model.secondaryArtistName,
+            isPlaying: model.secondaryIsPlaying,
+            artwork: model.secondaryArtwork,
+            usesPlatformLogo: model.secondaryUsesPlatformLogo,
+            hasMedia: model.secondaryHasMedia,
+            waveform: model.secondaryWaveform,
+            gradient: model.secondaryHasMedia ? model.secondaryWaveformGradient : .idle,
+            onPlayPause: model.toggleSecondaryPlayPause,
+            onSkipBackward: model.skipSecondaryBackward,
+            onSkipForward: model.skipSecondaryForward,
+            onArtworkTap: model.openSecondaryNowPlayingSource
+        )
     }
 
     private func dualActivitySplit<Left: View, Right: View>(
@@ -608,6 +697,22 @@ struct NotchView: View {
 
     // MARK: Album Artwork
 
+    /// Two compact thumbnails fanned so the collapsed island clearly reads as
+    /// two live sources. Front tile follows Watch-left / Music-right order via
+    /// `dualNowPlayingSwapsTiles`. Falls back to platform logos when art is
+    /// still loading so the dual signal never looks like a single blank square.
+    private var compactDualArtworkStack: some View {
+        let swap = model.dualNowPlayingSwapsTiles
+        return CompactDualNowPlayingArtwork(
+            frontImage: swap ? model.secondaryArtwork : model.artwork,
+            frontUsesPlatformLogo: swap ? model.secondaryUsesPlatformLogo : model.usesPlatformLogo,
+            frontPlatform: swap ? model.secondaryMediaPlatform : model.mediaPlatform,
+            backImage: swap ? model.artwork : model.secondaryArtwork,
+            backUsesPlatformLogo: swap ? model.usesPlatformLogo : model.secondaryUsesPlatformLogo,
+            backPlatform: swap ? model.mediaPlatform : model.secondaryMediaPlatform
+        )
+    }
+
     private func albumArtwork(size: CGFloat, cornerRadius: CGFloat) -> some View {
         Group {
             if let artwork = model.artwork {
@@ -813,6 +918,116 @@ private struct IslandUStroke: Shape {
         }
         path.addLine(to: CGPoint(x: bounds.maxX, y: bounds.minY))
         return path
+    }
+}
+
+/// One side of the dual Now Playing split. Same layout language as
+/// `musicSplitHeader`/`musicSplitControls`, but self-contained so it can be
+/// instantiated twice with independent state and independent transport.
+private struct DualNowPlayingTile: View {
+    let title: String
+    let artist: String
+    let isPlaying: Bool
+    let artwork: NSImage?
+    let usesPlatformLogo: Bool
+    let hasMedia: Bool
+    @ObservedObject var waveform: SimulatedWaveform
+    let gradient: ArtworkTint.Gradient
+    let onPlayPause: () -> Void
+    let onSkipBackward: () -> Void
+    let onSkipForward: () -> Void
+    let onArtworkTap: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
+                Button(action: onArtworkTap) {
+                    tileArtwork
+                }
+                .buttonStyle(.plain)
+                .fixedSize()
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title.isEmpty ? "Now Playing" : title)
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .allowsHitTesting(false)
+                    Text(artist.isEmpty ? "—" : artist)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .allowsHitTesting(false)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                SimulatedWaveformBars(
+                    waveform: waveform,
+                    gradient: hasMedia ? gradient : .idle,
+                    barHeight: 13,
+                    barWidth: 1.5,
+                    spacing: 1.5,
+                    barCount: 5
+                )
+                .fixedSize()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            HStack(spacing: 12) {
+                IslandTransportButton(
+                    system: "backward.fill",
+                    iconSize: 13,
+                    side: 28,
+                    action: onSkipBackward
+                )
+                IslandTransportButton(
+                    system: isPlaying ? "pause.fill" : "play.fill",
+                    iconSize: 16,
+                    side: 28,
+                    action: onPlayPause
+                )
+                IslandTransportButton(
+                    system: "forward.fill",
+                    iconSize: 13,
+                    side: 28,
+                    action: onSkipForward
+                )
+            }
+            .frame(height: IslandMetrics.dualActionRowHeight)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var tileArtwork: some View {
+        let size: CGFloat = 40
+        let radius: CGFloat = 10
+        return Group {
+            if let artwork {
+                Color.clear
+                    .overlay {
+                        Image(nsImage: artwork)
+                            .resizable()
+                            .aspectRatio(contentMode: usesPlatformLogo ? .fit : .fill)
+                            .transaction { $0.animation = nil }
+                            .id(ObjectIdentifier(artwork))
+                    }
+                    .clipped()
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: radius)
+                        .fill(Color.white.opacity(0.12))
+                    Image(systemName: hasMedia ? "music.note" : "music.note.list")
+                        .font(.system(size: size * 0.45, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: radius))
+        .contentShape(RoundedRectangle(cornerRadius: radius))
     }
 }
 

@@ -1091,7 +1091,9 @@ final class NotchWindowController: NSWindowController {
             showsShelf: viewModel.showsShelfRow,
             isScreenRecording: viewModel.isScreenRecording,
             showsIdleGlance: viewModel.showsIdleGlance,
-            idleDestinationCount: viewModel.idleDestinations.count
+            idleDestinationCount: viewModel.idleDestinations.count,
+            showsDualNowPlaying: viewModel.showsDualNowPlaying,
+            dualNowPlayingSwapsTiles: viewModel.dualNowPlayingSwapsTiles
         )
         switch action {
         case .passthrough:
@@ -1109,10 +1111,13 @@ final class NotchWindowController: NSWindowController {
             NSLog("[NotchWindow] island click battery settings")
             viewModel.openBatterySettingsFromOverlay()
         case .playPause:
+            NSLog("[NotchWindow] island click primary play/pause")
             viewModel.togglePlayPause()
         case .skipBack:
+            NSLog("[NotchWindow] island click primary skip back")
             viewModel.skipBackward()
         case .skipForward:
+            NSLog("[NotchWindow] island click primary skip forward")
             viewModel.skipForward()
         case .seek:
             isScrubbingFromClick = true
@@ -1120,6 +1125,18 @@ final class NotchWindowController: NSWindowController {
         case .openIdleDestination(let index):
             NSLog("[NotchWindow] island click idle destination %d", index)
             viewModel.openIdleDestination(at: index)
+        case .secondaryRevealNowPlaying:
+            NSLog("[NotchWindow] island click reveal secondary source")
+            viewModel.openSecondaryNowPlayingSource()
+        case .secondaryPlayPause:
+            NSLog("[NotchWindow] island click secondary play/pause")
+            viewModel.toggleSecondaryPlayPause()
+        case .secondarySkipBack:
+            NSLog("[NotchWindow] island click secondary skip back")
+            viewModel.skipSecondaryBackward()
+        case .secondarySkipForward:
+            NSLog("[NotchWindow] island click secondary skip forward")
+            viewModel.skipSecondaryForward()
         }
         return true
     }

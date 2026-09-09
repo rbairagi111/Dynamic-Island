@@ -1,6 +1,8 @@
 import Testing
 import CoreGraphics
 import AppKit
+import SwiftUI
+import Foundation
 @testable import Dynamic_Island
 
 struct Dynamic_IslandTests {
@@ -4730,6 +4732,551 @@ struct Dynamic_IslandTests {
         #expect(gridLeading == 178)
         #expect(gridTrailing == 321)
         #expect(gridTrailing - gridLeading == column)
+    }
+
+    @Test func dualNowPlayingRoutesTransportToTheClickedTile() {
+        // 560 x 144 dual layout matches IslandMetrics.dualWidthFixed +
+        // dualHeight(notchHeight: 32). Column layout mirrors NotchView:
+        //   pad 20 | left (inset gap toward divider) | 1pt | right | pad 20
+        // Transport band Y-range: [96, 132]. Artwork band Y-range: [32, 96).
+        let size = CGSize(
+            width: IslandMetrics.dualWidthFixed,
+            height: IslandMetrics.dualHeight(notchHeight: 32)
+        )
+        let notch: CGFloat = 32
+
+        // Primary column — artwork area reveals primary source.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 100, y: 60),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .revealNowPlaying
+        )
+        // Primary column — left third of transport is skipBack.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 40, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .skipBack
+        )
+        // Primary column — middle third is playPause.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 140, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .playPause
+        )
+        // Primary column — right third is skipForward.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 260, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .skipForward
+        )
+        // Secondary column — artwork reveals secondary source.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 400, y: 60),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .secondaryRevealNowPlaying
+        )
+        // Secondary column — left third is secondarySkipBack.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 300, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .secondarySkipBack
+        )
+        // Secondary column — middle is secondaryPlayPause.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 400, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .secondaryPlayPause
+        )
+        // Secondary column — right is secondarySkipForward.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 520, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .secondarySkipForward
+        )
+        // Below the transport band → passthrough (doesn't hijack the shadow zone).
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 300, y: 140),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true
+            ) == .passthrough
+        )
+        // No media — dual layer never dispatches.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 140, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: false,
+                persistentIsMusic: false,
+                showsDualNowPlaying: true
+            ) == .passthrough
+        )
+        // showsDualNowPlaying: false → falls back to existing single-tile mapping.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 400, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: false
+            ) != .secondaryPlayPause
+        )
+
+        // When MediaRemote holds Music as primary but Watch is shown on the
+        // left (swapsTiles), a left-column play/pause must hit secondary.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 145, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true,
+                dualNowPlayingSwapsTiles: true
+            ) == .secondaryPlayPause
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 400, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true,
+                dualNowPlayingSwapsTiles: true
+            ) == .playPause
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 40, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true,
+                dualNowPlayingSwapsTiles: true
+            ) == .secondarySkipBack
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 520, y: 115),
+                islandSize: size,
+                notchHeight: notch,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsDualNowPlaying: true,
+                dualNowPlayingSwapsTiles: true
+            ) == .skipForward
+        )
+    }
+
+    @Test func dualNowPlayingCompactStackIsVisiblyLargerThanSingleArt() {
+        let live = DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+            featureEnabled: true,
+            hasMedia: true,
+            isPlaying: true,
+            secondaryHasMedia: true,
+            secondaryIsPlaying: true,
+            overlayActive: false,
+            isScreenRecording: false,
+            isSelectingScreenToRecord: false
+        )
+        #expect(live)
+        #expect(
+            DualNowPlayingSurfacePolicy.showsCompactStackedArt(
+                hasLiveDualSessions: live,
+                isExpanded: false
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.showsCompactStackedArt(
+                hasLiveDualSessions: live,
+                isExpanded: true
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.showsExpandedSplit(
+                hasLiveDualSessions: live,
+                isExpanded: true
+            )
+        )
+
+        let stack = DualNowPlayingSurfacePolicy.compactStackSize(
+            art: IslandMetrics.compactDualArtSize,
+            overlapX: IslandMetrics.compactDualArtOverlapX,
+            overlapY: IslandMetrics.compactDualArtOverlapY
+        )
+        // Back tile must peek by a clear horizontal margin — not a 1–2pt sliver.
+        #expect(stack.width >= IslandMetrics.compactArt + 10)
+        #expect(stack.width == IslandMetrics.compactDualArtSize + IslandMetrics.compactDualArtOverlapX)
+        #expect(stack.height == IslandMetrics.compactDualArtSize + IslandMetrics.compactDualArtOverlapY)
+        #expect(IslandMetrics.compactDualArtOverlapX >= 8)
+        #expect(IslandMetrics.compactDualWidthBoost >= 12)
+
+        #expect(
+            DualNowPlayingSurfacePolicy.swapsTiles(
+                hasLiveDualSessions: live,
+                primaryIsYouTubeMusic: true,
+                secondaryIsYouTubeWatch: true
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.swapsTiles(
+                hasLiveDualSessions: live,
+                primaryIsYouTubeMusic: false,
+                secondaryIsYouTubeWatch: true
+            )
+        )
+    }
+
+    @Test func dualNowPlayingSecondaryScanHuntsFastUntilFound() {
+        #expect(
+            DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: false) <= 0.2
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: true) >= 2.0
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: false)
+                < DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: true)
+        )
+    }
+
+    @Test func dualNowPlayingDemotesWatchToSecondaryWhenMusicTakesPrimary() {
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoingIsYouTubeWatch: true,
+                outgoingIsYouTubeMusic: false,
+                incomingIsPlaying: true,
+                incomingIsYouTubeWatch: false,
+                incomingIsYouTubeMusic: true
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoingIsYouTubeWatch: false,
+                outgoingIsYouTubeMusic: true,
+                incomingIsPlaying: true,
+                incomingIsYouTubeWatch: true,
+                incomingIsYouTubeMusic: false
+            )
+        )
+        // Same-family handoff must not invent a dual session.
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoingIsYouTubeWatch: true,
+                outgoingIsYouTubeMusic: false,
+                incomingIsPlaying: true,
+                incomingIsYouTubeWatch: true,
+                incomingIsYouTubeMusic: false
+            )
+        )
+        // Outgoing already paused — nothing to demote.
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: false,
+                outgoingIsYouTubeWatch: true,
+                outgoingIsYouTubeMusic: false,
+                incomingIsPlaying: true,
+                incomingIsYouTubeWatch: false,
+                incomingIsYouTubeMusic: true
+            )
+        )
+    }
+
+    @Test func dualNowPlayingPreservesOppositeSecondaryOnMissedHunt() {
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
+                primaryIsYouTubeWatch: false,
+                primaryIsYouTubeMusic: true,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false,
+                secondaryIsPlaying: true,
+                holdActive: false
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
+                primaryIsYouTubeWatch: false,
+                primaryIsYouTubeMusic: true,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false,
+                secondaryIsPlaying: false,
+                holdActive: true
+            )
+        )
+        // Primary unbound during MediaRemote flicker — still hold Watch secondary.
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
+                primaryIsYouTubeWatch: false,
+                primaryIsYouTubeMusic: false,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false,
+                secondaryIsPlaying: true,
+                holdActive: true
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
+                primaryIsYouTubeWatch: false,
+                primaryIsYouTubeMusic: true,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false,
+                secondaryIsPlaying: false,
+                holdActive: false
+            )
+        )
+        #expect(DualNowPlayingSurfacePolicy.secondaryHoldDuration() >= 2.0)
+    }
+
+    @Test func dualNowPlayingInfersMusicWhenWatchTitleChanges() {
+        let inferred = DualNowPlayingSurfacePolicy.inferredIncomingYouTubeFormat(
+            outgoingIsYouTubeWatch: true,
+            outgoingIsYouTubeMusic: false,
+            incomingResolvedIsWatch: false,
+            incomingResolvedIsMusic: false,
+            titlesMatchOutgoing: false,
+            incomingIsPlaying: true,
+            incomingLooksLikeAlbumArt: false
+        )
+        #expect(inferred.isMusic)
+        #expect(!inferred.isWatch)
+
+        let album = DualNowPlayingSurfacePolicy.inferredIncomingYouTubeFormat(
+            outgoingIsYouTubeWatch: true,
+            outgoingIsYouTubeMusic: false,
+            incomingResolvedIsWatch: false,
+            incomingResolvedIsMusic: false,
+            titlesMatchOutgoing: true,
+            incomingIsPlaying: true,
+            incomingLooksLikeAlbumArt: true
+        )
+        #expect(album.isMusic)
+
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPublishOppositeSecondaryToUI(
+                primaryIsYouTubeWatch: true,
+                primaryIsYouTubeMusic: false,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false
+            ) == false
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPublishOppositeSecondaryToUI(
+                primaryIsYouTubeWatch: false,
+                primaryIsYouTubeMusic: true,
+                secondaryIsYouTubeWatch: true,
+                secondaryIsYouTubeMusic: false
+            )
+        )
+
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: false
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: true
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: nil
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: true,
+                htmlSaysPrimaryPlaying: false
+            )
+        )
+    }
+
+    @Test func dualNowPlayingCompactStackRequiresBothPlaying() {
+        #expect(
+            !DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+                featureEnabled: true,
+                hasMedia: true,
+                isPlaying: true,
+                secondaryHasMedia: true,
+                secondaryIsPlaying: false,
+                overlayActive: false,
+                isScreenRecording: false,
+                isSelectingScreenToRecord: false
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+                featureEnabled: true,
+                hasMedia: true,
+                isPlaying: false,
+                secondaryHasMedia: true,
+                secondaryIsPlaying: true,
+                overlayActive: false,
+                isScreenRecording: false,
+                isSelectingScreenToRecord: false
+            )
+        )
+    }
+
+    @Test @MainActor
+    func compactDualArtworkStackBitmapShowsBackTilePeek() {
+        func solidImage(color: NSColor) -> NSImage {
+            let image = NSImage(size: NSSize(width: 64, height: 64))
+            image.lockFocus()
+            color.setFill()
+            NSBezierPath(rect: NSRect(origin: .zero, size: image.size)).fill()
+            image.unlockFocus()
+            return image
+        }
+
+        let front = solidImage(color: .systemRed)
+        let back = solidImage(color: .systemBlue)
+        let view = CompactDualNowPlayingArtwork(
+            frontImage: front,
+            frontUsesPlatformLogo: false,
+            frontPlatform: .youtube,
+            backImage: back,
+            backUsesPlatformLogo: false,
+            backPlatform: .youtubeMusic
+        )
+        .padding(4)
+        .background(Color.black)
+
+        let renderer = ImageRenderer(content: view)
+        renderer.scale = 2
+        guard let cgImage = renderer.cgImage else {
+            Issue.record("ImageRenderer failed to produce a bitmap for compact dual art")
+            return
+        }
+
+        let expectedW = Int(
+            (IslandMetrics.compactDualArtSize + IslandMetrics.compactDualArtOverlapX + 8) * 2
+        )
+        #expect(cgImage.width >= expectedW - 4)
+
+        // Sample the rightmost peek region — must be blue-dominant (back tile),
+        // not the same as the front-left red tile.
+        let peekX = cgImage.width - 6
+        let midY = cgImage.height / 2
+        let frontX = 10
+        guard
+            let peek = pixelRGB(cgImage, x: peekX, y: midY),
+            let frontSample = pixelRGB(cgImage, x: frontX, y: midY)
+        else {
+            Issue.record("Failed to sample rendered dual-art pixels")
+            return
+        }
+        #expect(frontSample.r > frontSample.b)
+        #expect(peek.b > peek.r)
+        #expect(abs(Int(frontSample.r) - Int(peek.r)) > 40)
+    }
+
+    private func pixelRGB(_ image: CGImage, x: Int, y: Int) -> (r: UInt8, g: UInt8, b: UInt8)? {
+        guard x >= 0, y >= 0, x < image.width, y < image.height else { return nil }
+        guard let data = image.dataProvider?.data,
+              let ptr = CFDataGetBytePtr(data) else { return nil }
+        let bytesPerPixel = image.bitsPerPixel / 8
+        guard bytesPerPixel >= 3 else { return nil }
+        let offset = y * image.bytesPerRow + x * bytesPerPixel
+        // Prefer BGRA (common on Apple) vs RGBA by checking alpha layout via bitmap info.
+        let info = image.bitmapInfo
+        let alphaFirst = info.contains(.byteOrder32Little) || info.rawValue & CGBitmapInfo.byteOrderMask.rawValue == CGBitmapInfo.byteOrder32Little.rawValue
+        if alphaFirst || bytesPerPixel == 4 {
+            // BGRA little-endian is typical for CGImage from ImageRenderer on macOS.
+            return (r: ptr[offset + 2], g: ptr[offset + 1], b: ptr[offset + 0])
+        }
+        return (r: ptr[offset], g: ptr[offset + 1], b: ptr[offset + 2])
     }
 
     @Test func idleGlanceExpandedUsesMusicExpandedHeight() {
