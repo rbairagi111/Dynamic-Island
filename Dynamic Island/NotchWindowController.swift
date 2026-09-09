@@ -895,6 +895,42 @@ final class NotchWindowController: NSWindowController {
                 self.positionWindow()
             }
             .store(in: &cancellables)
+
+        // Idle glance width/height changes with media / ranking — keep the
+        // AppKit frame in sync so live matches what screenshots capture.
+        Publishers.CombineLatest3(
+            viewModel.$hasMedia,
+            viewModel.$persistentState,
+            viewModel.$idleDestinations
+        )
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.positionWindow()
+            }
+            .store(in: &cancellables)
+
+        AppSettings.shared.$idleGlanceEnabled
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.positionWindow()
+            }
+            .store(in: &cancellables)
+
+        // Idle glance hangs below the notch; keep the panel ordered front so
+        // the visible hang isn’t buried under menu-bar chrome.
+        viewModel.$hasMedia
+            .combineLatest(viewModel.$persistentState, AppSettings.shared.$idleGlanceEnabled)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] hasMedia, state, enabled in
+                guard let self, let window = self.window else { return }
+                let idle = enabled && !hasMedia && state == .idle
+                if idle, !LockScreenMonitor.shared.isLocked {
+                    window.orderFrontRegardless()
+                    self.positionWindow()
+                    window.displayIfNeeded()
+                }
+            }
+            .store(in: &cancellables)
     }
 
     private func applyWindowElevation() {
@@ -955,6 +991,15 @@ final class NotchWindowController: NSWindowController {
             .sink { [weak self] _ in
                 self?.positionWindow()
                 NSLog("[NotchWindow] overlay cleared; window restored")
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .islandIdleGlanceExpanded)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self, let window = self.window else { return }
+                self.positionWindow()
+                window.displayIfNeeded()
             }
             .store(in: &cancellables)
     }
@@ -1044,7 +1089,9 @@ final class NotchWindowController: NSWindowController {
             hasMedia: viewModel.hasMedia,
             persistentIsMusic: viewModel.persistentState == .musicPlaying,
             showsShelf: viewModel.showsShelfRow,
-            isScreenRecording: viewModel.isScreenRecording
+            isScreenRecording: viewModel.isScreenRecording,
+            showsIdleGlance: viewModel.showsIdleGlance,
+            idleDestinationCount: viewModel.idleDestinations.count
         )
         switch action {
         case .passthrough:
@@ -1070,6 +1117,9 @@ final class NotchWindowController: NSWindowController {
         case .seek:
             isScrubbingFromClick = true
             applyScrub(at: screenPoint, ended: false)
+        case .openIdleDestination(let index):
+            NSLog("[NotchWindow] island click idle destination %d", index)
+            viewModel.openIdleDestination(at: index)
         }
         return true
     }
@@ -1159,9 +1209,7 @@ final class NotchWindowController: NSWindowController {
                     window.ignoresMouseEvents = true
                 }
                 viewModel.releaseHoverExpandLockIfExpired()
-                if viewModel.isExpanded, !viewModel.isOverlayActive {
-                    viewModel.collapse()
-                }
+                requestCollapseAfterPointerExit()
             }
             return
         }
@@ -1205,12 +1253,18 @@ final class NotchWindowController: NSWindowController {
                     window.disableCursorRects()
                     window.ignoresMouseEvents = true
                     // SwiftUI onHover may not fire once we go click-through.
-                    if viewModel.isExpanded && !viewModel.isOverlayActive {
-                        viewModel.collapse()
-                    }
+                    requestCollapseAfterPointerExit()
+                } else if viewModel.isExpanded {
+                    requestCollapseAfterPointerExit()
                 }
             }
         }
+    }
+
+    /// Collapse immediately on pointer exit — same path for idle and media.
+    private func requestCollapseAfterPointerExit() {
+        guard viewModel.isExpanded, !viewModel.isOverlayActive else { return }
+        viewModel.collapse()
     }
 
     private func bindKeyboardTransport(pointerOverIsland: Bool) {

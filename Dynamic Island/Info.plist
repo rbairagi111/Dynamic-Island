@@ -4,5 +4,7 @@
 <dict>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Dynamic Island uses the desktop wallpaper so the menu bar can match the notch on every app, not only Cursor.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Dynamic Island uses your location to show local weather and air quality in the idle glance.</string>
 </dict>
 </plist>

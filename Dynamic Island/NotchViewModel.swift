@@ -5,7 +5,7 @@ import AppKit
 
 /// Shared layout for compact (now playing) and expanded (hover) island states.
 /// Widths are locked in points so they match the requested pixel sizes on a
-/// 2x Retina display: compact 470px (= 235pt), expanded 670px (= 335pt).
+/// 2x Retina display: compact 520px (= 260pt), expanded 670px (= 335pt).
 enum IslandMetrics {
     static let expandedHeight: CGFloat = 178
     static let expandedRadius: CGFloat = 48
@@ -30,8 +30,17 @@ enum IslandMetrics {
         notchHeight
     }
 
-    /// Fixed compact width: 470px @2x → 235pt
-    static let compactWidthFixed: CGFloat = 235
+    /// Fixed compact width: 520px @2x → 260pt
+    static let compactWidthFixed: CGFloat = 260
+    /// Compact idle content lives only in the visible ears beside the camera.
+    /// Under-notch pixels are captured by screenshots but hidden to the eye.
+    /// Left ear: weather icon + temperature only (no AQI).
+    static let idleGlanceCompactLeftEar: CGFloat = 52
+    static let idleGlanceCompactRightEar: CGFloat = 54
+
+    static func idleGlanceCompactWidth(notchWidth: CGFloat) -> CGFloat {
+        max(notchWidth, 1) + idleGlanceCompactLeftEar + idleGlanceCompactRightEar
+    }
     static let compactArt: CGFloat = 16.94
     static let compactBottomRadius: CGFloat = 12
 
@@ -135,6 +144,40 @@ enum IslandMetrics {
     }
 }
 
+/// Vertical 1pt separator used by dual layouts (music|chat, recording|chat)
+/// and idle glance (weather|shortcuts).
+struct IslandGradientDivider: View {
+    /// Fixed height for compact strips; `nil` fills the available height.
+    var height: CGFloat? = nil
+
+    var body: some View {
+        Rectangle()
+            .fill(Self.gradient)
+            .frame(width: 1)
+            .frame(height: height)
+            .frame(maxHeight: height == nil ? .infinity : height)
+    }
+
+    static let gradient = LinearGradient(
+        stops: [
+            .init(color: .black, location: 0.0),
+            .init(
+                color: Color(
+                    .sRGB,
+                    red: 0.8,
+                    green: 0.8,
+                    blue: 0.8,
+                    opacity: 1
+                ),
+                location: 0.5
+            ),
+            .init(color: .black, location: 1.0)
+        ],
+        startPoint: .top,
+        endPoint: .bottom
+    )
+}
+
 final class NotchViewModel: ObservableObject {
     @Published var isExpanded = false
     @Published var hasPhysicalNotch = true
@@ -183,6 +226,8 @@ final class NotchViewModel: ObservableObject {
     private let recordingMonitor = ScreenRecordingMonitor.shared
     private let focusMonitor = FocusMonitor.shared
     private let settings = AppSettings.shared
+    private let idleDestinationStore = IslandIdleDestinationStore.shared
+    private let weatherService = IslandWeatherService.shared
     private var cancellables = Set<AnyCancellable>()
     private var overlayTimeout: Timer?
     private var overlayHovering = false
@@ -197,6 +242,9 @@ final class NotchViewModel: ObservableObject {
     /// Settings preview can show the shelf even if the feature toggle is off.
     private var shelfPreviewActive = false
     private var shelfDropPreviewTimer: Timer?
+    @Published private(set) var idleDestinations: [IslandIdleDestination] = []
+    @Published private(set) var idleWeather: IslandWeatherSnapshot?
+    private var lastRecordedIdleMediaDestination: IslandIdleDestination?
 
     /// After opening a chat tab, don't re-expand just because the cursor is still over the island.
     private var suppressHoverExpand = false
@@ -222,10 +270,30 @@ final class NotchViewModel: ObservableObject {
         bindFocusMonitor()
         bindLiveActivities()
         bindShelfExpiry()
+        bindIdleGlance()
         syncChromeMonitor(denied: settings.automationDenied)
     }
 
     var isOverlayActive: Bool { transientOverlay != nil }
+
+    /// Weather + ranked destinations — only when nothing else owns the island.
+    /// Compact and hover-expanded both use this; live media/chat/recording win.
+    var showsIdleGlance: Bool {
+        settings.idleGlanceEnabled
+            && transientOverlay == nil
+            && !hasMedia
+            && persistentState == .idle
+            && !isScreenRecording
+            && !isSelectingScreenToRecord
+    }
+
+    var showsExpandedIdleGlance: Bool {
+        showsIdleGlance && isExpanded
+    }
+
+    var showsCompactIdleGlance: Bool {
+        showsIdleGlance && !isExpanded
+    }
 
     var dualActivity: IslandSurfacePolicy.DualActivity {
         IslandSurfacePolicy.dualActivity(
@@ -276,6 +344,9 @@ final class NotchViewModel: ObservableObject {
         if isExpanded {
             return IslandMetrics.expandedWidth(notchWidth: notchWidth)
         }
+        if showsCompactIdleGlance {
+            return IslandMetrics.idleGlanceCompactWidth(notchWidth: notchWidth)
+        }
         return IslandMetrics.compactWidth(notchWidth: notchWidth)
     }
 
@@ -323,7 +394,8 @@ final class NotchViewModel: ObservableObject {
         hasPhysicalNotch ? max(notchWidth - 8, 24) : 16
     }
 
-    /// File tray sits under the existing expanded player. Compact island is unchanged.
+    /// File tray sits under the expanded island (music or idle glance).
+    /// Compact island is unchanged.
     var showsShelfRow: Bool {
         (settings.shelfEnabled || shelfPreviewActive)
             && transientOverlay == nil
@@ -345,6 +417,15 @@ final class NotchViewModel: ObservableObject {
 
     private func expandLiveActivity(fromClick: Bool) {
         if isDropTargeted || isDraggingShelfItem {
+            setExpandedIfNeeded()
+            return
+        }
+        // Idle glance expands on hover, but honor the timed lock used after
+        // Check Now / idle destination navigation so Chrome under the cursor
+        // cannot bounce the island back open immediately.
+        if showsIdleGlance || (!hasMedia && persistentState == .idle && settings.idleGlanceEnabled) {
+            if let until = suppressExpandUntil, until > Date() { return }
+            suppressHoverExpand = false
             setExpandedIfNeeded()
             return
         }
@@ -370,6 +451,7 @@ final class NotchViewModel: ObservableObject {
     private func setExpandedIfNeeded() {
         guard !isExpanded else { return }
         isExpanded = true
+        NotificationCenter.default.post(name: .islandIdleGlanceExpanded, object: nil)
     }
 
     func collapse() {
@@ -696,6 +778,72 @@ final class NotchViewModel: ObservableObject {
         usesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
         refreshWaveformTint(from: snap.artwork)
         persistentState = hasMedia ? .musicPlaying : .idle
+        if hasMedia, let destination = IslandIdleDestination.from(platform: platform) {
+            noteIdleDestinationUsage(destination)
+        } else if !hasMedia {
+            lastRecordedIdleMediaDestination = nil
+        }
+    }
+
+    private func bindIdleGlance() {
+        idleDestinations = idleDestinationStore.ranked
+        idleDestinationStore.$ranked
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] ranked in
+                self?.idleDestinations = ranked
+            }
+            .store(in: &cancellables)
+
+        idleWeather = weatherService.snapshot
+        weatherService.$snapshot
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] snapshot in
+                self?.idleWeather = snapshot
+            }
+            .store(in: &cancellables)
+
+        settings.$idleGlanceEnabled
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] enabled in
+                guard let self else { return }
+                if enabled {
+                    self.weatherService.start()
+                } else {
+                    self.weatherService.stop()
+                }
+            }
+            .store(in: &cancellables)
+
+        if settings.idleGlanceEnabled {
+            weatherService.start()
+        }
+    }
+
+    private func noteIdleDestinationUsage(_ destination: IslandIdleDestination) {
+        if destination == lastRecordedIdleMediaDestination {
+            return
+        }
+        // Avoid double-counting continuous Now Playing polls for the same session.
+        if destination == .youtube || destination == .youtubeMusic {
+            lastRecordedIdleMediaDestination = destination
+        }
+        idleDestinationStore.record(destination)
+    }
+
+    func openIdleDestination(at index: Int) {
+        guard idleDestinations.indices.contains(index) else { return }
+        let destination = idleDestinations[index]
+        idleDestinationStore.record(destination)
+        if destination == .youtube || destination == .youtubeMusic {
+            lastRecordedIdleMediaDestination = destination
+        }
+        // Same as Check Now / open Now Playing source: collapse first and lock
+        // hover briefly so Chrome activating under the cursor cannot re-expand.
+        suppressHoverExpand = true
+        suppressExpandUntil = Date().addingTimeInterval(2.5)
+        collapse()
+        // Fast path — never enqueue AppleScript tab scans on the media queue.
+        IslandIdleNavigator.open(destination)
     }
 
     private func bindPowerMonitor() {
@@ -1035,6 +1183,7 @@ final class NotchViewModel: ObservableObject {
             )
             return
         }
+        noteIdleDestinationUsage(IslandIdleDestination.from(provider: snapshot.tab.provider))
         presentOverlay(.chatReady(preview: cleaned, tab: snapshot.tab))
     }
 

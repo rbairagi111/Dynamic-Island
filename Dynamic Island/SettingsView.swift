@@ -7,6 +7,13 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             Form {
+            Section("Idle glance") {
+                Text("When nothing else is on the island, show local weather/AQI on the left and your most-used YouTube / Claude / ChatGPT / Gemini destinations on the right. Playing media, chat banners, and recording always take over.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Show weather and shortcuts when idle", isOn: $settings.idleGlanceEnabled)
+            }
+
             Section("AI chat monitoring") {
                 Text("The island watches open Claude, ChatGPT, and Gemini tabs in Google Chrome and drops a banner when a reply finishes. It does not call those APIs. For instant alerts, install the bundled Chrome helper (one-time). Until then it polls via AppleScript — enable View → Developer → Allow JavaScript from Apple Events.")
                     .font(.caption)

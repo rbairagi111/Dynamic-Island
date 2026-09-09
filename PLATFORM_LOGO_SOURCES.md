@@ -7,6 +7,7 @@ the asset host referenced by that website. They are not redrawn or generated.
 - Netflix: https://assets.nflxext.com/us/ffe/siteui/common/icons/nficon2016.png
 - JioHotstar: https://secure-media.hotstar.com/web-assets/prod/jhs_favicon.ico
 - YouTube: https://www.youtube.com/s/desktop/f13793d9/img/favicon_144x144.png
+- YouTube Music: https://music.youtube.com/img/favicon_144.png
 - Spotify: https://open.spotifycdn.com/cdn/images/favicon32.b64ecc03.png
 - Max: https://www.max.com/dotcom/img/hbomax/apple-touch-icon.png
 - Twitch: https://assets.twitch.tv/assets/favicon-32-e29e246c157142c94346.png

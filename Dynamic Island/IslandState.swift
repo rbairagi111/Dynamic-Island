@@ -125,6 +125,7 @@ extension Notification.Name {
     static let previewShelfClear = Notification.Name("island.previewShelfClear")
     static let overlayActivated = Notification.Name("island.overlayActivated")
     static let overlayCleared = Notification.Name("island.overlayCleared")
+    static let islandIdleGlanceExpanded = Notification.Name("island.idleGlanceExpanded")
 }
 
 struct ClaudeTabSnapshot: Equatable {

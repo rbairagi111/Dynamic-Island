@@ -4594,6 +4594,203 @@ struct Dynamic_IslandTests {
         )
     }
 
+    @Test func idleDestinationRankerPrefersFrequentAndRecent() {
+        let now = Date()
+        let ranked = IslandIdleDestinationRanker.ranked(
+            stats: [
+                .youtube: (2, now.addingTimeInterval(-3600 * 40)),
+                .claude: (3, now.addingTimeInterval(-600)),
+                .chatgpt: (1, nil),
+                .gemini: (0, nil),
+                .youtubeMusic: (5, now.addingTimeInterval(-3600 * 100))
+            ],
+            limit: 4,
+            now: now
+        )
+        #expect(ranked.first == .claude)
+        #expect(ranked.contains(.youtubeMusic))
+        #expect(ranked.count == 4)
+    }
+
+    @Test func idleDestinationMatchesCatalogURLs() {
+        #expect(IslandIdleDestination.from(url: "https://music.youtube.com/watch?v=abc") == .youtubeMusic)
+        #expect(IslandIdleDestination.from(url: "https://www.youtube.com/watch?v=abc") == .youtube)
+        #expect(IslandIdleDestination.from(url: "https://claude.ai/chat/123") == .claude)
+        #expect(IslandIdleDestination.from(url: "https://chatgpt.com/c/xyz") == .chatgpt)
+        #expect(IslandIdleDestination.from(url: "https://gemini.google.com/app") == .gemini)
+        #expect(IslandIdleDestination.from(platform: .youtubeMusic) == .youtubeMusic)
+        #expect(IslandIdleDestination.from(provider: .gemini) == .gemini)
+    }
+
+    @Test func idleGlanceClicksMapToDestinationSlots() {
+        let notch: CGFloat = 180
+        let compactW = IslandMetrics.idleGlanceCompactWidth(notchWidth: notch)
+        #expect(
+            IslandClickPolicy.idleGlanceAction(
+                point: CGPoint(x: 40, y: 16),
+                islandWidth: compactW,
+                destinationCount: 2
+            ) == .passthrough
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: compactW - 20, y: 16),
+                islandSize: CGSize(width: compactW, height: 33),
+                notchHeight: 32,
+                isExpanded: false,
+                overlay: nil,
+                hasMedia: false,
+                persistentIsMusic: false,
+                showsIdleGlance: true,
+                idleDestinationCount: 2
+            ) == .openIdleDestination(1)
+        )
+        // Expanded idle uses the same shell as Now Playing (335×178).
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 280, y: 70),
+                islandSize: CGSize(
+                    width: IslandMetrics.expandedWidthFixed,
+                    height: IslandMetrics.expandedHeight
+                ),
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: false,
+                persistentIsMusic: false,
+                showsIdleGlance: true,
+                idleDestinationCount: 4
+            ) == .openIdleDestination(1)
+        )
+        // File tray hang must not map to destination slots.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 280, y: IslandMetrics.expandedHeight + 20),
+                islandSize: CGSize(
+                    width: IslandMetrics.expandedWidthFixed,
+                    height: IslandMetrics.expandedHeight + IslandMetrics.shelfSectionHeight
+                ),
+                notchHeight: 32,
+                isExpanded: true,
+                overlay: nil,
+                hasMedia: false,
+                persistentIsMusic: false,
+                showsShelf: true,
+                showsIdleGlance: true,
+                idleDestinationCount: 4
+            ) == .passthrough
+        )
+        // Music / recording still win over idle glance.
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: compactW - 20, y: 16),
+                islandSize: CGSize(width: compactW, height: 33),
+                notchHeight: 32,
+                isExpanded: false,
+                overlay: nil,
+                hasMedia: true,
+                persistentIsMusic: true,
+                showsIdleGlance: true,
+                idleDestinationCount: 2
+            ) == .revealNowPlaying
+        )
+        #expect(
+            IslandClickPolicy.action(
+                pointFromTopLeft: CGPoint(x: 26, y: 16),
+                islandSize: CGSize(width: compactW, height: 33),
+                notchHeight: 32,
+                isExpanded: false,
+                overlay: nil,
+                hasMedia: false,
+                persistentIsMusic: false,
+                isScreenRecording: true,
+                showsIdleGlance: true,
+                idleDestinationCount: 2
+            ) == .expandRecording
+        )
+    }
+
+    @Test func idleGlanceUsesStandardIslandMetrics() {
+        let notch: CGFloat = 32
+        let camera: CGFloat = 180
+        #expect(IslandMetrics.compactWidth(notchWidth: 180) == IslandMetrics.compactWidthFixed)
+        #expect(IslandMetrics.compactHeight(notchHeight: notch) == notch + IslandMetrics.compactHeightExtra)
+        #expect(
+            IslandMetrics.idleGlanceCompactWidth(notchWidth: camera)
+                == camera + IslandMetrics.idleGlanceCompactLeftEar + IslandMetrics.idleGlanceCompactRightEar
+        )
+        #expect(IslandMetrics.expandedWidth(notchWidth: 180) == IslandMetrics.expandedWidthFixed)
+        #expect(IslandMetrics.expandedHeight == 178)
+        #expect(IslandMetrics.expandedRadius == 48)
+        let islandW = IslandMetrics.expandedWidthFixed
+        let column = IslandClickPolicy.idleGlanceExpandedColumnWidth(islandWidth: islandW)
+        let gridLeading = IslandClickPolicy.idleGlanceExpandedGridLeadingX(islandWidth: islandW)
+        let gridTrailing = islandW - IslandMetrics.expandedHorizontalPadding
+        #expect(column == 143)
+        #expect(gridLeading == 178)
+        #expect(gridTrailing == 321)
+        #expect(gridTrailing - gridLeading == column)
+    }
+
+    @Test func idleGlanceExpandedUsesMusicExpandedHeight() {
+        // Idle hover must not invent a taller shell than Now Playing.
+        #expect(IslandMetrics.expandedHeight == 178)
+        #expect(IslandMetrics.shelfSectionHeight > 0)
+    }
+
+    @Test func idleGlanceCompactContentStaysOutsideCameraBand() {
+        let camera: CGFloat = 180
+        let width = IslandMetrics.idleGlanceCompactWidth(notchWidth: camera)
+        let left = IslandMetrics.idleGlanceCompactLeftEar
+        let right = IslandMetrics.idleGlanceCompactRightEar
+        // Left + right ears never overlap the physical camera band.
+        #expect(left + camera + right == width)
+        #expect(left > 0)
+        #expect(right > 0)
+    }
+
+    @Test func screenshotFreezeDetectsCaptureUIApps() {
+        #expect(
+            ScreenRecordingDSP.isCaptureUIApp(
+                bundleID: "com.apple.screencaptureui",
+                localizedName: nil
+            )
+        )
+        #expect(
+            ScreenRecordingDSP.isCaptureUIApp(
+                bundleID: "com.apple.Screenshot",
+                localizedName: "Screenshot"
+            )
+        )
+        #expect(
+            !ScreenRecordingDSP.isCaptureUIApp(
+                bundleID: "com.google.Chrome",
+                localizedName: "Chrome"
+            )
+        )
+    }
+
+    @Test func idleNavigatorPrefersMatchingChromeTab() {
+        let tabs = [
+            BrowserMediaNavigator.Tab(
+                windowIndex: 1,
+                tabIndex: 1,
+                tabID: 11,
+                title: "Home",
+                url: "https://www.youtube.com/"
+            ),
+            BrowserMediaNavigator.Tab(
+                windowIndex: 1,
+                tabIndex: 2,
+                tabID: 22,
+                title: "Video",
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            )
+        ]
+        let picked = IslandIdleNavigator.pickTab(for: .youtube, from: tabs)
+        #expect(picked?.tabID == 22)
+    }
+
     @Test func recordingExpandIgnoresStuckChatHoverLock() {
         #expect(
             IslandSurfacePolicy.shouldAllowRecordingExpand(
