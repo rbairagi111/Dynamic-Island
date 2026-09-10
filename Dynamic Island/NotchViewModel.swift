@@ -902,6 +902,19 @@ final class NotchViewModel: ObservableObject {
     }
 
     private func applySnapshot(_ snap: NowPlayingService.Snapshot) {
+        // Sync secondary UI before primary so compact dual can turn on in the
+        // same turn when the service published secondarySnapshot first.
+        let sec = nowPlaying.secondarySnapshot
+        if sec.hasMedia, sec.isPlaying {
+            let needsSecondarySync = !secondaryHasMedia
+                || !secondaryIsPlaying
+                || secondarySongTitle != sec.title
+                || secondaryArtwork !== sec.artwork
+            if needsSecondarySync {
+                applySecondarySnapshot(sec)
+            }
+        }
+
         isPlaying = snap.isPlaying
         waveform.setPlaying(snap.isPlaying)
         hasMedia = snap.hasMedia || snap.isPlaying
@@ -914,11 +927,19 @@ final class NotchViewModel: ObservableObject {
                 url: snap.sourceURL
             )
             : nil
+        // Demote→Music often lands with youtubeMusic platform token before URL
+        // bind; prefer that so Watch-left / Music-right swap (and dual stack
+        // front tile) is correct immediately.
+        let resolvedPlatform: StreamingPlatform? = {
+            if snap.artworkToken == "platform:youtubeMusic" { return .youtubeMusic }
+            if snap.sourceURL.contains("music.youtube.com") { return .youtubeMusic }
+            return platform
+        }()
         let displayTitle = StreamingPlatform.displayTitle(
             mediaTitle: snap.title,
             pageTitle: snap.sourcePageTitle,
             metadataTitle: snap.album,
-            platform: platform
+            platform: resolvedPlatform ?? platform
         )
         let nextTitle = hasMedia
             ? (displayTitle.isEmpty ? "Now Playing" : displayTitle)
@@ -936,22 +957,22 @@ final class NotchViewModel: ObservableObject {
         }
         duration = snap.duration
         let pendingArtwork = snap.artworkToken.hasPrefix("pending:")
-        let platformChanged = platform != mediaPlatform
-            && platform != nil
+        let platformChanged = (resolvedPlatform ?? platform) != mediaPlatform
+            && (resolvedPlatform ?? platform) != nil
             && mediaPlatform != nil
         if let image = snap.artwork {
             artwork = image
         } else if !pendingArtwork || trackIdentityChanged || platformChanged {
             artwork = nil
         }
-        mediaPlatform = platform
+        mediaPlatform = resolvedPlatform ?? platform
         usesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
         // #region agent log
         DebugLog.write(
             "NotchViewModel.applySnapshot",
             "primary UI applied",
             [
-                "plat": platform?.rawValue ?? "nil",
+                "plat": mediaPlatform?.rawValue ?? "nil",
                 "artNil": artwork == nil,
                 "token": snap.artworkToken,
                 "playing": isPlaying,
@@ -967,7 +988,7 @@ final class NotchViewModel: ObservableObject {
         // #endregion
         refreshWaveformTint(from: snap.artwork)
         persistentState = hasMedia ? .musicPlaying : .idle
-        if hasMedia, let destination = IslandIdleDestination.from(platform: platform) {
+        if hasMedia, let destination = IslandIdleDestination.from(platform: mediaPlatform) {
             noteIdleDestinationUsage(destination)
         } else if !hasMedia {
             lastRecordedIdleMediaDestination = nil

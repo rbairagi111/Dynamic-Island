@@ -133,6 +133,11 @@ final class NowPlayingService: ObservableObject {
     /// Music metadata without art while Watch keeps playing.
     private var ignoreOppositePausedUntil: TimeInterval = 0
     private var ignoreOppositePausedIsMusic: Bool = false
+    /// Demote just parked Watch as secondary because Music is incoming. Force
+    /// the next primary main publish to flush dual even when the Music URL/title
+    /// hint is not bound yet — otherwise one Music-only YouTube logo frame shows
+    /// before overlapping art.
+    private var pendingDualMusicPrimaryAfterDemote = false
 
     private static let mediaQueueKey = DispatchSpecificKey<UInt8>()
     private let mediaQueue: DispatchQueue = {
@@ -1082,9 +1087,12 @@ final class NowPlayingService: ObservableObject {
         secondaryHoldUntil = Date().timeIntervalSince1970
             + DualNowPlayingSurfacePolicy.secondaryHoldDuration()
         secondaryLatch = demoted
-        // Latch only — publishing Watch secondary while primary UI is still Watch
-        // paints Watch+Watch (placeholder/video stack), then Music replaces the
-        // front tile. Flush Watch secondary in the same main tick as Music primary.
+        if inferred.isMusic {
+            pendingDualMusicPrimaryAfterDemote = true
+        }
+        // Latch only on mediaQueue — Watch secondary is published on main in the
+        // same turn as Music primary (secondary first) so compact dual never
+        // flashes a lone YouTube logo.
         // #region agent log
         DebugLog.write(
             "NowPlayingService.demote",
@@ -1094,7 +1102,8 @@ final class NowPlayingService: ObservableObject {
                 "secArtNil": demoted.artwork == nil,
                 "secToken": demoted.artworkToken,
                 "inferredMusic": inferred.isMusic,
-                "hasTab": demoted.sourceTab != nil
+                "hasTab": demoted.sourceTab != nil,
+                "pendingMusicPrimary": pendingDualMusicPrimaryAfterDemote
             ],
             hypothesisId: "A,H",
             runId: "post-fix"
@@ -1486,10 +1495,21 @@ final class NowPlayingService: ObservableObject {
         }
         // Dropping a watch poster under a stale youtube.com binding must not
         // fall through to Chrome's 16:9 MediaRemote JPEG for the old tab.
+        // When Watch was just demoted for incoming Music, never flash the plain
+        // YouTube logo alone — use Music logo (dual back tile) or keep pending.
         if dropHeldArtwork,
            StreamingPlatform.from(url: artworkURL) == .youtube,
            !MediaArtworkPolicy.shouldKeepResolvedYouTubeArtwork(prepared.token) {
-            if let logo = StreamingPlatformArtwork.image(for: .youtube) {
+            let latchWatch = StreamingPlatform.from(url: secondaryLatch.sourceURL) == .youtube
+                && secondaryLatch.hasMedia
+                && secondaryLatch.isPlaying
+            if pendingDualMusicPrimaryAfterDemote || latchWatch {
+                if let logo = StreamingPlatformArtwork.image(for: .youtubeMusic) {
+                    prepared = (logo, "platform:youtubeMusic")
+                } else {
+                    prepared = (nil, "pending:youtubeMusic")
+                }
+            } else if let logo = StreamingPlatformArtwork.image(for: .youtube) {
                 prepared = (logo, "platform:youtube")
             } else {
                 prepared = (nil, "pending:youtube")
@@ -1528,6 +1548,12 @@ final class NowPlayingService: ObservableObject {
             artworkToken: prepared.token
         )
         let latchForMain = secondaryLatch
+        let forceMusicPrimaryDual = pendingDualMusicPrimaryAfterDemote
+            && latchForMain.hasMedia
+            && latchForMain.isPlaying
+        if forceMusicPrimaryDual {
+            pendingDualMusicPrimaryAfterDemote = false
+        }
         DispatchQueue.main.async {
             var merged = next
             if merged.sourceTab == nil,
@@ -1581,7 +1607,8 @@ final class NowPlayingService: ObservableObject {
                     "secPlaying": sec.isPlaying,
                     "secArtNil": sec.artwork == nil,
                     "identityChanged": identityChanged,
-                    "flushLatch": shouldFlushLatch
+                    "flushLatch": shouldFlushLatch,
+                    "forceMusicDual": forceMusicPrimaryDual
                 ],
                 hypothesisId: "C,E,H",
                 runId: "post-fix"
@@ -1595,31 +1622,40 @@ final class NowPlayingService: ObservableObject {
                 artist: merged.artist,
                 title: merged.title
             )
+            let treatAsMusicPrimary = hint == .youtubeMusic
+                || primaryIsMusic
+                || forceMusicPrimaryDual
+                || merged.artworkToken == "platform:youtubeMusic"
             if !merged.isPlaying,
                latch.hasMedia,
                latch.isPlaying,
                DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
                 primaryURL: merged.sourceURL,
-                primaryTitleHintIsMusic: hint == .youtubeMusic,
-                primaryTitleHintIsWatch: hint == .youtube,
+                primaryTitleHintIsMusic: treatAsMusicPrimary,
+                primaryTitleHintIsWatch: hint == .youtube && !treatAsMusicPrimary,
                 secondaryIsYouTubeWatch: latchPlat == .youtube,
                 secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
                ) {
                 return
             }
-            self.snapshot = merged
-            if DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+            let canFlushDual = DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
                 primaryURL: merged.sourceURL,
-                primaryTitleHintIsMusic: hint == .youtubeMusic,
-                primaryTitleHintIsWatch: hint == .youtube,
+                primaryTitleHintIsMusic: treatAsMusicPrimary,
+                primaryTitleHintIsWatch: hint == .youtube && !treatAsMusicPrimary,
                 secondaryIsYouTubeWatch: latchPlat == .youtube,
                 secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
-            ), latch.hasMedia, latch.isPlaying {
+            ) && latch.hasMedia && latch.isPlaying
+            // Secondary BEFORE primary so Combine applies secondaryHasMedia first
+            // and compact dual turns on in the same turn — no lone logo frame.
+            if canFlushDual {
                 if !self.secondarySnapshot.hasMedia
-                    || self.secondarySnapshot.sourceURL != latch.sourceURL {
+                    || self.secondarySnapshot.sourceURL != latch.sourceURL
+                    || self.secondarySnapshot.isPlaying != latch.isPlaying {
                     self.secondarySnapshot = latch
                 }
-            } else {
+            }
+            self.snapshot = merged
+            if !canFlushDual {
                 self.flushSecondaryLatchOntoMainIfNeeded(
                     primaryURL: merged.sourceURL,
                     primaryTitle: merged.title,
