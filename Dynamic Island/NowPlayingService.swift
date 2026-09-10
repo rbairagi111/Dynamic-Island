@@ -1,56 +1,6 @@
 import AppKit
 import Combine
-import Darwin
 import Foundation
-
-// #region agent log
-enum DebugLog {
-    private static let path = "/Users/user/Downloads/Dynamic-Island/.cursor/debug-6ca0b4.log"
-    private static let ingest = URL(string: "http://127.0.0.1:7623/ingest/f87ebb92-dab9-4330-a0bb-56cd64331ac1")!
-    private static let queue = DispatchQueue(label: "island.debug-log")
-
-    static func write(
-        _ location: String,
-        _ message: String,
-        _ data: [String: Any] = [:],
-        hypothesisId: String,
-        runId: String = "dual-lag"
-    ) {
-        let ts = Int(Date().timeIntervalSince1970 * 1000)
-        var payload: [String: Any] = [
-            "sessionId": "6ca0b4",
-            "runId": runId,
-            "hypothesisId": hypothesisId,
-            "location": location,
-            "message": message,
-            "timestamp": ts
-        ]
-        if !data.isEmpty { payload["data"] = data }
-        guard JSONSerialization.isValidJSONObject(payload),
-              let bytes = try? JSONSerialization.data(withJSONObject: payload),
-              let json = String(data: bytes, encoding: .utf8)
-        else { return }
-        NSLog("[DebugLog] %@", json)
-        queue.async {
-            var req = URLRequest(url: ingest)
-            req.httpMethod = "POST"
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("6ca0b4", forHTTPHeaderField: "X-Debug-Session-Id")
-            req.httpBody = bytes
-            URLSession.shared.dataTask(with: req).resume()
-            let url = URL(fileURLWithPath: path)
-            if !FileManager.default.fileExists(atPath: path) {
-                FileManager.default.createFile(atPath: path, contents: nil)
-            }
-            if let fh = try? FileHandle(forWritingTo: url) {
-                defer { try? fh.close() }
-                fh.seekToEndOfFile()
-                fh.write(Data((json + "\n").utf8))
-            }
-        }
-    }
-}
-// #endregion
 
 /// Reads macOS system Now Playing (Spotify, Music, YouTube in browser, etc.).
 ///
@@ -968,15 +918,6 @@ final class NowPlayingService: ObservableObject {
         incomingLooksLikeAlbumArt: Bool = false
     ) {
         guard isBrowserBundle(incomingBundleID), isBrowserBundle(activeBundleID) else {
-            // #region agent log
-            DebugLog.write(
-                "NowPlayingService.demote",
-                "skipped non-browser",
-                ["incomingBundle": incomingBundleID, "activeBundle": activeBundleID],
-                hypothesisId: "A",
-                runId: "post-fix"
-            )
-            // #endregion
             return
         }
         let outgoingURL = snapshot.sourceURL.isEmpty ? lastMediaSourceURL : snapshot.sourceURL
@@ -1024,26 +965,6 @@ final class NowPlayingService: ObservableObject {
             incomingIsYouTubeWatch: inferred.isWatch,
             incomingIsYouTubeMusic: inferred.isMusic
         )
-        // #region agent log
-        DebugLog.write(
-            "NowPlayingService.demote",
-            shouldDemote ? "will demote" : "skipped policy",
-            [
-                "outPlat": outgoingPlatform?.rawValue ?? "nil",
-                "inPlat": incomingPlatform?.rawValue ?? "nil",
-                "inferredWatch": inferred.isWatch,
-                "inferredMusic": inferred.isMusic,
-                "titlesMatch": titlesMatchOutgoing,
-                "albumArt": incomingLooksLikeAlbumArt,
-                "outPlaying": activeIsPlaying || snapshot.isPlaying,
-                "inPlaying": incomingIsPlaying,
-                "outArtNil": snapshot.artwork == nil,
-                "outURL": outgoingURL.contains("music.youtube") ? "music" : (outgoingURL.contains("watch") ? "watch" : "other")
-            ],
-            hypothesisId: "A,F",
-            runId: "post-fix"
-        )
-        // #endregion
         guard shouldDemote else { return }
 
         // Already showing this session as secondary — keep it.
@@ -1093,22 +1014,6 @@ final class NowPlayingService: ObservableObject {
         // Latch only on mediaQueue — Watch secondary is published on main in the
         // same turn as Music primary (secondary first) so compact dual never
         // flashes a lone YouTube logo.
-        // #region agent log
-        DebugLog.write(
-            "NowPlayingService.demote",
-            "secondary latched pending opposite primary",
-            [
-                "secPlat": outgoingPlatform?.rawValue ?? "nil",
-                "secArtNil": demoted.artwork == nil,
-                "secToken": demoted.artworkToken,
-                "inferredMusic": inferred.isMusic,
-                "hasTab": demoted.sourceTab != nil,
-                "pendingMusicPrimary": pendingDualMusicPrimaryAfterDemote
-            ],
-            hypothesisId: "A,H",
-            runId: "post-fix"
-        )
-        // #endregion
         requestImmediateSecondaryHunt()
     }
 
@@ -1147,18 +1052,6 @@ final class NowPlayingService: ObservableObject {
         for tab in ordered.prefix(6) {
             guard let details = probeSecondaryTabDetails(tab: tab, bundleID: bundleID),
                   details.isPlaying else { continue }
-            // #region agent log
-            DebugLog.write(
-                "NowPlayingService.seedSecondary",
-                "seeded opposite live tab",
-                [
-                    "primaryMusic": primary.url.contains("music.youtube"),
-                    "seedMusic": tab.url.contains("music.youtube"),
-                    "candidates": candidates.count
-                ],
-                hypothesisId: "B"
-            )
-            // #endregion
             mediaQueue.async { [weak self] in
                 self?.applySecondaryDetails(
                     details,
@@ -1169,18 +1062,6 @@ final class NowPlayingService: ObservableObject {
             }
             return
         }
-        // #region agent log
-        DebugLog.write(
-            "NowPlayingService.seedSecondary",
-            "no opposite playing tab",
-            [
-                "primaryMusic": primary.url.contains("music.youtube"),
-                "candidates": candidates.count,
-                "tabs": tabs.count
-            ],
-            hypothesisId: "B"
-        )
-        // #endregion
     }
 
     private func apply(payload: AdapterPayload, title: String) {
@@ -1580,40 +1461,6 @@ final class NowPlayingService: ObservableObject {
                 merged.artwork = self.snapshot.artwork
                 merged.artworkToken = self.snapshot.artworkToken
             }
-            // #region agent log
-            let sec = self.secondarySnapshot
-            let latch = latchForMain
-            let primaryIsMusic = merged.sourceURL.contains("music.youtube.com")
-            let primaryIsWatch = !primaryIsMusic
-                && (merged.sourceURL.contains("youtube.com/watch")
-                    || merged.sourceURL.contains("youtu.be/")
-                    || StreamingPlatform.from(url: merged.sourceURL) == .youtube)
-            let latchPlat = StreamingPlatform.from(url: latch.sourceURL)
-            let shouldFlushLatch = DualNowPlayingSurfacePolicy.shouldPublishOppositeSecondaryToUI(
-                primaryIsYouTubeWatch: primaryIsWatch,
-                primaryIsYouTubeMusic: primaryIsMusic,
-                secondaryIsYouTubeWatch: latchPlat == .youtube,
-                secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
-            ) && latch.hasMedia && latch.isPlaying
-            DebugLog.write(
-                "NowPlayingService.apply.primaryMain",
-                "primary snapshot on main",
-                [
-                    "token": merged.artworkToken,
-                    "artNil": merged.artwork == nil,
-                    "urlKind": merged.sourceURL.contains("music.youtube") ? "music" : (merged.sourceURL.contains("watch") ? "watch" : "other"),
-                    "playing": merged.isPlaying,
-                    "secHas": sec.hasMedia,
-                    "secPlaying": sec.isPlaying,
-                    "secArtNil": sec.artwork == nil,
-                    "identityChanged": identityChanged,
-                    "flushLatch": shouldFlushLatch,
-                    "forceMusicDual": forceMusicPrimaryDual
-                ],
-                hypothesisId: "C,E,H",
-                runId: "post-fix"
-            )
-            // #endregion
             // Pausing Music while Watch secondary is live must not leave Music
             // title/artist on the island (often without art). Promote owns UI.
             let hint = StreamingPlatform.titleHint(
@@ -1698,20 +1545,6 @@ final class NowPlayingService: ObservableObject {
             secondaryIsYouTubeMusic: latchPlat == .youtubeMusic
         ) else { return }
         if !secondarySnapshot.hasMedia || secondarySnapshot.sourceURL != latch.sourceURL {
-            // #region agent log
-            DebugLog.write(
-                "NowPlayingService.flushSecondaryLatch",
-                "flushed latch on primary bind",
-                [
-                    "primaryMusic": primaryURL.contains("music.youtube") || hint == .youtubeMusic,
-                    "latchWatch": latchPlat == .youtube,
-                    "secHad": secondarySnapshot.hasMedia,
-                    "hint": hint?.rawValue ?? "nil"
-                ],
-                hypothesisId: "H",
-                runId: "post-fix"
-            )
-            // #endregion
             secondarySnapshot = latch
         }
     }
@@ -3175,23 +3008,6 @@ final class NowPlayingService: ObservableObject {
                 secondaryIsYouTubeWatch: platform == .youtube,
                 secondaryIsYouTubeMusic: platform == .youtubeMusic
             )
-            // #region agent log
-            DebugLog.write(
-                "NowPlayingService.applySecondaryDetails",
-                publishOpposite ? "publish opposite secondary" : "defer same-format secondary",
-                [
-                    "primaryMusic": primaryIsMusic,
-                    "primaryWatch": primaryIsWatch,
-                    "secMusic": platform == .youtubeMusic,
-                    "secWatch": platform == .youtube,
-                    "latchHas": secondaryLatch.hasMedia,
-                    "latchMusic": secondaryLatch.sourceURL.contains("music.youtube"),
-                    "dualPrimary": dualPrimaryURL != nil
-                ],
-                hypothesisId: "H",
-                runId: "post-fix"
-            )
-            // #endregion
             // Never replace a demoted opposite latch with a same-format probe.
             guard publishOpposite else { return }
             secondaryLatch = next
@@ -3212,20 +3028,6 @@ final class NowPlayingService: ObservableObject {
                 secondaryIsYouTubeWatch: platform == .youtube,
                 secondaryIsYouTubeMusic: platform == .youtubeMusic
             )
-            // #region agent log
-            DebugLog.write(
-                "NowPlayingService.applySecondaryDetails",
-                uiReady ? "publish opposite to main" : "latch only waiting primary UI",
-                [
-                    "publishedMusic": publishedURL.contains("music.youtube") || publishedHint == .youtubeMusic,
-                    "publishedWatch": publishedHint == .youtube,
-                    "secWatch": platform == .youtube,
-                    "dualPrimary": dualPrimaryURL != nil
-                ],
-                hypothesisId: "H",
-                runId: "post-fix"
-            )
-            // #endregion
             guard uiReady else { return }
             DispatchQueue.main.async { [weak self] in
                 self?.secondarySnapshot = next
@@ -3412,21 +3214,6 @@ final class NowPlayingService: ObservableObject {
             secondaryIsPlaying: snap.isPlaying,
             holdActive: holdActive
         ) {
-            // #region agent log
-            DebugLog.write(
-                "NowPlayingService.publishEmptySecondary",
-                "preserved opposite secondary",
-                [
-                    "primaryPlat": primaryPlat?.rawValue ?? "nil",
-                    "secondaryPlat": secondaryPlat?.rawValue ?? "nil",
-                    "primaryMusicURL": primaryURL.contains("music.youtube"),
-                    "holdActive": holdActive,
-                    "secPlaying": snap.isPlaying
-                ],
-                hypothesisId: "B,C",
-                runId: "post-fix"
-            )
-            // #endregion
             if snap.isPlaying {
                 secondaryHoldUntil = Date().timeIntervalSince1970
                     + DualNowPlayingSurfacePolicy.secondaryHoldDuration()
@@ -3434,21 +3221,6 @@ final class NowPlayingService: ObservableObject {
             reassertPrimaryPlayingForDualIfNeeded()
             return
         }
-
-        // #region agent log
-        DebugLog.write(
-            "NowPlayingService.publishEmptySecondary",
-            "clearing secondary",
-            [
-                "primaryPlat": primaryPlat?.rawValue ?? "nil",
-                "secondaryPlat": secondaryPlat?.rawValue ?? "nil",
-                "holdActive": holdActive,
-                "secPlaying": snap.isPlaying
-            ],
-            hypothesisId: "B,C",
-            runId: "post-fix"
-        )
-        // #endregion
 
         secondaryHoldUntil = 0
         secondaryLatch = Snapshot()
@@ -3494,20 +3266,6 @@ final class NowPlayingService: ObservableObject {
             let playing = BrowserMediaNavigator.probePlaybackPlaying(on: tab, bundleID: bundleID)
             self?.mediaQueue.async {
                 guard let self else { return }
-                // #region agent log
-                DebugLog.write(
-                    "NowPlayingService.reassertPrimaryPlaying",
-                    "html recheck for dual",
-                    [
-                        "htmlPlaying": playing as Any,
-                        "activePlaying": self.activeIsPlaying,
-                        "primaryMusic": primaryIsMusic,
-                        "secPlat": latchPlat?.rawValue ?? "nil"
-                    ],
-                    hypothesisId: "J",
-                    runId: "post-fix"
-                )
-                // #endregion
                 guard playing == true else { return }
                 guard !self.activeIsPlaying else { return }
                 self.htmlPlaybackOverride = true
@@ -3597,19 +3355,6 @@ final class NowPlayingService: ObservableObject {
             secondaryIsYouTubeWatch: secPlat == .youtube,
             secondaryIsYouTubeMusic: secPlat == .youtubeMusic
         ) else { return false }
-        // #region agent log
-        DebugLog.write(
-            "NowPlayingService.promoteOppositeSecondary",
-            "promote secondary after primary stopped",
-            [
-                "primaryMusic": primaryIsMusic,
-                "secWatch": secPlat == .youtube,
-                "secMusic": secPlat == .youtubeMusic
-            ],
-            hypothesisId: "K",
-            runId: "post-fix"
-        )
-        // #endregion
         var toPromote = sec
         if toPromote.sourceTab == nil {
             // Promote still works if we only have a URL — rememberBrowserSource
@@ -3648,18 +3393,6 @@ final class NowPlayingService: ObservableObject {
                     mediaRemoteSaysPrimaryPlaying: self.activeIsPlaying,
                     htmlSaysPrimaryPlaying: playing
                 )
-                // #region agent log
-                DebugLog.write(
-                    "NowPlayingService.schedulePromoteSecondary",
-                    shouldPromote ? "html confirmed stop — promote" : "keep dual / reassert",
-                    [
-                        "htmlPlaying": playing as Any,
-                        "activePlaying": self.activeIsPlaying
-                    ],
-                    hypothesisId: "K",
-                    runId: "post-fix"
-                )
-                // #endregion
                 if shouldPromote {
                     _ = self.promoteOppositeSecondaryIfPrimaryStopped()
                     return

@@ -782,25 +782,6 @@ final class NotchViewModel: ObservableObject {
         secondaryArtwork = snap.artwork
         secondaryMediaPlatform = platform
         secondaryUsesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
-        // #region agent log
-        DebugLog.write(
-            "NotchViewModel.applySecondarySnapshot",
-            "secondary UI applied",
-            [
-                "plat": platform?.rawValue ?? "nil",
-                "artNil": snap.artwork == nil,
-                "token": snap.artworkToken,
-                "playing": secondaryIsPlaying,
-                "primaryPlat": mediaPlatform?.rawValue ?? "nil",
-                "primaryArtNil": artwork == nil,
-                "compactDual": showsCompactDualNowPlaying,
-                "swap": dualNowPlayingSwapsTiles,
-                "frontIsSecondary": dualNowPlayingSwapsTiles
-            ],
-            hypothesisId: "B,C,D",
-            runId: "post-fix"
-        )
-        // #endregion
         refreshSecondaryTint(from: snap.artwork)
     }
 
@@ -967,25 +948,6 @@ final class NotchViewModel: ObservableObject {
         }
         mediaPlatform = resolvedPlatform ?? platform
         usesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
-        // #region agent log
-        DebugLog.write(
-            "NotchViewModel.applySnapshot",
-            "primary UI applied",
-            [
-                "plat": mediaPlatform?.rawValue ?? "nil",
-                "artNil": artwork == nil,
-                "token": snap.artworkToken,
-                "playing": isPlaying,
-                "secHas": secondaryHasMedia,
-                "secPlaying": secondaryIsPlaying,
-                "compactDual": showsCompactDualNowPlaying,
-                "swap": dualNowPlayingSwapsTiles,
-                "expanded": isExpanded
-            ],
-            hypothesisId: "C,D,E",
-            runId: "post-fix"
-        )
-        // #endregion
         refreshWaveformTint(from: snap.artwork)
         persistentState = hasMedia ? .musicPlaying : .idle
         if hasMedia, let destination = IslandIdleDestination.from(platform: mediaPlatform) {
