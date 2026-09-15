@@ -1,0 +1,22 @@
+{
+  "expandedDual" : false,
+  "liveDual" : false,
+  "swap" : false,
+  "primaryArt" : "image",
+  "width" : 260,
+  "reason" : "primary",
+  "secondaryHasMedia" : true,
+  "secondaryArtTokenLogo" : false,
+  "overlay" : false,
+  "overlayName" : "nil",
+  "secondaryPlat" : "youtube",
+  "hasMedia" : true,
+  "ts" : 1789036949.607615,
+  "isExpanded" : false,
+  "height" : 33,
+  "isPlaying" : true,
+  "feature" : true,
+  "secondaryIsPlaying" : false,
+  "compactDual" : false,
+  "primaryPlat" : "youtubeMusic"
+}

@@ -1,0 +1,93 @@
+## Case A: YouTube Watch + YouTube Music
+{
+  "primaryArt" : "image",
+  "isPlaying" : true,
+  "compactDual" : true,
+  "secondaryHasMedia" : true,
+  "primaryPlat" : "youtube",
+  "secondaryPlat" : "youtubeMusic",
+  "secondaryArtTokenLogo" : false,
+  "reason" : "primary",
+  "feature" : true,
+  "isExpanded" : false,
+  "overlay" : false,
+  "swap" : false,
+  "expandedDual" : false,
+  "height" : 33,
+  "ts" : 1789034561.694808,
+  "hasMedia" : true,
+  "liveDual" : true,
+  "secondaryIsPlaying" : true,
+  "overlayName" : "nil",
+  "width" : 278
+}
+## Case B: Pause Music secondary
+{
+  "primaryArt" : "image",
+  "isPlaying" : true,
+  "compactDual" : true,
+  "secondaryHasMedia" : true,
+  "primaryPlat" : "youtube",
+  "secondaryPlat" : "youtubeMusic",
+  "secondaryArtTokenLogo" : false,
+  "reason" : "primary",
+  "feature" : true,
+  "isExpanded" : false,
+  "overlay" : false,
+  "swap" : false,
+  "expandedDual" : false,
+  "height" : 33,
+  "ts" : 1789034571.458056,
+  "hasMedia" : true,
+  "liveDual" : true,
+  "secondaryIsPlaying" : true,
+  "overlayName" : "nil",
+  "width" : 278
+}
+dual restored at i=1
+{
+  "overlayName" : "nil",
+  "secondaryHasMedia" : true,
+  "overlay" : false,
+  "compactDual" : true,
+  "width" : 278,
+  "isPlaying" : true,
+  "isExpanded" : false,
+  "feature" : true,
+  "secondaryIsPlaying" : true,
+  "reason" : "primary",
+  "expandedDual" : false,
+  "primaryPlat" : "youtubeMusic",
+  "height" : 33,
+  "ts" : 1789034573.4551249,
+  "liveDual" : true,
+  "swap" : true,
+  "secondaryPlat" : "youtube",
+  "primaryArt" : "nil",
+  "secondaryArtTokenLogo" : false,
+  "hasMedia" : true
+}
+## Case C: Pause Watch primary
+after watch pause i=3
+{
+  "primaryArt" : "image",
+  "isPlaying" : false,
+  "compactDual" : false,
+  "secondaryHasMedia" : true,
+  "primaryPlat" : "youtubeMusic",
+  "secondaryPlat" : "youtube",
+  "secondaryArtTokenLogo" : false,
+  "reason" : "primary",
+  "feature" : true,
+  "isExpanded" : false,
+  "overlay" : false,
+  "swap" : false,
+  "expandedDual" : false,
+  "height" : 33,
+  "ts" : 1789034574.948987,
+  "hasMedia" : true,
+  "liveDual" : false,
+  "secondaryIsPlaying" : true,
+  "overlayName" : "nil",
+  "width" : 260
+}
