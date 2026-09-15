@@ -1801,6 +1801,41 @@ struct Dynamic_IslandTests {
         )
     }
 
+    @Test func browserIslandKeepsPausedWatchButClearsYouTubeHome() {
+        #expect(
+            PlaybackPlayingPolicy.islandHasMedia(
+                isBrowser: true,
+                payloadHasMedia: true,
+                isPlaying: true,
+                sourceURL: "https://www.youtube.com/"
+            )
+        )
+        #expect(
+            PlaybackPlayingPolicy.islandHasMedia(
+                isBrowser: true,
+                payloadHasMedia: true,
+                isPlaying: false,
+                sourceURL: "https://www.youtube.com/watch?v=abc123"
+            )
+        )
+        #expect(
+            !PlaybackPlayingPolicy.islandHasMedia(
+                isBrowser: true,
+                payloadHasMedia: true,
+                isPlaying: false,
+                sourceURL: "https://www.youtube.com/"
+            )
+        )
+        // Native Music / Spotify may keep a paused session on the island.
+        #expect(
+            PlaybackPlayingPolicy.islandHasMedia(
+                isBrowser: false,
+                payloadHasMedia: true,
+                isPlaying: false
+            )
+        )
+    }
+
     @Test func htmlPlaybackProbeTreatsPagePauseAsStopped() {
         #expect(BrowserMediaNavigator.parsePlaybackProbe("paused") == false)
         #expect(BrowserMediaNavigator.parsePlaybackProbe("playing") == true)
@@ -1875,15 +1910,24 @@ struct Dynamic_IslandTests {
         #expect(AudioAmplitudeDSP.drive(rms: 0.45, highFrequency: 0.18) > pinned + 0.08)
     }
 
-    @Test func waveformBarsAreMirrored() {
+    @Test func waveformBarsExpandAndCollapseIndependently() {
         var engine = SimulatedWaveformEngine(seed: 4)
-        var levels: [CGFloat] = []
-        for _ in 0..<30 {
-            levels = engine.tick(dt: 1.0 / 30.0, playing: true)
+        let dt = 1.0 / 30.0
+        var leftCollapsed = false
+        var rightExpanded = false
+        var adjacentSplit = false
+        for _ in 0..<180 {
+            let levels = engine.tick(dt: dt, playing: true)
+            if levels[0] < 0.32 { leftCollapsed = true }
+            if levels[6] > 0.85 { rightExpanded = true }
+            if abs(levels[1] - levels[2]) > 0.14 { adjacentSplit = true }
         }
-        #expect(abs(levels[0] - levels[6]) < 0.001)
-        #expect(abs(levels[1] - levels[5]) < 0.001)
-        #expect(abs(levels[2] - levels[4]) < 0.001)
+        #expect(leftCollapsed)
+        #expect(rightExpanded)
+        #expect(adjacentSplit)
+    }
+
+    @Test func scalarLiveWaveformBarsAreMirrored() {
         var live = LiveWaveformMapper()
         for i in 0..<LiveWaveformMapper.weights.count {
             let j = LiveWaveformMapper.weights.count - 1 - i
@@ -1965,6 +2009,131 @@ struct Dynamic_IslandTests {
     @Test func liveWaveformUsesSameBarCountAsIsland() {
         #expect(LiveWaveformMapper.barCount == SimulatedWaveformEngine.barCount)
         #expect(LiveWaveformMapper.weights.count == LiveWaveformMapper.barCount)
+    }
+
+    @Test func parseWaveformBandsRejectsSentinels() {
+        #expect(BrowserMediaNavigator.parseWaveformBands("no-wave") == nil)
+        #expect(BrowserMediaNavigator.parseWaveformBands("idle") == nil)
+        #expect(BrowserMediaNavigator.parseWaveformBands("err:fail") == nil)
+        #expect(BrowserMediaNavigator.parseWaveformBands("0.1,0.2") == nil)
+    }
+
+    @Test func parseWaveformBandsAcceptsSevenValues() {
+        let bands = BrowserMediaNavigator.parseWaveformBands("0.05,0.20,0.40,0.80,0.40,0.20,0.05")
+        #expect(bands?.count == 7)
+        #expect(abs((bands?[3] ?? 0) - 0.80) < 0.001)
+    }
+
+    @Test func liveWaveformBandsFollowMixEnergy() {
+        var quietMapper = LiveWaveformMapper(seed: 11)
+        var loudMapper = LiveWaveformMapper(seed: 11)
+        let quiet = Array(repeating: CGFloat(0.04), count: LiveWaveformMapper.barCount)
+        let loud = Array(repeating: CGFloat(0.85), count: LiveWaveformMapper.barCount)
+        var quietPeak: CGFloat = 0
+        var loudPeak: CGFloat = 0
+        for _ in 0..<60 {
+            quietPeak = max(quietPeak, quietMapper.tick(dt: 1.0 / 30.0, bands: quiet).max() ?? 0)
+            loudPeak = max(loudPeak, loudMapper.tick(dt: 1.0 / 30.0, bands: loud).max() ?? 0)
+        }
+        #expect(loudPeak > quietPeak + 0.25)
+    }
+
+    @Test func liveWaveformBandsStayIndependentAcrossMappers() {
+        var music = LiveWaveformMapper(seed: 21)
+        var video = LiveWaveformMapper(seed: 21)
+        let dense = [CGFloat]([0.55, 0.75, 0.90, 0.70, 0.90, 0.75, 0.55])
+        let sparse = [CGFloat]([0.03, 0.05, 0.08, 0.04, 0.08, 0.05, 0.03])
+        var musicPeak: CGFloat = 0
+        var videoPeak: CGFloat = 0
+        for _ in 0..<45 {
+            musicPeak = max(musicPeak, music.tick(dt: 1.0 / 30.0, bands: dense).max() ?? 0)
+            videoPeak = max(videoPeak, video.tick(dt: 1.0 / 30.0, bands: sparse).max() ?? 0)
+        }
+        #expect(musicPeak > videoPeak + 0.2)
+    }
+
+    @Test func liveWaveformBandsDoNotFavorLeftOnBassHeavyMix() {
+        var mapper = LiveWaveformMapper(seed: 33)
+        // Classic left-heavy spectrum must not pin the left candles.
+        let staircase: [CGFloat] = [0.95, 0.80, 0.65, 0.50, 0.35, 0.22, 0.12]
+        var leftSum: CGFloat = 0
+        var rightSum: CGFloat = 0
+        var leftSawCollapse = false
+        var rightSawExpand = false
+        for _ in 0..<180 {
+            let levels = mapper.tick(dt: 1.0 / 30.0, bands: staircase)
+            leftSum += levels[0] + levels[1] + levels[2]
+            rightSum += levels[4] + levels[5] + levels[6]
+            if levels[0] < 0.35 || levels[1] < 0.35 { leftSawCollapse = true }
+            if levels[5] > 0.80 || levels[6] > 0.80 { rightSawExpand = true }
+        }
+        #expect(leftSum < rightSum * 1.5)
+        #expect(leftSawCollapse)
+        #expect(rightSawExpand)
+    }
+
+    @Test func liveWaveformEqualBandsCollapseAndExpandAcrossRow() {
+        var mapper = LiveWaveformMapper(seed: 44)
+        let equal = Array(repeating: CGFloat(0.8), count: LiveWaveformMapper.barCount)
+        var sawSplit = false
+        var sawCollapse = false
+        var sawExpand = false
+        for _ in 0..<150 {
+            let levels = mapper.tick(dt: 1.0 / 30.0, bands: equal)
+            if abs(levels[0] - levels[3]) > 0.12 { sawSplit = true }
+            if levels.min() ?? 1 < 0.32 { sawCollapse = true }
+            if levels.max() ?? 0 > 0.85 { sawExpand = true }
+        }
+        #expect(sawSplit)
+        #expect(sawCollapse)
+        #expect(sawExpand)
+    }
+
+    @Test func spectrumBandsPreferMatchingFrequency() {
+        let n = 1024
+        var low = [Float](repeating: 0, count: n)
+        var high = [Float](repeating: 0, count: n)
+        let lowFreq: Float = 100
+        let highFreq: Float = 5000
+        let sr: Float = 48_000
+        for i in 0..<n {
+            let t = Float(i) / sr
+            low[i] = sin(2 * Float.pi * lowFreq * t)
+            high[i] = sin(2 * Float.pi * highFreq * t)
+        }
+        // Prime AGC with a few frames of the same tone.
+        var lowBands = [Float]()
+        var highBands = [Float]()
+        for _ in 0..<20 {
+            lowBands = AudioAmplitudeDSP.spectrumBands(samples: low)
+        }
+        for _ in 0..<20 {
+            highBands = AudioAmplitudeDSP.spectrumBands(samples: high)
+        }
+        #expect(lowBands.count == AudioAmplitudeDSP.bandCount)
+        #expect(highBands.count == AudioAmplitudeDSP.bandCount)
+        let lowLeft = (lowBands[0] + lowBands[1]) / 2
+        let lowRight = (lowBands[5] + lowBands[6]) / 2
+        let highLeft = (highBands[0] + highBands[1]) / 2
+        let highRight = (highBands[5] + highBands[6]) / 2
+        #expect(lowLeft > lowRight)
+        #expect(highRight > highLeft)
+    }
+
+    @Test func liveWaveformBandsCollapseAfterPeak() {
+        var mapper = LiveWaveformMapper(seed: 55)
+        let loud = Array(repeating: CGFloat(0.95), count: LiveWaveformMapper.barCount)
+        var peak: CGFloat = 0
+        for _ in 0..<30 {
+            peak = max(peak, mapper.tick(dt: 1.0 / 30.0, bands: loud).max() ?? 0)
+        }
+        let quiet = Array(repeating: CGFloat(0), count: LiveWaveformMapper.barCount)
+        var settled: CGFloat = 1
+        for _ in 0..<40 {
+            settled = mapper.tick(dt: 1.0 / 30.0, bands: quiet).max() ?? 0
+        }
+        #expect(peak > 0.55)
+        #expect(settled < 0.25)
     }
 
     @Test func albumArtShadowClampsSaturationAndBrightness() {
@@ -2346,6 +2515,17 @@ struct Dynamic_IslandTests {
         #expect(IslandKeyboardTransport.fromCGKeyCode(124, flags: .maskShift) == nil)
         #expect(IslandKeyboardTransport.fromCGKeyCode(49, flags: .maskAlternate) == nil)
         #expect(IslandKeyboardTransport.fromCGKeyCode(126, flags: none) == nil)
+
+        // F7–F9 as standard function keys (not NX) — same transport as media keys.
+        #expect(IslandKeyboardTransport.fromCGMediaFunctionKeyCode(98, flags: none) == .skipBack)
+        #expect(IslandKeyboardTransport.fromCGMediaFunctionKeyCode(100, flags: none) == .playPause)
+        #expect(IslandKeyboardTransport.fromCGMediaFunctionKeyCode(101, flags: none) == .skipForward)
+        #expect(IslandKeyboardTransport.fromCGMediaFunctionKeyCode(100, flags: .maskCommand) == nil)
+        // Must not be treated as hover-gated arrow/space keys.
+        #expect(IslandKeyboardTransport.fromCGKeyCode(100, flags: none) == nil)
+
+        #expect(IslandSurfacePolicy.shouldCaptureHardwareMediaKeys(hasMedia: true))
+        #expect(!IslandSurfacePolicy.shouldCaptureHardwareMediaKeys(hasMedia: false))
 
         #expect(
             IslandSurfacePolicy.shouldBindArrowKeysToIsland(
@@ -4991,15 +5171,91 @@ struct Dynamic_IslandTests {
         #expect(
             DualNowPlayingSurfacePolicy.swapsTiles(
                 hasLiveDualSessions: live,
-                primaryIsYouTubeMusic: true,
-                secondaryIsYouTubeWatch: true
+                primaryKind: .audio,
+                secondaryKind: .video
             )
         )
         #expect(
             !DualNowPlayingSurfacePolicy.swapsTiles(
                 hasLiveDualSessions: live,
-                primaryIsYouTubeMusic: false,
-                secondaryIsYouTubeWatch: true
+                primaryKind: .video,
+                secondaryKind: .video
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.swapsTiles(
+                hasLiveDualSessions: live,
+                primaryKind: .video,
+                secondaryKind: .audio
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.swapsTiles(
+                hasLiveDualSessions: live,
+                primaryKind: .audio,
+                secondaryKind: .audio
+            )
+        )
+    }
+
+    @Test func dualNowPlayingPairMatrixAllowsDistinctKindsIncludingAudioAudio() {
+        let video: [StreamingPlatform] = [.youtube, .netflix, .primeVideo, .disneyPlus]
+        let audio: [StreamingPlatform] = [.youtubeMusic, .spotify, .appleMusic, .soundcloud]
+
+        for primary in video {
+            for secondary in video where primary != secondary {
+                #expect(
+                    DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                        primary: primary,
+                        secondary: secondary
+                    ),
+                    "video+video \(primary.rawValue)+\(secondary.rawValue)"
+                )
+            }
+            for secondary in audio {
+                #expect(
+                    DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                        primary: primary,
+                        secondary: secondary
+                    ),
+                    "video+audio \(primary.rawValue)+\(secondary.rawValue)"
+                )
+                #expect(
+                    DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                        primary: secondary,
+                        secondary: primary
+                    ),
+                    "audio+video \(secondary.rawValue)+\(primary.rawValue)"
+                )
+            }
+        }
+        for primary in audio {
+            for secondary in audio where primary != secondary {
+                #expect(
+                    DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                        primary: primary,
+                        secondary: secondary
+                    ),
+                    "audio+audio \(primary.rawValue)+\(secondary.rawValue)"
+                )
+            }
+        }
+        #expect(
+            !DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                primary: .netflix,
+                secondary: .netflix
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                primary: .spotify,
+                secondary: .spotify
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.isEligibleDualPair(
+                primary: nil,
+                secondary: .youtube
             )
         )
     }
@@ -5009,7 +5265,7 @@ struct Dynamic_IslandTests {
             DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: false) <= 0.2
         )
         #expect(
-            DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: true) >= 2.0
+            DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: true) >= 0.5
         )
         #expect(
             DualNowPlayingSurfacePolicy.secondaryScanInterval(hasSecondarySession: false)
@@ -5017,17 +5273,15 @@ struct Dynamic_IslandTests {
         )
     }
 
-    @Test func dualNowPlayingDemotesWatchToSecondaryWhenMusicTakesPrimary() {
+    @Test func dualNowPlayingDemotesEligibleOutgoingWhenIncomingTakesPrimary() {
         #expect(
             DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
                 featureEnabled: true,
                 outgoingHasMedia: true,
                 outgoingIsPlaying: true,
-                outgoingIsYouTubeWatch: true,
-                outgoingIsYouTubeMusic: false,
+                outgoing: .youtube,
                 incomingIsPlaying: true,
-                incomingIsYouTubeWatch: false,
-                incomingIsYouTubeMusic: true
+                incoming: .youtubeMusic
             )
         )
         #expect(
@@ -5035,24 +5289,61 @@ struct Dynamic_IslandTests {
                 featureEnabled: true,
                 outgoingHasMedia: true,
                 outgoingIsPlaying: true,
-                outgoingIsYouTubeWatch: false,
-                outgoingIsYouTubeMusic: true,
+                outgoing: .youtubeMusic,
                 incomingIsPlaying: true,
-                incomingIsYouTubeWatch: true,
-                incomingIsYouTubeMusic: false
+                incoming: .youtube
             )
         )
-        // Same-family handoff must not invent a dual session.
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoing: .netflix,
+                incomingIsPlaying: true,
+                incoming: .spotify
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoing: .netflix,
+                incomingIsPlaying: true,
+                incoming: .primeVideo
+            )
+        )
+        // Same platform must not invent a dual session.
         #expect(
             !DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
                 featureEnabled: true,
                 outgoingHasMedia: true,
                 outgoingIsPlaying: true,
-                outgoingIsYouTubeWatch: true,
-                outgoingIsYouTubeMusic: false,
+                outgoing: .youtube,
                 incomingIsPlaying: true,
-                incomingIsYouTubeWatch: true,
-                incomingIsYouTubeMusic: false
+                incoming: .youtube
+            )
+        )
+        // Audio+audio is dual-eligible (browser Spotify + YouTube Music, etc.).
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoing: .spotify,
+                incomingIsPlaying: true,
+                incoming: .youtubeMusic
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldDemoteOutgoingToSecondary(
+                featureEnabled: true,
+                outgoingHasMedia: true,
+                outgoingIsPlaying: true,
+                outgoing: .spotify,
+                incomingIsPlaying: true,
+                incoming: .appleMusic
             )
         )
         // Outgoing already paused — nothing to demote.
@@ -5061,58 +5352,57 @@ struct Dynamic_IslandTests {
                 featureEnabled: true,
                 outgoingHasMedia: true,
                 outgoingIsPlaying: false,
-                outgoingIsYouTubeWatch: true,
-                outgoingIsYouTubeMusic: false,
+                outgoing: .youtube,
                 incomingIsPlaying: true,
-                incomingIsYouTubeWatch: false,
-                incomingIsYouTubeMusic: true
+                incoming: .youtubeMusic
             )
         )
     }
 
-    @Test func dualNowPlayingPreservesOppositeSecondaryOnMissedHunt() {
+    @Test func dualNowPlayingPreservesEligibleSecondaryOnMissedHunt() {
         #expect(
             DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
-                primaryIsYouTubeWatch: false,
-                primaryIsYouTubeMusic: true,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false,
+                primary: .youtubeMusic,
+                secondary: .youtube,
                 secondaryIsPlaying: true,
                 holdActive: false
             )
         )
         #expect(
             DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
-                primaryIsYouTubeWatch: false,
-                primaryIsYouTubeMusic: true,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false,
-                secondaryIsPlaying: false,
+                primary: .spotify,
+                secondary: .netflix,
+                secondaryIsPlaying: true,
                 holdActive: true
             )
         )
-        // Primary unbound during MediaRemote flicker — still hold Watch secondary.
+        // Primary unbound during MediaRemote flicker — still hold playing secondary.
         #expect(
             DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
-                primaryIsYouTubeWatch: false,
-                primaryIsYouTubeMusic: false,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false,
+                primary: nil,
+                secondary: .primeVideo,
                 secondaryIsPlaying: true,
+                holdActive: true
+            )
+        )
+        // Paused secondary must not stay dual via hold alone.
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
+                primary: .spotify,
+                secondary: .netflix,
+                secondaryIsPlaying: false,
                 holdActive: true
             )
         )
         #expect(
             !DualNowPlayingSurfacePolicy.shouldPreserveSecondaryOnMissedHunt(
-                primaryIsYouTubeWatch: false,
-                primaryIsYouTubeMusic: true,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false,
+                primary: .youtubeMusic,
+                secondary: .youtube,
                 secondaryIsPlaying: false,
                 holdActive: false
             )
         )
-        #expect(DualNowPlayingSurfacePolicy.secondaryHoldDuration() >= 2.0)
+        #expect(DualNowPlayingSurfacePolicy.secondaryHoldDuration() >= 1.0)
     }
 
     @Test func dualNowPlayingInfersMusicWhenWatchTitleChanges() {
@@ -5140,19 +5430,39 @@ struct Dynamic_IslandTests {
         #expect(album.isMusic)
 
         #expect(
-            DualNowPlayingSurfacePolicy.shouldPublishOppositeSecondaryToUI(
-                primaryIsYouTubeWatch: true,
-                primaryIsYouTubeMusic: false,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false
+            DualNowPlayingSurfacePolicy.shouldPublishDualSecondaryToUI(
+                primary: .youtube,
+                secondary: .youtube
             ) == false
         )
         #expect(
-            DualNowPlayingSurfacePolicy.shouldPublishOppositeSecondaryToUI(
-                primaryIsYouTubeWatch: false,
-                primaryIsYouTubeMusic: true,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false
+            DualNowPlayingSurfacePolicy.shouldPublishDualSecondaryToUI(
+                primary: .youtubeMusic,
+                secondary: .youtube
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPublishDualSecondaryToUI(
+                primary: .netflix,
+                secondary: .spotify
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPublishDualSecondaryToUI(
+                primary: .netflix,
+                secondary: .primeVideo
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPublishDualSecondaryToUI(
+                primary: .spotify,
+                secondary: .youtubeMusic
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPublishDualSecondaryToUI(
+                primary: .spotify,
+                secondary: .appleMusic
             )
         )
 
@@ -5168,12 +5478,21 @@ struct Dynamic_IslandTests {
                 htmlSaysPrimaryPlaying: true
             )
         )
-        // nil HTML must still promote — otherwise paused Music stays on the
-        // island while Watch keeps playing in the background.
+        // nil HTML with no dual partner may still promote.
         #expect(
             DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
                 mediaRemoteSaysPrimaryPlaying: false,
-                htmlSaysPrimaryPlaying: nil
+                htmlSaysPrimaryPlaying: nil,
+                hasLiveDualSecondary: false
+            )
+        )
+        // nil HTML while dual is live must NOT promote — false MR pauses were
+        // collapsing and restoring the overlapping stack in a loop.
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: nil,
+                hasLiveDualSecondary: true
             )
         )
         #expect(
@@ -5183,21 +5502,32 @@ struct Dynamic_IslandTests {
             )
         )
         #expect(
-            DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+            DualNowPlayingSurfacePolicy.primaryAllowsDualSecondaryPublish(
                 primaryURL: "",
-                primaryTitleHintIsMusic: true,
-                primaryTitleHintIsWatch: false,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false
+                primaryTitleHint: .youtubeMusic,
+                secondary: .youtube
+            )
+        )
+        // Stale watch URL must not block Music+Watch dual flush.
+        #expect(
+            DualNowPlayingSurfacePolicy.primaryAllowsDualSecondaryPublish(
+                primaryURL: "https://www.youtube.com/watch?v=abc",
+                primaryTitleHint: .youtubeMusic,
+                secondary: .youtube
             )
         )
         #expect(
-            !DualNowPlayingSurfacePolicy.primaryAllowsOppositeSecondaryPublish(
+            DualNowPlayingSurfacePolicy.primaryAllowsDualSecondaryPublish(
+                primaryURL: "https://open.spotify.com/track/abc",
+                primaryTitleHint: nil,
+                secondary: .netflix
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.primaryAllowsDualSecondaryPublish(
                 primaryURL: "https://www.youtube.com/watch?v=abc",
-                primaryTitleHintIsMusic: false,
-                primaryTitleHintIsWatch: true,
-                secondaryIsYouTubeWatch: true,
-                secondaryIsYouTubeMusic: false
+                primaryTitleHint: .youtube,
+                secondary: .youtube
             )
         )
     }
@@ -5225,6 +5555,160 @@ struct Dynamic_IslandTests {
                 overlayActive: false,
                 isScreenRecording: false,
                 isSelectingScreenToRecord: false
+            )
+        )
+    }
+
+    @Test func dualNowPlayingPauseEitherSideCollapsesToSingleLayout() {
+        // Secondary paused → dual off (video/music primary keeps the island alone).
+        let secondaryPaused = DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+            featureEnabled: true,
+            hasMedia: true,
+            isPlaying: true,
+            secondaryHasMedia: true,
+            secondaryIsPlaying: false,
+            overlayActive: false,
+            isScreenRecording: false,
+            isSelectingScreenToRecord: false
+        )
+        #expect(!secondaryPaused)
+        #expect(
+            !DualNowPlayingSurfacePolicy.showsCompactStackedArt(
+                hasLiveDualSessions: secondaryPaused,
+                isExpanded: false
+            )
+        )
+
+        // Primary paused → dual off; promote policy hands island to secondary.
+        let primaryPaused = DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+            featureEnabled: true,
+            hasMedia: true,
+            isPlaying: false,
+            secondaryHasMedia: true,
+            secondaryIsPlaying: true,
+            overlayActive: false,
+            isScreenRecording: false,
+            isSelectingScreenToRecord: false
+        )
+        #expect(!primaryPaused)
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: false
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: nil,
+                hasLiveDualSecondary: false
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: nil,
+                hasLiveDualSecondary: true
+            )
+        )
+        // False MediaRemote pause while HTML still playing must not promote.
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldPromoteSecondaryAfterPrimaryPause(
+                mediaRemoteSaysPrimaryPlaying: false,
+                htmlSaysPrimaryPlaying: true
+            )
+        )
+
+        // After promote, MediaRemote leftover rows must not reclaim the island.
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldIgnorePausedMediaRemoteAfterDualPromote(
+                suppressActive: true,
+                remotePlaying: false
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldIgnoreMediaRemoteAfterDualPromote(
+                suppressActive: true
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldIgnorePausedMediaRemoteAfterDualPromote(
+                suppressActive: false,
+                remotePlaying: false
+            )
+        )
+
+        // Closed Music tab + still-open (even paused) Watch → keep Watch single layout.
+        #expect(
+            DualNowPlayingSurfacePolicy.shouldAdoptSecondaryWhenPrimaryTabClosed(
+                secondaryHasMedia: true
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.shouldAdoptSecondaryWhenPrimaryTabClosed(
+                secondaryHasMedia: false
+            )
+        )
+    }
+
+    @Test func dualNowPlayingArtworkPrefersRealThumbnailsOverPlatformLogo() {
+        #expect(
+            DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+                artworkToken: "platform:youtube"
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+                artworkToken: "remote:https://i.ytimg.com/vi/abc/hqdefault.jpg"
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+                artworkToken: "held:ytm"
+            )
+        )
+        #expect(
+            !DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+                artworkToken: "pending:youtubeMusic"
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.preferredDualArtworkToken(
+                currentToken: "platform:spotify",
+                hasCachedRealArt: true
+            ) == "held:cached"
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.preferredDualArtworkToken(
+                currentToken: "pending:youtubeMusic",
+                hasCachedRealArt: true
+            ) == "held:cached"
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.preferredDualArtworkToken(
+                currentToken: "remote:abc",
+                hasCachedRealArt: true
+            ) == nil
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.preferredDualArtworkToken(
+                currentToken: "platform:netflix",
+                hasCachedRealArt: false
+            ) == nil
+        )
+        // Audio+audio publish + demote flush paths.
+        #expect(
+            DualNowPlayingSurfacePolicy.primaryAllowsDualSecondaryPublish(
+                primaryURL: "https://open.spotify.com/track/abc",
+                primaryTitleHint: .spotify,
+                secondary: .youtubeMusic
+            )
+        )
+        #expect(
+            DualNowPlayingSurfacePolicy.primaryAllowsDualSecondaryPublish(
+                primaryURL: "https://music.youtube.com/watch?v=abc",
+                primaryTitleHint: .youtubeMusic,
+                secondary: .spotify
             )
         )
     }
@@ -5585,11 +6069,13 @@ struct Dynamic_IslandTests {
         #expect(NotchFTUEStore.shouldPlay(defaults: defaults))
         NotchFTUEStore.markSeen(defaults: defaults)
         #expect(!NotchFTUEStore.shouldPlay(defaults: defaults))
+        NotchFTUEStore.reset(defaults: defaults)
+        #expect(NotchFTUEStore.shouldPlay(defaults: defaults))
         defaults.removePersistentDomain(forName: suite)
     }
 
     @Test @MainActor
-    func firstLaunchStartsFTUEGlowOnce() {
+    func firstLaunchStartsFTUESequenceOnce() {
         let suite = "island.ftue.model.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suite) else {
             Issue.record("Could not create FTUE defaults suite")
@@ -5597,15 +6083,104 @@ struct Dynamic_IslandTests {
         }
         defaults.removePersistentDomain(forName: suite)
         let model = NotchViewModel()
+        #expect(model.ftuePlayToken == 0)
         model.noteIslandAppeared(defaults: defaults)
-        #expect(model.isFTUEGlowActive)
+        #expect(model.isFTUESequenceRunning)
+        #expect(model.ftuePhase == .preparing)
+        #expect(model.ftueGlowAmount == 0)
+        #expect(model.ftueContentOpacity == 0)
+        #expect(!model.showsFTUEInteriorContent)
+        #expect(model.ftuePlayToken == 1)
         #expect(defaults.bool(forKey: NotchFTUEMetrics.defaultsKey))
         model.noteIslandAppeared(defaults: defaults)
-        #expect(model.isFTUEGlowActive)
-        model.noteFTUEGlowFinished()
-        #expect(!model.isFTUEGlowActive)
+        #expect(model.ftuePlayToken == 1)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    @Test @MainActor
+    func ftueGlowPreviewDoesNotMarkSeen() {
+        let suite = "island.ftue.preview.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("Could not create FTUE defaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suite)
+        let model = NotchViewModel()
+        model.playFTUEGlowPreview()
+        #expect(model.isFTUESequenceRunning)
+        #expect(model.ftuePhase == .preparing)
+        #expect(model.ftueGlowAmount == 0)
+        #expect(model.ftueContentOpacity == 0)
+        #expect(model.ftuePlayToken == 1)
+        #expect(!defaults.bool(forKey: NotchFTUEMetrics.defaultsKey))
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    @Test @MainActor
+    func ftueReplayIntroResetsAndRestarts() {
+        let suite = "island.ftue.replay.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("Could not create FTUE defaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suite)
+        NotchFTUEStore.markSeen(defaults: defaults)
+        let model = NotchViewModel()
+        model.replayFTUEIntro(defaults: defaults)
+        #expect(model.isFTUESequenceRunning)
+        #expect(model.ftuePhase == .preparing)
+        #expect(model.ftueContentOpacity == 0)
+        #expect(defaults.bool(forKey: NotchFTUEMetrics.defaultsKey))
+        #expect(model.ftuePlayToken == 1)
+        model.replayFTUEIntro(defaults: defaults)
+        #expect(model.ftuePlayToken == 2)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    @Test func ftueGradientUsesSiriStopColors() {
+        #expect(
+            NotchFTUEMetrics.gradientStopHexes
+                == ["#eb4848", "#ea7251", "#f8d87e", "#fefffc", "#96f9fd", "#82ed95"]
+        )
+        #expect(NotchFTUEMetrics.gradientGradientStops.count == 6)
+        let white = NotchFTUEMetrics.gradientGradientStops[3]
+        #expect(white.location == 0.50)
+        #expect(NotchFTUEMetrics.glowPeakOpacity == 1.0)
+        #expect(NotchFTUEMetrics.glowWidthFactor >= 1.0 && NotchFTUEMetrics.glowWidthFactor <= 1.1)
+        #expect(NotchFTUEMetrics.glowFillInsetScale >= 0.94 && NotchFTUEMetrics.glowFillInsetScale < 1.0)
+        #expect(NotchFTUEMetrics.glowCoreBlur < NotchFTUEMetrics.glowOuterBlur)
+        #expect(NotchFTUEMetrics.glowOuterBlur >= 10 && NotchFTUEMetrics.glowOuterBlur <= 16)
+        #expect(NotchFTUEMetrics.glowInDuration >= 1.4 && NotchFTUEMetrics.glowInDuration <= 1.8)
+        #expect(NotchFTUEMetrics.holdDuration >= 0.5 && NotchFTUEMetrics.holdDuration <= 0.7)
+        #expect(NotchFTUEMetrics.morphDuration >= 0.85 && NotchFTUEMetrics.morphDuration <= 1.1)
+        #expect(NotchFTUEMetrics.ghostCursorApproachDuration > 0)
+        #expect(NotchFTUEMetrics.ghostCursorRetreatDuration > 0)
+        #expect(NotchFTUEMetrics.ghostCursorNudgeUpDuration >= 0.8)
+        #expect(NotchFTUEMetrics.ghostCursorNudgeDip >= NotchFTUEMetrics.ghostCursorSize * 0.6)
+        #expect(NotchFTUEMetrics.ghostCursorNudgeDip <= NotchFTUEMetrics.ghostCursorApproachDip)
+        #expect(NotchFTUEMetrics.ghostCursorSymbolName.contains("hand"))
+        let settle = NotchFTUEMetrics.ghostCursorSettleOffset(islandWidth: 280)
+        let away = NotchFTUEMetrics.ghostCursorAwayOffset(islandWidth: 280)
+        // Same X for approach + settle so nudges stay vertical-only on the right ear.
+        #expect(away.width == settle.width)
+        // YouTube/Music cluster (~28pt from trailing) + tip bias.
+        #expect(settle.width == 280 * 0.5 - 28 + NotchFTUEMetrics.ghostCursorTipBiasX)
+        #expect(NotchFTUEMetrics.expandedHoldDuration >= 1.0 && NotchFTUEMetrics.expandedHoldDuration <= 1.5)
+    }
+
+    @Test @MainActor
+    func ftueGhostCursorStartsHidden() {
+        let suite = "island.ftue.ghost.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("Could not create FTUE defaults suite")
+            return
+        }
+        defaults.removePersistentDomain(forName: suite)
+        let model = NotchViewModel()
         model.noteIslandAppeared(defaults: defaults)
-        #expect(!model.isFTUEGlowActive)
+        #expect(model.ftueGhostCursorOpacity == 0)
+        #expect(model.ftueGhostCursorProgress == 0)
+        #expect(model.ftuePhase == .preparing)
         defaults.removePersistentDomain(forName: suite)
     }
 }

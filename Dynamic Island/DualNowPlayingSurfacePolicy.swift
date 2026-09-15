@@ -4,6 +4,10 @@ import Foundation
 /// Pure layout gates for dual Now Playing (expanded split + compact stack).
 /// Kept free of AppKit/SwiftUI so unit tests can pin the compact dual signal
 /// without spinning up MediaRemote or a live window.
+///
+/// Eligible pairs: two distinct browser streaming platforms (video+video,
+/// video+audio, or audio+audio). Same-platform pairs never dual. Native apps
+/// are out of scope — discovery stays browser-tab based.
 enum DualNowPlayingSurfacePolicy {
     /// Both browser sessions are live and no transient surface is stealing the island.
     static func hasLiveDualSessions(
@@ -34,13 +38,43 @@ enum DualNowPlayingSurfacePolicy {
         hasLiveDualSessions && !isExpanded
     }
 
-    /// Watch sits in front (and expanded-left) when MediaRemote holds Music.
+    /// Distinct platforms only. Video+video, video+audio, and audio+audio OK.
+    static func isEligibleDualPair(
+        primary: StreamingPlatform?,
+        secondary: StreamingPlatform?
+    ) -> Bool {
+        guard let primary, let secondary else { return false }
+        return primary != secondary
+    }
+
+    /// Video sits in front (and expanded-left) when MediaRemote holds audio.
+    /// Video+video and audio+audio keep MediaRemote primary on the left (no swap).
     static func swapsTiles(
         hasLiveDualSessions: Bool,
-        primaryIsYouTubeMusic: Bool,
-        secondaryIsYouTubeWatch: Bool
+        primaryKind: StreamingPlatform.MediaKind?,
+        secondaryKind: StreamingPlatform.MediaKind?
     ) -> Bool {
-        hasLiveDualSessions && primaryIsYouTubeMusic && secondaryIsYouTubeWatch
+        hasLiveDualSessions
+            && primaryKind == .audio
+            && secondaryKind == .video
+    }
+
+    /// Dual tiles must never paint a platform logo when real session art exists.
+    /// Prefer the bitmap; only treat `platform:` tokens as logo fallbacks.
+    static func usesPlatformLogoForDualTile(artworkToken: String) -> Bool {
+        artworkToken.hasPrefix("platform:")
+    }
+
+    /// When flushing dual, upgrade a logo/empty tile to cached real art when available.
+    static func preferredDualArtworkToken(
+        currentToken: String,
+        hasCachedRealArt: Bool
+    ) -> String? {
+        guard hasCachedRealArt else { return nil }
+        if currentToken.hasPrefix("platform:") || currentToken.hasPrefix("pending:") {
+            return "held:cached"
+        }
+        return nil
     }
 
     /// Compact stack frame — must be clearly larger than a single `compactArt`
@@ -49,54 +83,45 @@ enum DualNowPlayingSurfacePolicy {
         CGSize(width: art + overlapX, height: art + overlapY)
     }
 
-    /// Hunt fast until a second live tab is found; refresh slowly once dual is up.
+    /// Hunt fast until a second live tab is found. Once dual is up, rediscovery
+    /// can be slower — known-tab playback refresh handles pause/collapse.
     static func secondaryScanInterval(hasSecondarySession: Bool) -> TimeInterval {
-        hasSecondarySession ? 2.5 : 0.15
+        hasSecondarySession ? 1.0 : 0.15
     }
 
-    /// When MediaRemote hands primary from Watch→Music (or Music→Watch) while
+    /// When MediaRemote hands primary between two dual-eligible sessions while
     /// the outgoing session is still live, park it as secondary immediately so
     /// compact dual art does not wait on the AppleScript probe.
     static func shouldDemoteOutgoingToSecondary(
         featureEnabled: Bool,
         outgoingHasMedia: Bool,
         outgoingIsPlaying: Bool,
-        outgoingIsYouTubeWatch: Bool,
-        outgoingIsYouTubeMusic: Bool,
+        outgoing: StreamingPlatform?,
         incomingIsPlaying: Bool,
-        incomingIsYouTubeWatch: Bool,
-        incomingIsYouTubeMusic: Bool
+        incoming: StreamingPlatform?
     ) -> Bool {
         guard featureEnabled else { return false }
         guard outgoingHasMedia, outgoingIsPlaying, incomingIsPlaying else { return false }
-        let watchToMusic = outgoingIsYouTubeWatch && incomingIsYouTubeMusic
-        let musicToWatch = outgoingIsYouTubeMusic && incomingIsYouTubeWatch
-        return watchToMusic || musicToWatch
+        // Incoming becomes primary; outgoing becomes secondary.
+        return isEligibleDualPair(primary: incoming, secondary: outgoing)
     }
 
     /// After a positive secondary seed/apply, ignore empty-hunt clears for this
     /// long. A racing failed probe was wiping Watch right after Music bound
     /// (debug-6ca0b4: seed @6167 → secHas false @6299 → dual only @7730).
-    static func secondaryHoldDuration() -> TimeInterval { 3.0 }
+    static func secondaryHoldDuration() -> TimeInterval { 1.0 }
 
-    /// Keep an opposite-format secondary through a failed hunt (Watch while
-    /// primary is Music, or the reverse). Only a positive pause should clear it.
-    /// `holdActive` alone is enough: MediaRemote often nils primary for a tick
-    /// during rebind (debug-6ca0b4: clear with holdActive true + primaryPlat nil
-    /// after ~6s of healthy dual).
+    /// Keep a dual-eligible *playing* secondary through a failed hunt.
+    /// A positively paused secondary must not stay dual via hold alone.
     static func shouldPreserveSecondaryOnMissedHunt(
-        primaryIsYouTubeWatch: Bool,
-        primaryIsYouTubeMusic: Bool,
-        secondaryIsYouTubeWatch: Bool,
-        secondaryIsYouTubeMusic: Bool,
+        primary: StreamingPlatform?,
+        secondary: StreamingPlatform?,
         secondaryIsPlaying: Bool,
         holdActive: Bool
     ) -> Bool {
-        let secondaryYouTubeFamily = secondaryIsYouTubeWatch || secondaryIsYouTubeMusic
-        if holdActive, secondaryYouTubeFamily { return true }
         guard secondaryIsPlaying else { return false }
-        return (primaryIsYouTubeMusic && secondaryIsYouTubeWatch)
-            || (primaryIsYouTubeWatch && secondaryIsYouTubeMusic)
+        if holdActive, secondary != nil { return true }
+        return isEligibleDualPair(primary: primary, secondary: secondary)
     }
 
     /// MediaRemote titles for YouTube Music almost never contain "YouTube Music",
@@ -131,53 +156,88 @@ enum DualNowPlayingSurfacePolicy {
         return (false, false)
     }
 
-    /// Compact dual must never paint Watch+Watch or Music+Music. Latch the
-    /// opposite secondary, but only publish it once primary is the other format.
-    static func shouldPublishOppositeSecondaryToUI(
-        primaryIsYouTubeWatch: Bool,
-        primaryIsYouTubeMusic: Bool,
-        secondaryIsYouTubeWatch: Bool,
-        secondaryIsYouTubeMusic: Bool
+    /// Compact dual must never paint same-platform pairs.
+    static func shouldPublishDualSecondaryToUI(
+        primary: StreamingPlatform?,
+        secondary: StreamingPlatform?
     ) -> Bool {
-        (primaryIsYouTubeMusic && secondaryIsYouTubeWatch)
-            || (primaryIsYouTubeWatch && secondaryIsYouTubeMusic)
+        isEligibleDualPair(primary: primary, secondary: secondary)
+    }
+
+    /// Resolve primary platform from a bound URL, then title hint.
+    /// Music handoff often keeps a stale `youtube.com/watch` URL for a tick
+    /// while the title/platform hint already says Music — prefer the hint so
+    /// demoted Watch secondary can flush in the same turn.
+    static func resolvedPlatform(
+        url: String,
+        titleHint: StreamingPlatform? = nil
+    ) -> StreamingPlatform? {
+        if titleHint == .youtubeMusic {
+            return .youtubeMusic
+        }
+        if let fromURL = StreamingPlatform.from(url: url) {
+            if fromURL == .youtube,
+               titleHint?.mediaKind == .audio {
+                return titleHint
+            }
+            return fromURL
+        }
+        return titleHint
+    }
+
+    /// True when a latched/demoted secondary may be shown with this primary.
+    /// Accepts URL or title-hint so dual can land in the same main-queue tick.
+    static func primaryAllowsDualSecondaryPublish(
+        primaryURL: String,
+        primaryTitleHint: StreamingPlatform?,
+        secondary: StreamingPlatform?
+    ) -> Bool {
+        let primary = resolvedPlatform(url: primaryURL, titleHint: primaryTitleHint)
+        return shouldPublishDualSecondaryToUI(primary: primary, secondary: secondary)
     }
 
     /// MediaRemote often blips primary to paused while both tabs still play.
-    /// Promote the still-playing opposite secondary unless HTML positively says
-    /// primary is still playing (false MediaRemote pause). `nil` HTML must not
-    /// leave a paused Music tile on screen while Watch keeps playing.
+    /// Promote when HTML positively says primary stopped. `nil` HTML while a
+    /// dual secondary is live is treated as a false MediaRemote pause so the
+    /// overlapping dual stack does not collapse and restore in a loop.
     static func shouldPromoteSecondaryAfterPrimaryPause(
         mediaRemoteSaysPrimaryPlaying: Bool,
-        htmlSaysPrimaryPlaying: Bool?
+        htmlSaysPrimaryPlaying: Bool?,
+        hasLiveDualSecondary: Bool = false
     ) -> Bool {
         guard !mediaRemoteSaysPrimaryPlaying else { return false }
         if htmlSaysPrimaryPlaying == true { return false }
-        return true
+        if htmlSaysPrimaryPlaying == false { return true }
+        // nil HTML: promote only when there is no live dual partner to keep.
+        return !hasLiveDualSecondary
     }
 
-    /// True when a latched/demoted secondary may be shown with this primary
-    /// without painting Watch+Watch or Music+Music. Accepts URL or title-hint
-    /// Music so dual can land in the same main-queue tick as the Music bind.
-    static func primaryAllowsOppositeSecondaryPublish(
-        primaryURL: String,
-        primaryTitleHintIsMusic: Bool,
-        primaryTitleHintIsWatch: Bool,
-        secondaryIsYouTubeWatch: Bool,
-        secondaryIsYouTubeMusic: Bool
+    /// After dual collapses to the still-playing tile, MediaRemote keeps
+    /// advertising the paused opposite (YT Music titles often omit
+    /// "YouTube Music") and can also blip the promoted session to paused.
+    /// Ignore *all* MediaRemote rows during the suppress window so
+    /// pause-music → video (and pause-video → music) stick with real art.
+    static func shouldIgnoreMediaRemoteAfterDualPromote(
+        suppressActive: Bool
     ) -> Bool {
-        let urlMusic = primaryURL.contains("music.youtube.com")
-        let urlWatch = !urlMusic
-            && (primaryURL.contains("youtube.com/watch")
-                || primaryURL.contains("youtu.be/")
-                || primaryURL.contains("youtube.com/shorts"))
-        let primaryMusic = urlMusic || primaryTitleHintIsMusic
-        let primaryWatch = !primaryMusic && (urlWatch || primaryTitleHintIsWatch)
-        return shouldPublishOppositeSecondaryToUI(
-            primaryIsYouTubeWatch: primaryWatch,
-            primaryIsYouTubeMusic: primaryMusic,
-            secondaryIsYouTubeWatch: secondaryIsYouTubeWatch,
-            secondaryIsYouTubeMusic: secondaryIsYouTubeMusic
-        )
+        suppressActive
+    }
+
+    /// Back-compat name used by older call sites / docs.
+    static func shouldIgnorePausedMediaRemoteAfterDualPromote(
+        suppressActive: Bool,
+        remotePlaying: Bool
+    ) -> Bool {
+        _ = remotePlaying
+        return shouldIgnoreMediaRemoteAfterDualPromote(suppressActive: suppressActive)
+    }
+
+    /// Closing the primary dual partner (e.g. YT Music tab) must not wipe the
+    /// island to idle when the other session's tab is still open — even paused.
+    /// Compact single layout (art + waveform) stays for that remaining tab.
+    static func shouldAdoptSecondaryWhenPrimaryTabClosed(
+        secondaryHasMedia: Bool
+    ) -> Bool {
+        secondaryHasMedia
     }
 }

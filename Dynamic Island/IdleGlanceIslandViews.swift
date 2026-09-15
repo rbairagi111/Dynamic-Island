@@ -94,6 +94,8 @@ struct IdleGlanceContent: View {
             HStack(spacing: Self.compactMarkSpacing) {
                 ForEach(compactDestinations, id: \.self) { destination in
                     destinationMark(destination, size: Self.compactMarkSize)
+                        .help(destination.displayName)
+                        .accessibilityLabel(destination.displayName)
                 }
             }
             .padding(.trailing, Self.compactTrailingPad)

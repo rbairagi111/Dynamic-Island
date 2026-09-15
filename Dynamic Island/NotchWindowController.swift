@@ -909,6 +909,32 @@ final class NotchWindowController: NSWindowController {
             }
             .store(in: &cancellables)
 
+        // F7–F9 must rebind whenever media appears/disappears — not only when
+        // the pointer moves over the island (that left play/pause dead until hover).
+        Publishers.CombineLatest3(
+            viewModel.$hasMedia,
+            viewModel.$isExpanded,
+            viewModel.$persistentState
+        )
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _, _, _ in
+                guard let self else { return }
+                let over = self.lastPointerScreenPoint.map { point in
+                    guard let window = self.window,
+                          let hosting = window.contentView else { return false }
+                    let inScreen = self.hoverIslandScreenRect(in: hosting, window: window, pad: 0)
+                    let radius = IslandSurfacePolicy.islandHoverRadius(islandSize: inScreen.size)
+                    return IslandSurfacePolicy.pointerIsOverIsland(
+                        point: point,
+                        island: inScreen,
+                        previous: nil,
+                        radius: radius
+                    )
+                } ?? false
+                self.bindKeyboardTransport(pointerOverIsland: over)
+            }
+            .store(in: &cancellables)
+
         AppSettings.shared.$idleGlanceEnabled
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -983,6 +1009,27 @@ final class NotchWindowController: NSWindowController {
                 guard let self else { return }
                 self.revealForOverlay()
                 NSLog("[NotchWindow] overlay activated; window elevated")
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .previewFTUEGlow)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.revealForOverlay()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .ftueSequenceStarted)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.revealForOverlay()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .replayFTUEIntro)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.revealForOverlay()
             }
             .store(in: &cancellables)
 
@@ -1256,7 +1303,9 @@ final class NotchWindowController: NSWindowController {
                 window.invalidateCursorRects(for: hosting)
                 NSCursor.arrow.set()
             }
-            if !viewModel.isOverlayActive, !viewModel.isExpanded {
+            if !viewModel.isFTUESequenceRunning,
+               !viewModel.isOverlayActive,
+               !viewModel.isExpanded {
                 viewModel.expand()
             }
             if needsLiveActivityElevation {
@@ -1281,13 +1330,16 @@ final class NotchWindowController: NSWindowController {
 
     /// Collapse immediately on pointer exit — same path for idle and media.
     private func requestCollapseAfterPointerExit() {
+        guard !viewModel.isFTUESequenceRunning else { return }
         guard viewModel.isExpanded, !viewModel.isOverlayActive else { return }
         viewModel.collapse()
     }
 
     private func bindKeyboardTransport(pointerOverIsland: Bool) {
         VolumeBrightnessMonitor.shared.updateKeyboardBinding(
-            mediaKeys: viewModel.hasMedia,
+            mediaKeys: IslandSurfacePolicy.shouldCaptureHardwareMediaKeys(
+                hasMedia: viewModel.hasMedia
+            ),
             arrowKeys: IslandSurfacePolicy.shouldBindArrowKeysToIsland(
                 isExpanded: viewModel.isExpanded,
                 hasMedia: viewModel.hasMedia,

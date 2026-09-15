@@ -62,8 +62,8 @@ struct CompactDualNowPlayingArtwork: View {
         cornerRadius: CGFloat
     ) -> some View {
         let resolved = image
-            ?? platform.flatMap { StreamingPlatformArtwork.image(for: $0) }
-        let fitLogo = usesPlatformLogo || (image == nil && platform != nil)
+            ?? (usesPlatformLogo ? platform.flatMap { StreamingPlatformArtwork.image(for: $0) } : nil)
+        let fitLogo = usesPlatformLogo
 
         return Group {
             if let resolved {

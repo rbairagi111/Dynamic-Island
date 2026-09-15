@@ -19,7 +19,7 @@ struct LevelHUDEvent: Equatable {
 
 private let nxSysDefinedEvent: UInt32 = 14
 private let nxAuxControlSubtype: Int16 = 8
-private let nxKeyDownState = 0x0A
+private let nxKeyUpState = 0x0B
 private let volumeStep: Float = 1.0 / 16.0
 private let brightnessStep: Float = 1.0 / 16.0
 
@@ -103,9 +103,20 @@ final class VolumeBrightnessMonitor {
 
     func updateKeyboardBinding(mediaKeys: Bool, arrowKeys: Bool) {
         bindingLock.lock()
+        let needsTap = mediaKeys || arrowKeys
         captureMediaKeys = mediaKeys
         captureArrowKeys = arrowKeys
         bindingLock.unlock()
+        // Re-enable a timed-out tap as soon as we need F7–F9 again — otherwise
+        // play/pause looks dead until the next poll cycle.
+        guard needsTap else { return }
+        if Thread.isMainThread {
+            installMediaKeyTap()
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.installMediaKeyTap()
+            }
+        }
     }
 
     private func keyboardBinding() -> (mediaKeys: Bool, arrowKeys: Bool) {
@@ -154,6 +165,22 @@ final class VolumeBrightnessMonitor {
                 return nil
             }
             let flags = event.flags
+            // F7–F9 as standard function keys (System Settings) — macOS will
+            // not play/pause those; the island must. Dedicated NX media keys
+            // are never swallowed (passed through to MediaRemote below).
+            if let transport = IslandKeyboardTransport.fromCGMediaFunctionKeyCode(
+                code,
+                flags: flags
+            ) {
+                guard keyboardBinding().mediaKeys else {
+                    return Unmanaged.passUnretained(event)
+                }
+                if type == .keyDown,
+                   event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
+                    emitTransport(transport)
+                }
+                return nil
+            }
             if let transport = IslandKeyboardTransport.fromCGKeyCode(code, flags: flags) {
                 let binding = keyboardBinding()
                 guard binding.arrowKeys else {
@@ -177,19 +204,16 @@ final class VolumeBrightnessMonitor {
 
         let keyCode = Int64((nsEvent.data1 & 0xFFFF0000) >> 16)
         let keyState = (nsEvent.data1 & 0x0000FF00) >> 8
-        if let transport = IslandKeyboardTransport.fromNXKeyCode(keyCode) {
-            guard keyboardBinding().mediaKeys else {
-                return Unmanaged.passUnretained(event)
-            }
-            if keyState == nxKeyDownState {
-                emitTransport(transport)
-            }
-            return nil
+        // NX play/pause/next/prev: never swallow. Capturing these and then
+        // missing YouTube JS left the key dead for both the island and macOS.
+        // System MediaRemote handles them; the island UI follows the adapter.
+        if IslandKeyboardTransport.fromNXKeyCode(keyCode) != nil {
+            return Unmanaged.passUnretained(event)
         }
         guard let key = RedirectedMediaKey.fromNXKeyCode(keyCode) else {
             return Unmanaged.passUnretained(event)
         }
-        if keyState != nxKeyDownState {
+        if keyState == nxKeyUpState {
             return nil
         }
         if !perform(key), key == .brightnessUp || key == .brightnessDown {

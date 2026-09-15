@@ -11,10 +11,11 @@ enum IslandFeatures {
     /// Set to `true` to restore detection, island UI, native-stop hiding, and Settings previews.
     static let screenRecordingEnabled = false
 
-    /// Side-by-side Now Playing tiles when a second browser tab (typically
-    /// YouTube video + YouTube Music) is playing at the same time as the
-    /// primary MediaRemote session. Additive: the primary snapshot pipeline
-    /// (waveform tint, artwork, seek, chat banners, lock screen) is untouched.
+    /// Side-by-side Now Playing tiles when a second browser tab is playing
+    /// at the same time as the primary MediaRemote session (any two distinct
+    /// streaming platforms — video and/or audio). Additive: the primary
+    /// snapshot pipeline (waveform tint, artwork, seek, chat banners, lock
+    /// screen) is untouched.
     static let dualNowPlayingEnabled = true
 }
 

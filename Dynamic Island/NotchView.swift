@@ -47,26 +47,23 @@ struct NotchView: View {
         model.isScreenRecording && !model.isExpanded && !model.isOverlayActive
     }
 
+    /// `IslandUStroke` + drop shadow — depth rim on the normal island, but a
+    /// visible dark outline against the FTUE glow. Off for the entire sequence.
+    private var showsFTUEChrome: Bool {
+        if model.isFTUESequenceRunning { return false }
+        if model.ftueGlowAmount > 0.001 { return false }
+        return true
+    }
+
     /// Compact Now Playing + recording: artwork and waveform stay together on
     /// the leading edge; the recording pulse stays on the trailing edge.
     private var showsCompactRecordingMedia: Bool {
         !model.isExpanded && model.isScreenRecording && model.persistentState == .musicPlaying
     }
 
-    /// YouTube Music metadata is already on the view model in compact; watch
-    /// compact stays art + waveform only. Hidden when dual stack is showing so
-    /// the overlapping thumbnails stay the clear dual signal.
-    private var showsCompactMusicText: Bool {
-        !model.isExpanded
-            && !model.isOverlayActive
-            && model.hasMedia
-            && model.mediaPlatform == .youtubeMusic
-            && !model.showsCompactDualNowPlaying
-    }
-
     private var compactRecordingMediaSpacing: CGFloat {
         if model.isExpanded { return 12 }
-        if showsCompactRecordingMedia || showsCompactMusicText { return 8 }
+        if showsCompactRecordingMedia { return 8 }
         return 0
     }
 
@@ -92,51 +89,87 @@ struct NotchView: View {
             .overlay(alignment: .top) {
                 islandCard
             }
+            .overlay(alignment: .top) {
+                if model.ftueGhostCursorOpacity > 0.001 {
+                    // Compact width + overlay tooltip — hand stays on YouTube/Music ear
+                    // whether the island is collapsed or expanded.
+                    NotchFTUEGhostCursor(
+                        progress: model.ftueGhostCursorProgress,
+                        opacity: model.ftueGhostCursorOpacity,
+                        showsLabel: model.showsFTUETooltip && !model.isExpanded,
+                        islandWidth: IslandMetrics.idleGlanceCompactWidth(notchWidth: model.notchWidth)
+                    )
+                    .padding(.top, islandTopOffset + model.notchHeight * 0.38)
+                    .allowsHitTesting(false)
+                }
+            }
     }
 
     private var islandCard: some View {
         ZStack(alignment: .top) {
+            // 1) Glow UNDER the black pill — only the blurred halo bleeds out.
+            // Mounted during `.preparing` at amount 0 so 0→1 can ease (not pop).
+            if model.isFTUESequenceRunning || model.ftueGlowAmount > 0.001 {
+                NotchFTUESiriGlow(
+                    amount: model.ftueGlowAmount,
+                    islandWidth: shapeWidth,
+                    islandHeight: shapeHeight,
+                    bottomLeadingRadius: bottomRadius,
+                    bottomTrailingRadius: bottomRadius
+                )
+                .zIndex(0)
+                .allowsHitTesting(false)
+            }
+
+            // 2) Black notch pill + interior content (content gated until morph).
             ZStack(alignment: .top) {
                 islandShape
                     .fill(Color.black)
 
-                if model.isOverlayActive {
-                    overlayContent
-                } else if model.showsMediaRecordingDual {
-                    mediaRecordingDual
-                } else if model.showsDualNowPlaying {
-                    dualNowPlayingContent
-                } else if model.showsRecordingExpanded {
-                    ScreenRecordingIsland(
-                        elapsed: model.recordingElapsed,
-                        onStop: model.stopScreenRecording
-                    )
-                    .padding(.top, IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
-                    .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
-                } else if model.showsCompactLiveActivity {
-                    CompactLiveActivityRow(
-                        isRecording: model.isScreenRecording,
-                        isSelectingRecord: model.isSelectingScreenToRecord
-                    )
-                    .frame(width: shapeWidth, height: shapeHeight)
-                } else if model.showsIdleGlance {
-                    IdleGlanceContent(
-                        isExpanded: model.isExpanded,
-                        notchWidth: model.notchWidth,
-                        notchHeight: model.notchHeight,
-                        weather: model.idleWeather,
-                        destinations: model.idleDestinations
-                    )
-                    .frame(width: shapeWidth, height: shapeHeight)
-                } else {
-                    nowPlayingContent
+                if model.showsFTUEInteriorContent {
+                    Group {
+                        if model.isOverlayActive {
+                            overlayContent
+                        } else if model.showsMediaRecordingDual {
+                            mediaRecordingDual
+                        } else if model.showsDualNowPlaying {
+                            dualNowPlayingContent
+                        } else if model.showsRecordingExpanded {
+                            ScreenRecordingIsland(
+                                elapsed: model.recordingElapsed,
+                                onStop: model.stopScreenRecording
+                            )
+                            .padding(.top, IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
+                            .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+                        } else if model.showsCompactLiveActivity {
+                            CompactLiveActivityRow(
+                                isRecording: model.isScreenRecording,
+                                isSelectingRecord: model.isSelectingScreenToRecord
+                            )
+                            .frame(width: shapeWidth, height: shapeHeight)
+                        } else if model.showsIdleGlance {
+                            IdleGlanceContent(
+                                isExpanded: model.isExpanded,
+                                notchWidth: model.notchWidth,
+                                notchHeight: model.notchHeight,
+                                weather: model.idleWeather,
+                                destinations: model.idleDestinations
+                            )
+                            .frame(width: shapeWidth, height: shapeHeight)
+                        } else {
+                            nowPlayingContent
+                        }
+                    }
+                    .opacity(model.ftueContentOpacity)
                 }
             }
             .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
             .clipShape(islandShape)
+            .zIndex(1)
 
             // Drawn outside clipShape so the hairline isn’t cropped to 0.5pt on black.
-            if showsRecordingCompactGlow {
+            // Hidden during FTUE bloom — a crisp U-stroke reads as a hard panel border.
+            if showsFTUEChrome, showsRecordingCompactGlow {
                 // The active recording state gets both a soft light and a
                 // crisp red rim. Keeping them separate prevents the glow from
                 // washing out the thin silhouette shown in the reference.
@@ -150,28 +183,35 @@ struct NotchView: View {
                 )
                 .blur(radius: 1.2)
                 .allowsHitTesting(false)
+                .zIndex(2)
             }
 
-            IslandUStroke(
-                bottomLeadingRadius: bottomRadius,
-                bottomTrailingRadius: bottomRadius
-            )
-            .stroke(
-                islandStrokeColor,
-                lineWidth: showsRecordingCompactStroke
-                    ? IslandMetrics.recordingStrokeWidth
-                    : IslandMetrics.islandStrokeWidth
-            )
-            .allowsHitTesting(false)
+            if showsFTUEChrome {
+                IslandUStroke(
+                    bottomLeadingRadius: bottomRadius,
+                    bottomTrailingRadius: bottomRadius
+                )
+                .stroke(
+                    islandStrokeColor,
+                    lineWidth: showsRecordingCompactStroke
+                        ? IslandMetrics.recordingStrokeWidth
+                        : IslandMetrics.islandStrokeWidth
+                )
+                .allowsHitTesting(false)
+                .zIndex(2)
+            }
         }
+        // Layout size stays the pill; glow may paint outside (no clip).
         .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
         .background {
-            islandShape
-                .fill(Color.black)
-                .notchShadow(
-                    compact: !model.isExpanded && !model.isOverlayActive,
-                    expanded: model.isExpanded || model.isOverlayActive
-                )
+            if showsFTUEChrome {
+                islandShape
+                    .fill(Color.black)
+                    .notchShadow(
+                        compact: !model.isExpanded && !model.isOverlayActive,
+                        expanded: model.isExpanded || model.isOverlayActive
+                    )
+            }
         }
         .padding(.top, islandTopOffset)
         .contentShape(islandShape)
@@ -191,12 +231,8 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.showsShelfRow)
         .animation(IslandMetrics.motion, value: model.shelfItems.count)
         .animation(IslandMetrics.motion, value: model.showsCompactDualNowPlaying)
-        .notchFTUEGlow(
-            isActive: model.isFTUEGlowActive,
-            bottomLeadingRadius: bottomRadius,
-            bottomTrailingRadius: bottomRadius,
-            onFinished: model.noteFTUEGlowFinished
-        )
+        .animation(NotchFTUEMetrics.tooltipAnimation, value: model.showsFTUETooltip)
+        .animation(NotchFTUEMetrics.tooltipAnimation, value: model.isExpanded)
         .onAppear {
             model.noteIslandAppeared()
         }
@@ -241,20 +277,6 @@ struct NotchView: View {
                                 .allowsHitTesting(false)
                         }
                         .transition(IslandMetrics.contentReveal)
-                    } else if showsCompactMusicText {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(model.songTitle)
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                                .allowsHitTesting(false)
-                            Text(model.artistName)
-                                .font(.system(size: 9))
-                                .foregroundStyle(.white.opacity(0.6))
-                                .lineLimit(1)
-                                .allowsHitTesting(false)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     if showsCompactRecordingMedia {
@@ -266,7 +288,7 @@ struct NotchView: View {
                         .matchedGeometryEffect(id: "waveform", in: island)
                     }
 
-                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia || showsCompactMusicText ? 8 : 0)
+                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia ? 8 : 0)
 
                     if !showsCompactRecordingMedia {
                         waveformIndicator(
