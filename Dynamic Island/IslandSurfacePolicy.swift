@@ -116,6 +116,14 @@ enum IslandSurfacePolicy {
         isTrusted && !alreadyAttempted && !previousCreateFailed
     }
 
+    /// When System Settings uses F7–F9 as *standard function keys*, those
+    /// CG keycodes must be captured whenever Now Playing is showing — macOS
+    /// will not treat them as media keys. Dedicated NX media keys are never
+    /// swallowed (see `VolumeBrightnessMonitor`); they go to MediaRemote.
+    static func shouldCaptureHardwareMediaKeys(hasMedia: Bool) -> Bool {
+        hasMedia
+    }
+
     /// Cursor arrows / space drive island transport only while the user is
     /// actually on the expanded player. F7–F9 media keys are separate.
     static func shouldBindArrowKeysToIsland(

@@ -120,6 +120,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 NotificationCenter.default.post(name: .previewShelfHold, object: nil)
             }
         }
+
+        if CommandLine.arguments.contains("--replay-ftue") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                NotificationCenter.default.post(name: .replayFTUEIntro, object: nil)
+            }
+        }
     }
 
     private func acquireSingleInstanceLock() -> Bool {

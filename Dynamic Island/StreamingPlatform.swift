@@ -126,8 +126,10 @@ enum BrowserMediaControlPolicy {
 }
 
 /// Now Playing `isPlaying` for the waveform and transport UI.
-/// The bars are simulated from this flag, not from real audio — a stale
-/// "playing" snapshot is why they keep dancing after a browser video pauses.
+/// When System Audio Recording is allowed, bars follow live mix loudness /
+/// transients. Otherwise they are simulated from this flag. A stale "playing"
+/// snapshot is why they keep dancing after a browser video pauses — HTML
+/// probes correct that.
 enum PlaybackPlayingPolicy {
     /// Trust MediaRemote's boolean when it is present. `playbackRate` is only
     /// a fallback; a paused session often still reports rate 1.0.
@@ -140,6 +142,29 @@ enum PlaybackPlayingPolicy {
     /// never got the pause event (common on OTT / scrape players).
     static func resolvedPlaying(remote: Bool, htmlOverride: Bool?) -> Bool {
         htmlOverride ?? remote
+    }
+
+    /// Browser sessions stay on the island while playing **or paused**, as long
+    /// as they are bound to a real playback surface (watch / shorts / …).
+    /// Browsing YouTube home with no watch URL must not keep a stale thumbnail.
+    /// Native Music / Spotify may keep any paused session.
+    static func islandHasMedia(
+        isBrowser: Bool,
+        payloadHasMedia: Bool,
+        isPlaying: Bool,
+        sourceURL: String = ""
+    ) -> Bool {
+        if !isBrowser {
+            return payloadHasMedia || isPlaying
+        }
+        guard payloadHasMedia || isPlaying else { return false }
+        if isPlaying { return true }
+        let url = sourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !url.isEmpty, let platform = StreamingPlatform.from(url: url) else {
+            // Session metadata without a resolved tab URL — keep paused tile.
+            return payloadHasMedia
+        }
+        return BrowserMediaNavigator.isLikelyPlaybackURL(url, platform: platform)
     }
 }
 
@@ -163,6 +188,23 @@ enum StreamingPlatform: String, CaseIterable, Equatable {
     case soundcloud
     case vimeo
     case plex
+
+    /// Video (mp4-like) vs audio (mp3-like) for dual Now Playing pairing.
+    enum MediaKind: Equatable {
+        case video
+        case audio
+    }
+
+    var mediaKind: MediaKind {
+        switch self {
+        case .youtubeMusic, .spotify, .appleMusic, .jioSaavn, .soundcloud:
+            return .audio
+        case .primeVideo, .netflix, .jioHotstar, .disneyPlus, .youtube,
+             .appleTV, .hulu, .max, .crunchyroll, .twitch, .sonyliv, .zee5,
+             .vimeo, .plex:
+            return .video
+        }
+    }
 
     var displayName: String {
         switch self {

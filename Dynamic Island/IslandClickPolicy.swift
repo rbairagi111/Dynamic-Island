@@ -20,6 +20,11 @@ enum IslandClickPolicy {
         case expandRecording
         /// Behavior-ranked idle destination icon.
         case openIdleDestination(Int)
+        /// Dual Now Playing tiles — second column routes to the secondary reader.
+        case secondaryRevealNowPlaying
+        case secondaryPlayPause
+        case secondarySkipBack
+        case secondarySkipForward
     }
 
     /// Bottom band reserved for play/pause, scrubbing, and the file shelf.
@@ -44,7 +49,9 @@ enum IslandClickPolicy {
         showsShelf: Bool = false,
         isScreenRecording: Bool = false,
         showsIdleGlance: Bool = false,
-        idleDestinationCount: Int = 0
+        idleDestinationCount: Int = 0,
+        showsDualNowPlaying: Bool = false,
+        dualNowPlayingSwapsTiles: Bool = false
     ) -> Action {
         let bounds = CGRect(origin: .zero, size: islandSize)
         guard bounds.width > 1, bounds.height > 1, bounds.contains(pointFromTopLeft) else {
@@ -123,6 +130,20 @@ enum IslandClickPolicy {
 
         if isScreenRecording, isExpanded {
             return .passthrough
+        }
+
+        // Dual Now Playing (two tiles side-by-side) — split island in half,
+        // map x-thirds inside each column to skip-back / play-pause / skip-fwd.
+        // Left column routes to primary transport, right column to secondary —
+        // unless tiles were visually swapped (Watch left / Music right).
+        if showsDualNowPlaying, isExpanded {
+            return dualNowPlayingAction(
+                point: pointFromTopLeft,
+                islandSize: islandSize,
+                notchHeight: notchHeight,
+                hasMedia: hasMedia,
+                swapsTiles: dualNowPlayingSwapsTiles
+            )
         }
 
         if showsIdleGlance, !hasMedia, idleDestinationCount > 0 {
@@ -245,6 +266,74 @@ enum IslandClickPolicy {
             destinationCount: destinationCount,
             isExpanded: false
         )
+    }
+
+    /// Two Now Playing tiles side-by-side. The bottom `dualActionRowHeight`
+    /// slice of each column is the transport band (skipBack | play | skipFwd
+    /// as x-thirds). Everything above it (artwork / title / waveform) reveals
+    /// that tile's tab.
+    ///
+    /// Column math mirrors `NotchView.dualNowPlayingContent`: outer pad, 1pt
+    /// divider, equal halves, and `chatOverlayColumnSpacing / 2` inset toward
+    /// the divider so transport thirds track the visible button row.
+    static func dualNowPlayingAction(
+        point: CGPoint,
+        islandSize: CGSize,
+        notchHeight: CGFloat,
+        hasMedia: Bool,
+        swapsTiles: Bool = false
+    ) -> Action {
+        guard hasMedia else { return .passthrough }
+        let pad = IslandMetrics.chatOverlayHorizontalPadding
+        let divider: CGFloat = 1
+        let columnGap = IslandMetrics.chatOverlayColumnSpacing / 2
+        let innerWidth = max(0, islandSize.width - pad * 2)
+        let columnWidth = max((innerWidth - divider) / 2, 1)
+        let primaryLeft = pad
+        let primaryRight = pad + columnWidth
+        let secondaryLeft = pad + columnWidth + divider
+        let secondaryRight = secondaryLeft + columnWidth
+
+        let contentTop = IslandMetrics.expandedContentTopInset(notchHeight: notchHeight)
+        let bottomPad = IslandMetrics.chatOverlayBottomPadding
+        let transportBottom = islandSize.height - bottomPad
+        let transportTop = transportBottom - IslandMetrics.dualActionRowHeight
+
+        guard point.y >= contentTop, point.y <= transportBottom else {
+            return .passthrough
+        }
+
+        let leftIsPrimary = !swapsTiles
+        let isPrimary: Bool
+        let hitLeft: CGFloat
+        let hitWidth: CGFloat
+        if point.x >= primaryLeft, point.x < primaryRight {
+            isPrimary = leftIsPrimary
+            // Left column: trailing gap before divider is not part of buttons.
+            hitLeft = primaryLeft
+            hitWidth = max(columnWidth - columnGap, 1)
+        } else if point.x >= secondaryLeft, point.x <= secondaryRight {
+            isPrimary = !leftIsPrimary
+            // Right column: leading gap after divider is not part of buttons.
+            hitLeft = secondaryLeft + columnGap
+            hitWidth = max(columnWidth - columnGap, 1)
+        } else {
+            return .passthrough
+        }
+
+        if point.y < transportTop {
+            return isPrimary ? .revealNowPlaying : .secondaryRevealNowPlaying
+        }
+        let rel = point.x - hitLeft
+        guard rel >= 0, rel <= hitWidth else { return .passthrough }
+        let third = max(hitWidth / 3, 1)
+        if rel < third {
+            return isPrimary ? .skipBack : .secondarySkipBack
+        }
+        if rel < third * 2 {
+            return isPrimary ? .playPause : .secondaryPlayPause
+        }
+        return isPrimary ? .skipForward : .secondarySkipForward
     }
 
     private static func musicAction(

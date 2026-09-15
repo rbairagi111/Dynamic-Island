@@ -7,6 +7,18 @@ struct SettingsView: View {
     var body: some View {
         ScrollView {
             Form {
+            Section("First launch") {
+                Text("On first launch the notch plays a short intro: Siri-style glow, then a pointing-hand hover hint that stays until you hover the notch. Watch the notch (not this window).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Replay Intro") {
+                    NotificationCenter.default.post(name: .replayFTUEIntro, object: nil)
+                }
+                Button("Preview glow only") {
+                    NotificationCenter.default.post(name: .previewFTUEGlow, object: nil)
+                }
+            }
+
             Section("Idle glance") {
                 Text("When nothing else is on the island, show local weather/AQI on the left and your most-used YouTube / Claude / ChatGPT / Gemini destinations on the right. Playing media, chat banners, and recording always take over.")
                     .font(.caption)

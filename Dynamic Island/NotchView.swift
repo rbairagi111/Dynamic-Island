@@ -47,24 +47,23 @@ struct NotchView: View {
         model.isScreenRecording && !model.isExpanded && !model.isOverlayActive
     }
 
+    /// `IslandUStroke` + drop shadow — depth rim on the normal island, but a
+    /// visible dark outline against the FTUE glow. Off for the entire sequence.
+    private var showsFTUEChrome: Bool {
+        if model.isFTUESequenceRunning { return false }
+        if model.ftueGlowAmount > 0.001 { return false }
+        return true
+    }
+
     /// Compact Now Playing + recording: artwork and waveform stay together on
     /// the leading edge; the recording pulse stays on the trailing edge.
     private var showsCompactRecordingMedia: Bool {
         !model.isExpanded && model.isScreenRecording && model.persistentState == .musicPlaying
     }
 
-    /// YouTube Music metadata is already on the view model in compact; watch
-    /// compact stays art + waveform only.
-    private var showsCompactMusicText: Bool {
-        !model.isExpanded
-            && !model.isOverlayActive
-            && model.hasMedia
-            && model.mediaPlatform == .youtubeMusic
-    }
-
     private var compactRecordingMediaSpacing: CGFloat {
         if model.isExpanded { return 12 }
-        if showsCompactRecordingMedia || showsCompactMusicText { return 8 }
+        if showsCompactRecordingMedia { return 8 }
         return 0
     }
 
@@ -90,49 +89,87 @@ struct NotchView: View {
             .overlay(alignment: .top) {
                 islandCard
             }
+            .overlay(alignment: .top) {
+                if model.ftueGhostCursorOpacity > 0.001 {
+                    // Compact width + overlay tooltip — hand stays on YouTube/Music ear
+                    // whether the island is collapsed or expanded.
+                    NotchFTUEGhostCursor(
+                        progress: model.ftueGhostCursorProgress,
+                        opacity: model.ftueGhostCursorOpacity,
+                        showsLabel: model.showsFTUETooltip && !model.isExpanded,
+                        islandWidth: IslandMetrics.idleGlanceCompactWidth(notchWidth: model.notchWidth)
+                    )
+                    .padding(.top, islandTopOffset + model.notchHeight * 0.38)
+                    .allowsHitTesting(false)
+                }
+            }
     }
 
     private var islandCard: some View {
         ZStack(alignment: .top) {
+            // 1) Glow UNDER the black pill — only the blurred halo bleeds out.
+            // Mounted during `.preparing` at amount 0 so 0→1 can ease (not pop).
+            if model.isFTUESequenceRunning || model.ftueGlowAmount > 0.001 {
+                NotchFTUESiriGlow(
+                    amount: model.ftueGlowAmount,
+                    islandWidth: shapeWidth,
+                    islandHeight: shapeHeight,
+                    bottomLeadingRadius: bottomRadius,
+                    bottomTrailingRadius: bottomRadius
+                )
+                .zIndex(0)
+                .allowsHitTesting(false)
+            }
+
+            // 2) Black notch pill + interior content (content gated until morph).
             ZStack(alignment: .top) {
                 islandShape
                     .fill(Color.black)
 
-                if model.isOverlayActive {
-                    overlayContent
-                } else if model.showsMediaRecordingDual {
-                    mediaRecordingDual
-                } else if model.showsRecordingExpanded {
-                    ScreenRecordingIsland(
-                        elapsed: model.recordingElapsed,
-                        onStop: model.stopScreenRecording
-                    )
-                    .padding(.top, IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
-                    .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
-                } else if model.showsCompactLiveActivity {
-                    CompactLiveActivityRow(
-                        isRecording: model.isScreenRecording,
-                        isSelectingRecord: model.isSelectingScreenToRecord
-                    )
-                    .frame(width: shapeWidth, height: shapeHeight)
-                } else if model.showsIdleGlance {
-                    IdleGlanceContent(
-                        isExpanded: model.isExpanded,
-                        notchWidth: model.notchWidth,
-                        notchHeight: model.notchHeight,
-                        weather: model.idleWeather,
-                        destinations: model.idleDestinations
-                    )
-                    .frame(width: shapeWidth, height: shapeHeight)
-                } else {
-                    nowPlayingContent
+                if model.showsFTUEInteriorContent {
+                    Group {
+                        if model.isOverlayActive {
+                            overlayContent
+                        } else if model.showsMediaRecordingDual {
+                            mediaRecordingDual
+                        } else if model.showsDualNowPlaying {
+                            dualNowPlayingContent
+                        } else if model.showsRecordingExpanded {
+                            ScreenRecordingIsland(
+                                elapsed: model.recordingElapsed,
+                                onStop: model.stopScreenRecording
+                            )
+                            .padding(.top, IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
+                            .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+                        } else if model.showsCompactLiveActivity {
+                            CompactLiveActivityRow(
+                                isRecording: model.isScreenRecording,
+                                isSelectingRecord: model.isSelectingScreenToRecord
+                            )
+                            .frame(width: shapeWidth, height: shapeHeight)
+                        } else if model.showsIdleGlance {
+                            IdleGlanceContent(
+                                isExpanded: model.isExpanded,
+                                notchWidth: model.notchWidth,
+                                notchHeight: model.notchHeight,
+                                weather: model.idleWeather,
+                                destinations: model.idleDestinations
+                            )
+                            .frame(width: shapeWidth, height: shapeHeight)
+                        } else {
+                            nowPlayingContent
+                        }
+                    }
+                    .opacity(model.ftueContentOpacity)
                 }
             }
             .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
             .clipShape(islandShape)
+            .zIndex(1)
 
             // Drawn outside clipShape so the hairline isn’t cropped to 0.5pt on black.
-            if showsRecordingCompactGlow {
+            // Hidden during FTUE bloom — a crisp U-stroke reads as a hard panel border.
+            if showsFTUEChrome, showsRecordingCompactGlow {
                 // The active recording state gets both a soft light and a
                 // crisp red rim. Keeping them separate prevents the glow from
                 // washing out the thin silhouette shown in the reference.
@@ -146,28 +183,35 @@ struct NotchView: View {
                 )
                 .blur(radius: 1.2)
                 .allowsHitTesting(false)
+                .zIndex(2)
             }
 
-            IslandUStroke(
-                bottomLeadingRadius: bottomRadius,
-                bottomTrailingRadius: bottomRadius
-            )
-            .stroke(
-                islandStrokeColor,
-                lineWidth: showsRecordingCompactStroke
-                    ? IslandMetrics.recordingStrokeWidth
-                    : IslandMetrics.islandStrokeWidth
-            )
-            .allowsHitTesting(false)
+            if showsFTUEChrome {
+                IslandUStroke(
+                    bottomLeadingRadius: bottomRadius,
+                    bottomTrailingRadius: bottomRadius
+                )
+                .stroke(
+                    islandStrokeColor,
+                    lineWidth: showsRecordingCompactStroke
+                        ? IslandMetrics.recordingStrokeWidth
+                        : IslandMetrics.islandStrokeWidth
+                )
+                .allowsHitTesting(false)
+                .zIndex(2)
+            }
         }
+        // Layout size stays the pill; glow may paint outside (no clip).
         .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
         .background {
-            islandShape
-                .fill(Color.black)
-                .notchShadow(
-                    compact: !model.isExpanded && !model.isOverlayActive,
-                    expanded: model.isExpanded || model.isOverlayActive
-                )
+            if showsFTUEChrome {
+                islandShape
+                    .fill(Color.black)
+                    .notchShadow(
+                        compact: !model.isExpanded && !model.isOverlayActive,
+                        expanded: model.isExpanded || model.isOverlayActive
+                    )
+            }
         }
         .padding(.top, islandTopOffset)
         .contentShape(islandShape)
@@ -186,12 +230,9 @@ struct NotchView: View {
         .animation(IslandMetrics.motion, value: model.persistentState)
         .animation(IslandMetrics.motion, value: model.showsShelfRow)
         .animation(IslandMetrics.motion, value: model.shelfItems.count)
-        .notchFTUEGlow(
-            isActive: model.isFTUEGlowActive,
-            bottomLeadingRadius: bottomRadius,
-            bottomTrailingRadius: bottomRadius,
-            onFinished: model.noteFTUEGlowFinished
-        )
+        .animation(IslandMetrics.motion, value: model.showsCompactDualNowPlaying)
+        .animation(NotchFTUEMetrics.tooltipAnimation, value: model.showsFTUETooltip)
+        .animation(NotchFTUEMetrics.tooltipAnimation, value: model.isExpanded)
         .onAppear {
             model.noteIslandAppeared()
         }
@@ -208,12 +249,19 @@ struct NotchView: View {
 
             VStack(spacing: model.isExpanded ? 12 : 0) {
                 HStack(alignment: .center, spacing: compactRecordingMediaSpacing) {
-                    albumArtwork(
-                        size: model.isExpanded ? 48 : IslandMetrics.compactArt,
-                        cornerRadius: model.isExpanded ? 12 : 5
-                    )
-                    .matchedGeometryEffect(id: "artwork", in: island)
-                    .padding(.leading, model.isExpanded ? 0 : 8)
+                    if !model.isExpanded, model.showsCompactDualNowPlaying {
+                        // No matchedGeometryEffect here — morphing into the
+                        // single-art id collapses the fan into one square.
+                        compactDualArtworkStack
+                            .padding(.leading, 10)
+                    } else {
+                        albumArtwork(
+                            size: model.isExpanded ? 48 : IslandMetrics.compactArt,
+                            cornerRadius: model.isExpanded ? 12 : 5
+                        )
+                        .matchedGeometryEffect(id: "artwork", in: island)
+                        .padding(.leading, model.isExpanded ? 0 : 8)
+                    }
 
                     if model.isExpanded {
                         VStack(alignment: .leading, spacing: 2) {
@@ -229,20 +277,6 @@ struct NotchView: View {
                                 .allowsHitTesting(false)
                         }
                         .transition(IslandMetrics.contentReveal)
-                    } else if showsCompactMusicText {
-                        VStack(alignment: .leading, spacing: 0) {
-                            Text(model.songTitle)
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .lineLimit(1)
-                                .allowsHitTesting(false)
-                            Text(model.artistName)
-                                .font(.system(size: 9))
-                                .foregroundStyle(.white.opacity(0.6))
-                                .lineLimit(1)
-                                .allowsHitTesting(false)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     if showsCompactRecordingMedia {
@@ -254,7 +288,7 @@ struct NotchView: View {
                         .matchedGeometryEffect(id: "waveform", in: island)
                     }
 
-                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia || showsCompactMusicText ? 8 : 0)
+                    Spacer(minLength: model.isExpanded || showsCompactRecordingMedia ? 8 : 0)
 
                     if !showsCompactRecordingMedia {
                         waveformIndicator(
@@ -400,6 +434,83 @@ struct NotchView: View {
         }
         .padding(.bottom, IslandMetrics.chatOverlayBottomPadding)
         .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+    }
+
+    /// Two Now Playing tiles side-by-side (e.g. YouTube video + YT Music).
+    /// Additive: only rendered when the secondary reader has a live tab.
+    /// Both columns are equal width — the media/chat 35/65 split is deliberately
+    /// not reused, so both tiles get identical layout, artwork size, and title space.
+    private var dualNowPlayingContent: some View {
+        VStack(spacing: 0) {
+            Color.clear
+                .frame(height: IslandMetrics.expandedContentTopInset(notchHeight: model.notchHeight))
+
+            GeometryReader { geo in
+                let dividerWidth: CGFloat = 1
+                let columnWidth = max(0, (geo.size.width - dividerWidth) / 2)
+                let swap = model.dualNowPlayingSwapsTiles
+
+                HStack(alignment: .top, spacing: 0) {
+                    Group {
+                        if swap { secondaryDualTile } else { primaryDualTile }
+                    }
+                    .padding(.trailing, IslandMetrics.chatOverlayColumnSpacing / 2)
+                    .frame(width: columnWidth)
+                    .frame(maxHeight: .infinity)
+
+                    Rectangle()
+                        .fill(IslandGradientDivider.gradient)
+                        .frame(width: dividerWidth)
+                        .frame(maxHeight: .infinity)
+
+                    Group {
+                        if swap { primaryDualTile } else { secondaryDualTile }
+                    }
+                    .padding(.leading, IslandMetrics.chatOverlayColumnSpacing / 2)
+                    .frame(width: columnWidth)
+                    .frame(maxHeight: .infinity)
+                }
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+            }
+            .padding(.horizontal, IslandMetrics.chatOverlayHorizontalPadding)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .padding(.bottom, IslandMetrics.chatOverlayBottomPadding)
+        .frame(width: shapeWidth, height: shapeHeight, alignment: .top)
+    }
+
+    private var primaryDualTile: some View {
+        DualNowPlayingTile(
+            title: model.songTitle,
+            artist: model.artistName,
+            isPlaying: model.isPlaying,
+            artwork: model.artwork,
+            usesPlatformLogo: model.usesPlatformLogo,
+            hasMedia: model.hasMedia,
+            waveform: model.waveform,
+            gradient: model.hasMedia ? model.waveformGradient : .idle,
+            onPlayPause: model.togglePlayPause,
+            onSkipBackward: model.skipBackward,
+            onSkipForward: model.skipForward,
+            onArtworkTap: model.openNowPlayingSource
+        )
+    }
+
+    private var secondaryDualTile: some View {
+        DualNowPlayingTile(
+            title: model.secondarySongTitle,
+            artist: model.secondaryArtistName,
+            isPlaying: model.secondaryIsPlaying,
+            artwork: model.secondaryArtwork,
+            usesPlatformLogo: model.secondaryUsesPlatformLogo,
+            hasMedia: model.secondaryHasMedia,
+            waveform: model.secondaryWaveform,
+            gradient: model.secondaryHasMedia ? model.secondaryWaveformGradient : .idle,
+            onPlayPause: model.toggleSecondaryPlayPause,
+            onSkipBackward: model.skipSecondaryBackward,
+            onSkipForward: model.skipSecondaryForward,
+            onArtworkTap: model.openSecondaryNowPlayingSource
+        )
     }
 
     private func dualActivitySplit<Left: View, Right: View>(
@@ -608,6 +719,22 @@ struct NotchView: View {
 
     // MARK: Album Artwork
 
+    /// Two compact thumbnails fanned so the collapsed island clearly reads as
+    /// two live sources. Front tile follows Watch-left / Music-right order via
+    /// `dualNowPlayingSwapsTiles`. Falls back to platform logos when art is
+    /// still loading so the dual signal never looks like a single blank square.
+    private var compactDualArtworkStack: some View {
+        let swap = model.dualNowPlayingSwapsTiles
+        return CompactDualNowPlayingArtwork(
+            frontImage: swap ? model.secondaryArtwork : model.artwork,
+            frontUsesPlatformLogo: swap ? model.secondaryUsesPlatformLogo : model.usesPlatformLogo,
+            frontPlatform: swap ? model.secondaryMediaPlatform : model.mediaPlatform,
+            backImage: swap ? model.artwork : model.secondaryArtwork,
+            backUsesPlatformLogo: swap ? model.usesPlatformLogo : model.secondaryUsesPlatformLogo,
+            backPlatform: swap ? model.mediaPlatform : model.secondaryMediaPlatform
+        )
+    }
+
     private func albumArtwork(size: CGFloat, cornerRadius: CGFloat) -> some View {
         Group {
             if let artwork = model.artwork {
@@ -813,6 +940,116 @@ private struct IslandUStroke: Shape {
         }
         path.addLine(to: CGPoint(x: bounds.maxX, y: bounds.minY))
         return path
+    }
+}
+
+/// One side of the dual Now Playing split. Same layout language as
+/// `musicSplitHeader`/`musicSplitControls`, but self-contained so it can be
+/// instantiated twice with independent state and independent transport.
+private struct DualNowPlayingTile: View {
+    let title: String
+    let artist: String
+    let isPlaying: Bool
+    let artwork: NSImage?
+    let usesPlatformLogo: Bool
+    let hasMedia: Bool
+    @ObservedObject var waveform: SimulatedWaveform
+    let gradient: ArtworkTint.Gradient
+    let onPlayPause: () -> Void
+    let onSkipBackward: () -> Void
+    let onSkipForward: () -> Void
+    let onArtworkTap: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 10) {
+                Button(action: onArtworkTap) {
+                    tileArtwork
+                }
+                .buttonStyle(.plain)
+                .fixedSize()
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title.isEmpty ? "Now Playing" : title)
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .allowsHitTesting(false)
+                    Text(artist.isEmpty ? "—" : artist)
+                        .font(.system(size: 11, weight: .regular))
+                        .foregroundStyle(.white.opacity(0.55))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .allowsHitTesting(false)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                SimulatedWaveformBars(
+                    waveform: waveform,
+                    gradient: hasMedia ? gradient : .idle,
+                    barHeight: 13,
+                    barWidth: 1.5,
+                    spacing: 1.5,
+                    barCount: 5
+                )
+                .fixedSize()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            HStack(spacing: 12) {
+                IslandTransportButton(
+                    system: "backward.fill",
+                    iconSize: 13,
+                    side: 28,
+                    action: onSkipBackward
+                )
+                IslandTransportButton(
+                    system: isPlaying ? "pause.fill" : "play.fill",
+                    iconSize: 16,
+                    side: 28,
+                    action: onPlayPause
+                )
+                IslandTransportButton(
+                    system: "forward.fill",
+                    iconSize: 13,
+                    side: 28,
+                    action: onSkipForward
+                )
+            }
+            .frame(height: IslandMetrics.dualActionRowHeight)
+            .frame(maxWidth: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var tileArtwork: some View {
+        let size: CGFloat = 40
+        let radius: CGFloat = 10
+        return Group {
+            if let artwork {
+                Color.clear
+                    .overlay {
+                        Image(nsImage: artwork)
+                            .resizable()
+                            .aspectRatio(contentMode: usesPlatformLogo ? .fit : .fill)
+                            .transaction { $0.animation = nil }
+                            .id(ObjectIdentifier(artwork))
+                    }
+                    .clipped()
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: radius)
+                        .fill(Color.white.opacity(0.12))
+                    Image(systemName: hasMedia ? "music.note" : "music.note.list")
+                        .font(.system(size: size * 0.45, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+            }
+        }
+        .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: radius))
+        .contentShape(RoundedRectangle(cornerRadius: radius))
     }
 }
 

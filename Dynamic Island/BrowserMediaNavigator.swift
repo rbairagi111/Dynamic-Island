@@ -154,18 +154,73 @@ enum BrowserMediaNavigator {
     }
 
     static func listTabs(bundleID: String) -> [Tab] {
+        listTabs(bundleID: bundleID, urlContainsAny: nil)
+    }
+
+    /// Same as `listTabs`, but only returns tabs whose URL contains one of the
+    /// needles. Cuts AppleScript payload size when hunting dual secondaries.
+    static func listTabs(
+        bundleID: String,
+        urlContainsAny needles: [String]?
+    ) -> [Tab] {
         let appName = appleScriptName(for: bundleID)
         if appName == "Firefox" { return [] }
         let script: String
         if appName == "Safari" {
+            if let needles, !needles.isEmpty {
+                let checks = needles.map { needle in
+                    let escaped = appleScriptEscape(needle)
+                    return "(u contains \"\(escaped)\")"
+                }.joined(separator: " or ")
+                script = """
+                tell application "Safari"
+                  set out to ""
+                  repeat with wi from 1 to count of windows
+                    repeat with ti from 1 to count of tabs of window wi
+                      try
+                        set currentTab to tab ti of window wi
+                        set u to (URL of currentTab) as text
+                        if \(checks) then
+                          set out to out & wi & "\t" & ti & "\t" & "0" & "\t" & (name of currentTab) & "\t" & u & linefeed
+                        end if
+                      end try
+                    end repeat
+                  end repeat
+                  return out
+                end tell
+                """
+            } else {
+                script = """
+                tell application "Safari"
+                  set out to ""
+                  repeat with wi from 1 to count of windows
+                    repeat with ti from 1 to count of tabs of window wi
+                      try
+                        set currentTab to tab ti of window wi
+                        set out to out & wi & "\t" & ti & "\t" & "0" & "\t" & (name of currentTab) & "\t" & (URL of currentTab) & linefeed
+                      end try
+                    end repeat
+                  end repeat
+                  return out
+                end tell
+                """
+            }
+        } else if let needles, !needles.isEmpty {
+            let checks = needles.map { needle in
+                let escaped = appleScriptEscape(needle)
+                return "(u contains \"\(escaped)\")"
+            }.joined(separator: " or ")
             script = """
-            tell application "Safari"
+            tell application "\(appName)"
               set out to ""
               repeat with wi from 1 to count of windows
                 repeat with ti from 1 to count of tabs of window wi
                   try
                     set currentTab to tab ti of window wi
-                    set out to out & wi & "\t" & ti & "\t" & "0" & "\t" & (name of currentTab) & "\t" & (URL of currentTab) & linefeed
+                    set u to (URL of currentTab) as text
+                    if \(checks) then
+                      set out to out & wi & "\t" & ti & "\t" & ((id of currentTab) as text) & "\t" & (title of currentTab) & "\t" & u & linefeed
+                    end if
                   end try
                 end repeat
               end repeat
@@ -196,8 +251,20 @@ enum BrowserMediaNavigator {
             return []
         }
         let tabs = parseTabList(result.stringValue ?? "")
-        NSLog("[BrowserMedia] scanned app=%@ tabs=%d", appName, tabs.count)
+        NSLog("[BrowserMedia] scanned app=%@ tabs=%d filtered=%@", appName, tabs.count, needles == nil ? "no" : "yes")
         return tabs
+    }
+
+    /// Hosts we care about for dual Now Playing secondary discovery.
+    static var streamingURLNeedles: [String] {
+        [
+            "youtube.com", "youtu.be", "music.youtube.com",
+            "netflix.com", "spotify.com", "primevideo.com", "amazon.com",
+            "disneyplus.com", "hotstar.com", "hulu.com", "max.com",
+            "twitch.tv", "soundcloud.com", "jiosaavn.com", "music.apple.com",
+            "tv.apple.com", "crunchyroll.com", "sonyliv.com", "zee5.com",
+            "vimeo.com", "plex.tv"
+        ]
     }
 
     /// Front window's selected tab only — used to load a YouTube poster without
@@ -369,6 +436,38 @@ enum BrowserMediaNavigator {
         }
     }
 
+    /// Per-tab frequency bands (7 values, `0...1`) from the playing media element.
+    /// Nil when the tab has no analyser (paused, missing media, or JS denied).
+    /// Independent of system mix — dual Watch + Music each get their own feed.
+    static func probeWaveformBands(on tab: Tab, bundleID: String) -> [CGFloat]? {
+        switch executeJavaScript(waveformBandsJavaScript, on: tab, bundleID: bundleID) {
+        case .success(let value):
+            return parseWaveformBands(value)
+        case .needsPermission, .failed, .missingTab:
+            return nil
+        }
+    }
+
+    /// `0.12,0.40,...` (7 commas) → normalized bands. Sentinels → nil.
+    static func parseWaveformBands(_ raw: String) -> [CGFloat]? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty
+            || trimmed == "no-wave"
+            || trimmed == "idle"
+            || trimmed.hasPrefix("err") {
+            return nil
+        }
+        let parts = trimmed.split(separator: ",", omittingEmptySubsequences: false)
+        guard parts.count == SimulatedWaveformEngine.barCount else { return nil }
+        var bands: [CGFloat] = []
+        bands.reserveCapacity(parts.count)
+        for part in parts {
+            guard let value = Double(part.trimmingCharacters(in: .whitespaces)) else { return nil }
+            bands.append(CGFloat(min(1, max(0, value))))
+        }
+        return bands
+    }
+
     private static let playbackTimingJavaScript = """
     (() => {
       const v = document.querySelector('#movie_player video.html5-main-video, #movie_player video, #song-video video, video.html5-main-video, video');
@@ -376,6 +475,80 @@ enum BrowserMediaNavigator {
       const elapsed = Number.isFinite(v.currentTime) ? v.currentTime : 0;
       const duration = Number.isFinite(v.duration) ? v.duration : 0;
       return elapsed + '\\t' + duration;
+    })()
+    """
+
+    /// Installs a per-tab AnalyserNode via `captureStream` (does not steal
+    /// `createMediaElementSource`). Returns 7 log-spaced band energies.
+    private static let waveformBandsJavaScript = """
+    (() => {
+      const N = 7;
+      const pick = () => {
+        const sels = [
+          '#movie_player video.html5-main-video',
+          '#movie_player video',
+          '#song-video video',
+          'video.html5-main-video',
+          'video',
+          'audio'
+        ];
+        for (let i = 0; i < sels.length; i++) {
+          const el = document.querySelector(sels[i]);
+          if (el && !el.paused && !el.ended) return el;
+        }
+        const all = document.querySelectorAll('video, audio');
+        for (let i = 0; i < all.length; i++) {
+          const m = all[i];
+          if (m && !m.paused && !m.ended) return m;
+        }
+        return null;
+      };
+      const media = pick();
+      if (!media) return 'no-wave';
+      try {
+        let state = window.__diIslandWave;
+        if (!state || state.media !== media) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (!AC || typeof media.captureStream !== 'function') return 'no-wave';
+          const ctx = new AC();
+          const stream = media.captureStream();
+          if (!stream || !stream.getAudioTracks || stream.getAudioTracks().length === 0) {
+            return 'no-wave';
+          }
+          const src = ctx.createMediaStreamSource(stream);
+          const analyser = ctx.createAnalyser();
+          analyser.fftSize = 256;
+          analyser.smoothingTimeConstant = 0.5;
+          src.connect(analyser);
+          state = {
+            media: media,
+            ctx: ctx,
+            analyser: analyser,
+            data: new Uint8Array(analyser.frequencyBinCount)
+          };
+          window.__diIslandWave = state;
+        }
+        if (state.ctx.state === 'suspended') state.ctx.resume();
+        state.analyser.getByteFrequencyData(state.data);
+        const data = state.data;
+        const len = data.length;
+        const bands = [];
+        for (let i = 0; i < N; i++) {
+          const start = Math.floor(Math.pow(i / N, 1.55) * len);
+          const end = Math.max(start + 1, Math.floor(Math.pow((i + 1) / N, 1.55) * len));
+          let sum = 0;
+          let count = 0;
+          for (let j = start; j < end && j < len; j++) {
+            sum += data[j];
+            count++;
+          }
+          const avg = count > 0 ? sum / count : 0;
+          bands.push((avg / 255).toFixed(3));
+        }
+        return bands.join(',');
+      } catch (e) {
+        return 'no-wave';
+      }
     })()
     """
 

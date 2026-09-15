@@ -42,6 +42,14 @@ enum IslandMetrics {
         max(notchWidth, 1) + idleGlanceCompactLeftEar + idleGlanceCompactRightEar
     }
     static let compactArt: CGFloat = 16.94
+    /// Dual compact stack uses a larger tile than single-source art so the
+    /// second thumbnail is obvious in the notch ears (~34px @2x).
+    static let compactDualArtSize: CGFloat = 20
+    /// Horizontal fan of the back tile — the primary cue that two sources play.
+    static let compactDualArtOverlapX: CGFloat = 9
+    static let compactDualArtOverlapY: CGFloat = 4
+    /// Extra compact width so the fan does not crowd the camera band.
+    static let compactDualWidthBoost: CGFloat = 18
     static let compactBottomRadius: CGFloat = 12
 
     static let motion = Animation.spring(response: 0.4, dampingFraction: 0.75)
@@ -181,8 +189,20 @@ struct IslandGradientDivider: View {
 final class NotchViewModel: ObservableObject {
     @Published var isExpanded = false
     @Published var hasPhysicalNotch = true
-    /// One-shot first-launch edge glow. Independent of hover, overlays, and Now Playing.
-    @Published private(set) var isFTUEGlowActive = false
+    /// One-shot first-launch sequence (Siri glow → morph → expand demo → tooltip).
+    @Published private(set) var isFTUESequenceRunning = false
+    @Published private(set) var ftuePhase: NotchFTUEPhase = .idle
+    @Published private(set) var ftueGlowAmount: CGFloat = 0
+    @Published private(set) var ftueContentOpacity: Double = 1
+    @Published private(set) var showsFTUETooltip = false
+    /// Ghost cursor visual only (0…1 travel). Expand uses `expandForFTUEDemo`.
+    @Published private(set) var ftueGhostCursorProgress: CGFloat = 0
+    @Published private(set) var ftueGhostCursorOpacity: Double = 0
+    /// Bumped on every play so SwiftUI restarts observers cleanly.
+    @Published private(set) var ftuePlayToken: Int = 0
+    private var ftueTask: Task<Void, Never>?
+    /// Set when the user expands via real hover after the first ghost-cursor demo.
+    private var ftueSawRealHover = false
 
     /// Real notch geometry set by the window controller at launch and on screen changes.
     @Published var notchWidth:  CGFloat = 180
@@ -209,6 +229,20 @@ final class NotchViewModel: ObservableObject {
     /// Keep the last track while locked — MediaRemote goes silent.
     @Published var holdLastMedia = false
 
+    // MARK: Secondary Now Playing (dual-tile) — additive; never replaces primary.
+    @Published private(set) var secondaryHasMedia = false
+    @Published private(set) var secondaryIsPlaying = false
+    @Published private(set) var secondarySongTitle = ""
+    @Published private(set) var secondaryArtistName = ""
+    @Published private(set) var secondaryCurrentTime: TimeInterval = 0
+    @Published private(set) var secondaryDuration: TimeInterval = 0
+    @Published private(set) var secondaryArtwork: NSImage? = nil
+    @Published private(set) var secondaryMediaPlatform: StreamingPlatform? = nil
+    @Published private(set) var secondaryUsesPlatformLogo = false
+    @Published private(set) var secondaryWaveformGradient: ArtworkTint.Gradient = .fallback
+    let secondaryWaveform = SimulatedWaveform()
+    private var lastSecondaryTintedArtwork: ObjectIdentifier?
+
     /// While the user drags the timeline, freeze live updates and show this time.
     @Published var isScrubbing = false
     @Published var scrubTime: TimeInterval = 0
@@ -228,6 +262,7 @@ final class NotchViewModel: ObservableObject {
     private let settings = AppSettings.shared
     private let idleDestinationStore = IslandIdleDestinationStore.shared
     private let weatherService = IslandWeatherService.shared
+    private let audioAmplitude = AudioAmplitudeMonitor.shared
     private var cancellables = Set<AnyCancellable>()
     private var overlayTimeout: Timer?
     private var overlayHovering = false
@@ -264,6 +299,7 @@ final class NotchViewModel: ObservableObject {
 
     init() {
         bindNowPlaying()
+        bindSystemAudioWaveform()
         bindChromeMonitor()
         bindPowerMonitor()
         bindLevelHUD()
@@ -271,6 +307,7 @@ final class NotchViewModel: ObservableObject {
         bindLiveActivities()
         bindShelfExpiry()
         bindIdleGlance()
+        bindFTUEPreview()
         syncChromeMonitor(denied: settings.automationDenied)
     }
 
@@ -341,11 +378,18 @@ final class NotchViewModel: ObservableObject {
         if isScreenRecording && isExpanded {
             return IslandMetrics.batteryBannerWidth
         }
+        if showsDualNowPlaying {
+            return IslandMetrics.dualWidthFixed
+        }
         if isExpanded {
             return IslandMetrics.expandedWidth(notchWidth: notchWidth)
         }
         if showsCompactIdleGlance {
             return IslandMetrics.idleGlanceCompactWidth(notchWidth: notchWidth)
+        }
+        if showsCompactDualNowPlaying {
+            return IslandMetrics.compactWidth(notchWidth: notchWidth)
+                + IslandMetrics.compactDualWidthBoost
         }
         return IslandMetrics.compactWidth(notchWidth: notchWidth)
     }
@@ -365,6 +409,9 @@ final class NotchViewModel: ObservableObject {
         if isScreenRecording && isExpanded {
             return IslandMetrics.recordingBannerHeight(notchHeight: notchHeight)
         }
+        if showsDualNowPlaying {
+            return IslandMetrics.dualHeight(notchHeight: notchHeight)
+        }
         if isExpanded {
             if showsShelfRow {
                 return IslandMetrics.expandedHeight + IslandMetrics.shelfSectionHeight
@@ -378,16 +425,289 @@ final class NotchViewModel: ObservableObject {
         0
     }
 
-    /// Call from the island view’s `onAppear`. Marks the FTUE seen immediately so
-    /// SwiftUI re-appears cannot replay it.
+    /// Call from the island view’s `onAppear`. Plays the full FTUE once.
     func noteIslandAppeared(defaults: UserDefaults = .standard) {
-        guard NotchFTUEStore.shouldPlay(defaults: defaults) else { return }
-        NotchFTUEStore.markSeen(defaults: defaults)
-        isFTUEGlowActive = true
+        let should = NotchFTUEStore.shouldPlay(defaults: defaults)
+        NotchFTUEMetrics.log("noteIslandAppeared shouldPlay=\(should)")
+        guard should else { return }
+        startFTUESequence(markSeen: true, defaults: defaults)
     }
 
-    func noteFTUEGlowFinished() {
-        isFTUEGlowActive = false
+    /// Settings → Replay Intro. Resets the flag and runs the full sequence again.
+    func replayFTUEIntro(defaults: UserDefaults = .standard) {
+        NotchFTUEMetrics.log("replayFTUEIntro")
+        NotchFTUEStore.reset(defaults: defaults)
+        startFTUESequence(markSeen: true, defaults: defaults)
+    }
+
+    /// Glow-only preview (no expand/tooltip). Does not change `hasSeenFTUE`.
+    func playFTUEGlowPreview() {
+        guard !isFTUESequenceRunning else { return }
+        NotchFTUEMetrics.log("playFTUEGlowPreview")
+        ftueTask?.cancel()
+        ftuePlayToken &+= 1
+        let token = ftuePlayToken
+        isFTUESequenceRunning = true
+        ftuePhase = .preparing
+        ftueGlowAmount = 0
+        ftueContentOpacity = 0
+        showsFTUETooltip = false
+        ftueGhostCursorProgress = 0
+        ftueGhostCursorOpacity = 0
+        ftueTask = Task { @MainActor [weak self] in
+            await self?.runGlowOnlyPreview(token: token)
+        }
+    }
+
+    private func startFTUESequence(markSeen: Bool, defaults: UserDefaults) {
+        if markSeen {
+            NotchFTUEStore.markSeen(defaults: defaults)
+        }
+        ftueTask?.cancel()
+        ftuePlayToken &+= 1
+        let token = ftuePlayToken
+
+        // Fully black pill first: glow mounted at 0, no content inside.
+        isFTUESequenceRunning = true
+        ftuePhase = .preparing
+        ftueGlowAmount = 0
+        ftueContentOpacity = 0
+        showsFTUETooltip = false
+        ftueGhostCursorProgress = 0
+        ftueGhostCursorOpacity = 0
+        ftueSawRealHover = false
+        suppressHoverExpand = true
+        suppressExpandUntil = nil
+        if isExpanded { isExpanded = false }
+
+        NotchFTUEMetrics.log("sequence start token=\(token) phase=preparing glow=0 content=0")
+        NotificationCenter.default.post(name: .ftueSequenceStarted, object: nil)
+
+        ftueTask = Task { @MainActor [weak self] in
+            await self?.runFullFTUESequence(token: token)
+        }
+    }
+
+    @MainActor
+    private func runFullFTUESequence(token: Int) async {
+        // Let SwiftUI commit the preparing frame (glow at 0, content hidden)
+        // before ease-out starts — otherwise 0→1 coalesces into an instant cut.
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 16_000_000)
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        // 1. Glow-in: opacity + hue travel red→…→green (same screen point changes hue)
+        ftuePhase = .glowIn
+        NotchFTUEMetrics.logGradientStopsAtRender()
+        NotchFTUEMetrics.log("glow-in begin duration=\(NotchFTUEMetrics.glowInDuration)")
+        withAnimation(NotchFTUEMetrics.glowInAnimation) {
+            ftueGlowAmount = 1
+        }
+        NotchFTUEMetrics.log("glow amount → 1 (opacity only; 6-stop spatial gradient static)")
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.glowInDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        // 2. Hold at green end of the gradient
+        ftuePhase = .hold
+        NotchFTUEMetrics.log("hold begin")
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.holdDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        // 3. Morph → content fades in; glow contracts away
+        ftuePhase = .morph
+        NotchFTUEMetrics.log("morph begin duration=\(NotchFTUEMetrics.morphDuration)")
+        withAnimation(NotchFTUEMetrics.morphAnimation) {
+            ftueGlowAmount = 0
+            ftueContentOpacity = 1
+        }
+        NotchFTUEMetrics.log("glow amount → 0, content → 1 (animated)")
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.morphDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        // 4. Ghost-cursor: demo hover, then repeating nudge until real hover.
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.pauseBeforeExpand))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        await runGhostCursorDemoCycle(token: token)
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        ftuePhase = .awaitingHover
+        suppressHoverExpand = false
+        isFTUESequenceRunning = false
+        withAnimation(NotchFTUEMetrics.tooltipAnimation) {
+            showsFTUETooltip = true
+        }
+        NotchFTUEMetrics.log("ghost nudge loop — awaiting real hover")
+
+        await runGhostCursorNudgeLoop(token: token)
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        // Hover already cleared these instantly; snap any leftover without fade.
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            ftueGhostCursorOpacity = 0
+            showsFTUETooltip = false
+            ftueGhostCursorProgress = 0
+        }
+        ftuePhase = .idle
+        NotchFTUEMetrics.log("sequence complete (ghost dismissed by real hover)")
+    }
+
+    /// One full demo: onto right of pill → expand; away → collapse.
+    @MainActor
+    private func runGhostCursorDemoCycle(token: Int) async {
+        ftuePhase = .demoExpand
+        ftueSawRealHover = false
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            ftueGhostCursorProgress = 0
+            ftueGhostCursorOpacity = 0
+            showsFTUETooltip = false
+        }
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 16_000_000)
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        NotchFTUEMetrics.log("ghost demo: fade in off-notch")
+        withAnimation(NotchFTUEMetrics.tooltipAnimation) {
+            showsFTUETooltip = true
+        }
+        // Fade in and start the glide together so the approach doesn’t hitch.
+        withAnimation(NotchFTUEMetrics.ghostCursorFadeAnimation) {
+            ftueGhostCursorOpacity = 1
+        }
+        withAnimation(NotchFTUEMetrics.ghostCursorApproachAnimation) {
+            ftueGhostCursorProgress = 1
+        }
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(
+            max(NotchFTUEMetrics.ghostCursorFadeInDuration, NotchFTUEMetrics.ghostCursorApproachDuration)
+        ))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+        expandForFTUEDemo()
+
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorDwellDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        NotchFTUEMetrics.log("ghost demo: slide away → collapse")
+        withAnimation(NotchFTUEMetrics.ghostCursorRetreatAnimation) {
+            ftueGhostCursorProgress = 0
+        }
+        collapseForFTUEDemo()
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorRetreatDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+        NotchFTUEMetrics.log("ghost demo cycle complete")
+    }
+
+    /// Soft double upward nudge until the user hovers for real.
+    /// Starts from wherever the demo left the cursor (away / progress 0) — no snap.
+    @MainActor
+    private func runGhostCursorNudgeLoop(token: Int) async {
+        let rest = NotchFTUEMetrics.ghostCursorNudgeRestProgress(
+            islandWidth: IslandMetrics.idleGlanceCompactWidth(notchWidth: notchWidth)
+        )
+
+        // Demo ends at away (progress 0). Ease up to rest from that same place
+        // instead of teleporting onto the ear.
+        if abs(ftueGhostCursorProgress - rest) > 0.01 {
+            withAnimation(NotchFTUEMetrics.ghostCursorNudgeUpAnimation) {
+                ftueGhostCursorProgress = rest
+            }
+            try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorNudgeUpDuration))
+            guard !Task.isCancelled, ftuePlayToken == token else { return }
+            if ftueSawRealHover { return }
+        }
+
+        while true {
+            guard !Task.isCancelled, ftuePlayToken == token else { return }
+            if ftueSawRealHover { return }
+
+            for peck in 0..<2 {
+                withAnimation(NotchFTUEMetrics.ghostCursorNudgeUpAnimation) {
+                    ftueGhostCursorProgress = 1
+                }
+                try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorNudgeUpDuration))
+                guard !Task.isCancelled, ftuePlayToken == token else { return }
+                if ftueSawRealHover { return }
+
+                withAnimation(NotchFTUEMetrics.ghostCursorNudgeDownAnimation) {
+                    ftueGhostCursorProgress = rest
+                }
+                try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorNudgeDownDuration))
+                guard !Task.isCancelled, ftuePlayToken == token else { return }
+                if ftueSawRealHover { return }
+
+                if peck == 0 {
+                    try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorNudgeBetweenPecksDuration))
+                    guard !Task.isCancelled, ftuePlayToken == token else { return }
+                    if ftueSawRealHover { return }
+                }
+            }
+
+            try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.ghostCursorNudgeLoopPauseDuration))
+        }
+    }
+
+    @MainActor
+    private func runGlowOnlyPreview(token: Int) async {
+        await Task.yield()
+        try? await Task.sleep(nanoseconds: 16_000_000)
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        ftuePhase = .glowIn
+        NotchFTUEMetrics.logGradientStopsAtRender()
+        NotchFTUEMetrics.log("preview glow-in")
+        withAnimation(NotchFTUEMetrics.glowInAnimation) {
+            ftueGlowAmount = 1
+        }
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.glowInDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        ftuePhase = .hold
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.holdDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        ftuePhase = .morph
+        withAnimation(NotchFTUEMetrics.morphAnimation) {
+            ftueGlowAmount = 0
+        }
+        try? await Task.sleep(nanoseconds: Self.ftueNanos(NotchFTUEMetrics.morphDuration))
+        guard !Task.isCancelled, ftuePlayToken == token else { return }
+
+        isFTUESequenceRunning = false
+        ftuePhase = .idle
+        ftueContentOpacity = 1
+        NotchFTUEMetrics.log("preview complete")
+    }
+
+    private func expandForFTUEDemo() {
+        guard !isOverlayActive else { return }
+        suppressHoverExpand = false
+        suppressExpandUntil = nil
+        setExpandedIfNeeded()
+        NotificationCenter.default.post(name: .islandIdleGlanceExpanded, object: nil)
+    }
+
+    private func collapseForFTUEDemo() {
+        guard !isOverlayActive else { return }
+        guard !isDropTargeted, !isDraggingShelfItem else { return }
+        if isExpanded {
+            isExpanded = false
+        }
+        // Keep hover locked until the tooltip finishes so pointer position
+        // cannot bounce the island open mid-demo.
+        suppressHoverExpand = true
+    }
+
+    private static func ftueNanos(_ interval: TimeInterval) -> UInt64 {
+        UInt64(max(interval, 0) * 1_000_000_000)
+    }
+
+    /// Idle-glance / media content stays hidden until morph (or sequence idle).
+    var showsFTUEInteriorContent: Bool {
+        if !isFTUESequenceRunning { return true }
+        return ftueContentOpacity > 0.01
     }
 
     var notchDeadZoneWidth: CGFloat {
@@ -406,7 +726,23 @@ final class NotchViewModel: ObservableObject {
     }
 
     func expand() {
+        if !isFTUESequenceRunning {
+            dismissFTUEGhostOnRealHover()
+        }
         expandLiveActivity(fromClick: false)
+    }
+
+    /// Drop the demo cursor/tip instantly on real hover — do not wait for the
+    /// nudge-loop sleep or the old fade-out.
+    private func dismissFTUEGhostOnRealHover() {
+        ftueSawRealHover = true
+        guard ftueGhostCursorOpacity > 0.001 || showsFTUETooltip else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            ftueGhostCursorOpacity = 0
+            showsFTUETooltip = false
+        }
     }
 
     /// Deliberate click on the compact recording pill. Clears the Check Now
@@ -588,7 +924,9 @@ final class NotchViewModel: ObservableObject {
     func skipForward()     { nowPlaying.nextTrack() }
 
     func handleKeyboardTransport(_ key: IslandKeyboardTransport) {
-        guard hasMedia else { return }
+        // Prefer view-model flag; fall back to live snapshot so a brief
+        // hasMedia lag cannot swallow F8 after the key was already captured.
+        guard hasMedia || nowPlaying.snapshot.hasMedia else { return }
         switch key {
         case .playPause:
             togglePlayPause()
@@ -659,12 +997,151 @@ final class NotchViewModel: ObservableObject {
         }
     }
 
+    /// Shared live-session gate for expanded dual tiles and compact stacked art.
+    var hasDualLiveNowPlayingSessions: Bool {
+        DualNowPlayingSurfacePolicy.hasLiveDualSessions(
+            featureEnabled: IslandFeatures.dualNowPlayingEnabled,
+            hasMedia: hasMedia,
+            isPlaying: isPlaying,
+            secondaryHasMedia: secondaryHasMedia,
+            secondaryIsPlaying: secondaryIsPlaying,
+            overlayActive: transientOverlay != nil,
+            isScreenRecording: isScreenRecording,
+            isSelectingScreenToRecord: isSelectingScreenToRecord
+        )
+    }
+
+    /// True only when *both* tiles are actively playing. Pausing either side
+    /// collapses back to the single-tile player of the session that is still live.
+    var showsDualNowPlaying: Bool {
+        DualNowPlayingSurfacePolicy.showsExpandedSplit(
+            hasLiveDualSessions: hasDualLiveNowPlayingSessions,
+            isExpanded: isExpanded
+        )
+    }
+
+    /// Compact (collapsed) island: both sessions live → stacked overlapping art.
+    var showsCompactDualNowPlaying: Bool {
+        DualNowPlayingSurfacePolicy.showsCompactStackedArt(
+            hasLiveDualSessions: hasDualLiveNowPlayingSessions,
+            isExpanded: isExpanded
+        )
+    }
+
+    /// MediaRemote often keeps audio (Spotify / YT Music) as primary while a
+    /// video tab is secondary. Product layout is video left / audio right —
+    /// swap tiles (and click routing) when that happens so pause-on-left stops
+    /// the video. Same swap decides which thumbnail sits in front of the
+    /// compact stack. Video+video and audio+audio keep MediaRemote primary left.
+    var dualNowPlayingSwapsTiles: Bool {
+        DualNowPlayingSurfacePolicy.swapsTiles(
+            hasLiveDualSessions: hasDualLiveNowPlayingSessions,
+            primaryKind: mediaPlatform?.mediaKind,
+            secondaryKind: secondaryMediaPlatform?.mediaKind
+        )
+    }
+
+    // MARK: Secondary controls — routed to the second browser tab only.
+    func toggleSecondaryPlayPause() { nowPlaying.secondaryTogglePlayPause() }
+    func skipSecondaryBackward()    { nowPlaying.secondarySkipBackward() }
+    func skipSecondaryForward()     { nowPlaying.secondarySkipForward() }
+    func openSecondaryNowPlayingSource() {
+        guard secondaryHasMedia else { return }
+        suppressHoverExpand = true
+        collapse()
+        nowPlaying.secondaryRevealSource()
+    }
+
+    private func applySecondarySnapshot(_ snap: NowPlayingService.Snapshot) {
+        let isBrowser = MediaClient.isBrowserBundle(snap.bundleIdentifier)
+        let live = PlaybackPlayingPolicy.islandHasMedia(
+            isBrowser: isBrowser,
+            payloadHasMedia: snap.hasMedia,
+            isPlaying: snap.isPlaying,
+            sourceURL: snap.sourceURL
+        )
+        secondaryHasMedia = live
+        secondaryIsPlaying = live && snap.isPlaying
+        secondaryWaveform.setPlaying(secondaryIsPlaying)
+        if !secondaryIsPlaying {
+            secondaryWaveform.setUsesLiveCapture(false)
+        }
+        defer { refreshSystemAudioCapture() }
+        guard live else {
+            secondarySongTitle = ""
+            secondaryArtistName = ""
+            secondaryCurrentTime = 0
+            secondaryDuration = 0
+            secondaryArtwork = nil
+            secondaryMediaPlatform = nil
+            secondaryUsesPlatformLogo = false
+            secondaryWaveformGradient = .fallback
+            lastSecondaryTintedArtwork = nil
+            return
+        }
+        let platform = StreamingPlatform.resolve(
+            bundleID: snap.bundleIdentifier,
+            appName: snap.appName,
+            artist: snap.artist,
+            title: snap.title,
+            url: snap.sourceURL
+        )
+        let displayTitle = StreamingPlatform.displayTitle(
+            mediaTitle: snap.title,
+            pageTitle: snap.sourcePageTitle,
+            metadataTitle: snap.album,
+            platform: platform
+        )
+        secondarySongTitle = displayTitle.isEmpty ? "Now Playing" : displayTitle
+        secondaryArtistName = snap.artist.isEmpty ? "—" : snap.artist
+        secondaryCurrentTime = snap.elapsed
+        secondaryDuration = snap.duration
+        secondaryArtwork = snap.artwork
+        secondaryMediaPlatform = platform
+        secondaryUsesPlatformLogo = DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+            artworkToken: snap.artworkToken
+        )
+        refreshSecondaryTint(from: snap.artwork)
+    }
+
+    private func refreshSecondaryTint(from image: NSImage?) {
+        guard let image else {
+            lastSecondaryTintedArtwork = nil
+            secondaryWaveformGradient = .fallback
+            return
+        }
+        let identity = ObjectIdentifier(image)
+        if identity == lastSecondaryTintedArtwork { return }
+        lastSecondaryTintedArtwork = identity
+        artworkTintQueue.async { [weak self] in
+            let gradient = ArtworkTint.waveformGradient(from: image)
+            DispatchQueue.main.async {
+                guard let self, self.secondaryArtwork === image else { return }
+                self.secondaryWaveformGradient = gradient
+            }
+        }
+    }
+
     private func bindNowPlaying() {
+        nowPlaying.$secondarySnapshot
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] snap in
+                self?.applySecondarySnapshot(snap)
+            }
+            .store(in: &cancellables)
+
         nowPlaying.$snapshot
             .receive(on: DispatchQueue.main)
             .sink { [weak self] snap in
                 guard let self else { return }
-                if snap.hasMedia || snap.isPlaying {
+                let isBrowser = MediaClient.isBrowserBundle(snap.bundleIdentifier)
+                let showMedia = PlaybackPlayingPolicy.islandHasMedia(
+                    isBrowser: isBrowser,
+                    payloadHasMedia: snap.hasMedia,
+                    isPlaying: snap.isPlaying,
+                    sourceURL: snap.sourceURL
+                )
+                if showMedia {
                     let platform = StreamingPlatform.resolve(
                         bundleID: snap.bundleIdentifier,
                         appName: snap.appName,
@@ -684,7 +1161,9 @@ final class NotchViewModel: ObservableObject {
                         self.cachedArtwork = snap.artwork
                     }
                     self.cachedMediaPlatform = platform
-                    self.cachedUsesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
+                    self.cachedUsesPlatformLogo = DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+                        artworkToken: snap.artworkToken
+                    )
                     self.cachedDuration = snap.duration
                     self.cachedElapsed = snap.elapsed
                     self.cachedPlaying = snap.isPlaying
@@ -700,6 +1179,92 @@ final class NotchViewModel: ObservableObject {
                 self.applySnapshot(snap)
             }
             .store(in: &cancellables)
+    }
+
+    /// System-output spectrum (Core Audio process tap). YouTube pages expose no
+    /// audio tracks via `captureStream`, so in-tab JS spectrum cannot work.
+    /// Dual video+audio: only the audio tile follows the mix (usually music);
+    /// the video tile stays near idle so quiet Watch does not dance to Music.
+    private func bindSystemAudioWaveform() {
+        audioAmplitude.$bands
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] bands in
+                self?.applySystemBands(bands)
+            }
+            .store(in: &cancellables)
+
+        audioAmplitude.$isRunning
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] running in
+                guard let self else { return }
+                if !running {
+                    self.waveform.setUsesLiveCapture(false)
+                    self.secondaryWaveform.setUsesLiveCapture(false)
+                } else {
+                    self.applySystemBands(self.audioAmplitude.bands)
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    private func refreshSystemAudioCapture() {
+        let anyPlaying = isPlaying || secondaryIsPlaying
+        if anyPlaying {
+            audioAmplitude.start()
+            applySystemBands(audioAmplitude.bands)
+        } else {
+            audioAmplitude.stop()
+            waveform.setUsesLiveCapture(false)
+            secondaryWaveform.setUsesLiveCapture(false)
+        }
+    }
+
+    private func applySystemBands(_ bands: [CGFloat]) {
+        let hasEnergy = audioAmplitude.isRunning
+            || audioAmplitude.amplitude > 0
+            || bands.contains(where: { $0 > 0.02 })
+        guard hasEnergy else { return }
+        guard isPlaying || secondaryIsPlaying else {
+            waveform.setUsesLiveCapture(false)
+            secondaryWaveform.setUsesLiveCapture(false)
+            return
+        }
+
+        let idle = Array(repeating: CGFloat(0), count: SimulatedWaveform.barCount)
+        let live = bands.count == SimulatedWaveform.barCount ? bands : idle
+
+        let dual = hasDualLiveNowPlayingSessions
+        let primaryKind = mediaPlatform?.mediaKind
+        let secondaryKind = secondaryMediaPlatform?.mediaKind
+
+        if dual, primaryKind == .video, secondaryKind == .audio {
+            waveform.setUsesLiveCapture(true)
+            waveform.setLiveBands(idle)
+            secondaryWaveform.setUsesLiveCapture(true)
+            secondaryWaveform.setLiveBands(live)
+            return
+        }
+        if dual, primaryKind == .audio, secondaryKind == .video {
+            waveform.setUsesLiveCapture(true)
+            waveform.setLiveBands(live)
+            secondaryWaveform.setUsesLiveCapture(true)
+            secondaryWaveform.setLiveBands(idle)
+            return
+        }
+
+        if isPlaying {
+            waveform.setUsesLiveCapture(true)
+            waveform.setLiveBands(live)
+        } else {
+            waveform.setUsesLiveCapture(false)
+        }
+
+        if secondaryIsPlaying {
+            secondaryWaveform.setUsesLiveCapture(true)
+            secondaryWaveform.setLiveBands(live)
+        } else {
+            secondaryWaveform.setUsesLiveCapture(false)
+        }
     }
 
     private func clearCachedMedia() {
@@ -729,12 +1294,36 @@ final class NotchViewModel: ObservableObject {
         usesPlatformLogo = cachedUsesPlatformLogo
         refreshWaveformTint(from: cachedArtwork)
         persistentState = .musicPlaying
+        refreshSystemAudioCapture()
     }
 
     private func applySnapshot(_ snap: NowPlayingService.Snapshot) {
+        // Sync secondary UI before primary so compact dual can turn on in the
+        // same turn when the service published secondarySnapshot first.
+        let sec = nowPlaying.secondarySnapshot
+        if sec.hasMedia, sec.isPlaying {
+            let needsSecondarySync = !secondaryHasMedia
+                || !secondaryIsPlaying
+                || secondarySongTitle != sec.title
+                || secondaryArtwork !== sec.artwork
+            if needsSecondarySync {
+                applySecondarySnapshot(sec)
+            }
+        }
+
         isPlaying = snap.isPlaying
         waveform.setPlaying(snap.isPlaying)
-        hasMedia = snap.hasMedia || snap.isPlaying
+        if !snap.isPlaying {
+            waveform.setUsesLiveCapture(false)
+        }
+        let isBrowser = MediaClient.isBrowserBundle(snap.bundleIdentifier)
+        hasMedia = PlaybackPlayingPolicy.islandHasMedia(
+            isBrowser: isBrowser,
+            payloadHasMedia: snap.hasMedia,
+            isPlaying: snap.isPlaying,
+            sourceURL: snap.sourceURL
+        )
+        defer { refreshSystemAudioCapture() }
         let platform = hasMedia
             ? StreamingPlatform.resolve(
                 bundleID: snap.bundleIdentifier,
@@ -744,11 +1333,20 @@ final class NotchViewModel: ObservableObject {
                 url: snap.sourceURL
             )
             : nil
+        // Demote→Music often lands with youtubeMusic / pending token before URL
+        // bind; prefer that so Watch-left / Music-right swap (and dual stack
+        // front tile) is correct immediately — never treat pending Music as
+        // Watch (that painted a YouTube logo via CompactDual fallback).
+        let resolvedPlatform: StreamingPlatform? = {
+            if snap.artworkToken.contains("youtubeMusic") { return .youtubeMusic }
+            if snap.sourceURL.contains("music.youtube.com") { return .youtubeMusic }
+            return platform
+        }()
         let displayTitle = StreamingPlatform.displayTitle(
             mediaTitle: snap.title,
             pageTitle: snap.sourcePageTitle,
             metadataTitle: snap.album,
-            platform: platform
+            platform: resolvedPlatform ?? platform
         )
         let nextTitle = hasMedia
             ? (displayTitle.isEmpty ? "Now Playing" : displayTitle)
@@ -766,19 +1364,21 @@ final class NotchViewModel: ObservableObject {
         }
         duration = snap.duration
         let pendingArtwork = snap.artworkToken.hasPrefix("pending:")
-        let platformChanged = platform != mediaPlatform
-            && platform != nil
+        let platformChanged = (resolvedPlatform ?? platform) != mediaPlatform
+            && (resolvedPlatform ?? platform) != nil
             && mediaPlatform != nil
         if let image = snap.artwork {
             artwork = image
         } else if !pendingArtwork || trackIdentityChanged || platformChanged {
             artwork = nil
         }
-        mediaPlatform = platform
-        usesPlatformLogo = snap.artworkToken.hasPrefix("platform:")
+        mediaPlatform = resolvedPlatform ?? platform
+        usesPlatformLogo = DualNowPlayingSurfacePolicy.usesPlatformLogoForDualTile(
+            artworkToken: snap.artworkToken
+        )
         refreshWaveformTint(from: snap.artwork)
         persistentState = hasMedia ? .musicPlaying : .idle
-        if hasMedia, let destination = IslandIdleDestination.from(platform: platform) {
+        if hasMedia, let destination = IslandIdleDestination.from(platform: mediaPlatform) {
             noteIdleDestinationUsage(destination)
         } else if !hasMedia {
             lastRecordedIdleMediaDestination = nil
@@ -942,6 +1542,22 @@ final class NotchViewModel: ObservableObject {
                 let raw = note.userInfo?["provider"] as? String
                 let provider = raw.flatMap(ChatProvider.init(rawValue:)) ?? .claude
                 self?.presentRecordingChatPreview(provider: provider)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func bindFTUEPreview() {
+        NotificationCenter.default.publisher(for: .previewFTUEGlow)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.playFTUEGlowPreview()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .replayFTUEIntro)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.replayFTUEIntro()
             }
             .store(in: &cancellables)
     }

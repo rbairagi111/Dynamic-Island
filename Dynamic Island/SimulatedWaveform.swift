@@ -1,37 +1,41 @@
 import Foundation
 import Combine
 
-/// Alcove-style fake equalizer: irregular motion and occasional hits, not a looping sine.
-/// Not tied to the real mix — no audio tap.
+/// Equalizer silhouette. Live audio sets overall energy; each candle expands and
+/// collapses on its own schedule (YouTube-style), so the left side is not stuck tall.
 struct SimulatedWaveformEngine {
     static let barCount = 7
     static let idleLevel: CGFloat = 0.2
 
     private(set) var levels: [CGFloat]
     private var time: TimeInterval = 0
-    private var nextPulseAt: TimeInterval = 0.08
-    private var pulse: CGFloat = 0
-    private var hat: CGFloat = 0
-    private var leadA = 1
-    private var leadB = 4
     private var wasPlaying = false
     private var rng: SplitMix64
     private var live = LiveWaveformMapper()
+    private var candles = IndependentCandles(seed: 0xC0FFEE)
 
     init(seed: UInt64 = 0xC0FFEE) {
+        let s = seed == 0 ? 1 : seed
         levels = Array(repeating: Self.idleLevel, count: Self.barCount)
-        rng = SplitMix64(state: seed == 0 ? 1 : seed)
+        rng = SplitMix64(state: s)
+        candles = IndependentCandles(seed: s &+ 0x9E37)
     }
 
     /// Advance one frame. `dt` is seconds (e.g. 1/30).
-    /// Pass `liveAmplitude` when the shared CATap RMS feed is running.
+    /// Prefer `liveBands` (per-tab spectrum). Scalar `liveAmplitude` is legacy.
     mutating func tick(
         dt: TimeInterval,
         playing: Bool,
-        liveAmplitude: CGFloat? = nil
+        liveAmplitude: CGFloat? = nil,
+        liveBands: [CGFloat]? = nil
     ) -> [CGFloat] {
         let step = max(dt, 1.0 / 120.0)
         time += step
+
+        if playing, let liveBands, liveBands.count == Self.barCount {
+            levels = live.tick(dt: step, bands: liveBands)
+            return levels
+        }
 
         if playing, let liveAmplitude {
             levels = live.tick(dt: step, amplitude: liveAmplitude)
@@ -39,10 +43,7 @@ struct SimulatedWaveformEngine {
         }
 
         if playing && !wasPlaying {
-            pickLeads()
-            pulse = 0.95
-            hat = 0.55
-            nextPulseAt = time + rng.next(in: 0.28...0.72)
+            candles.kickstart(at: time, rng: &rng)
         }
         wasPlaying = playing
 
@@ -50,62 +51,21 @@ struct SimulatedWaveformEngine {
             for i in 0..<Self.barCount {
                 levels[i] += (Self.idleLevel - levels[i]) * min(1, CGFloat(step) * 3.6)
             }
-            Self.mirror(&levels)
-            pulse = 0
-            hat = 0
+            candles.clearPulses()
             return levels
         }
 
-        if time >= nextPulseAt {
-            pickLeads()
-            pulse = CGFloat(rng.next(in: 0.82...1.0))
-            hat = CGFloat(rng.next(in: 0.35...0.85))
-            nextPulseAt = time + rng.next(in: 0.22...0.78)
-        }
-
-        pulse *= CGFloat(exp(-step * 3.2))
-        hat *= CGFloat(exp(-step * 6.4))
-
-        for i in 0..<Self.barCount {
-            let bass = 1 - CGFloat(i) / CGFloat(Self.barCount - 1)
-            let treble = CGFloat(i) / CGFloat(Self.barCount - 1)
-            let isLead = i == leadA || i == leadB
-
-            // Incommensurate oscillators so the pattern does not close on a short loop.
-            let t = time
-            let iD = Double(i)
-            let wander =
-                0.50 * (0.5 + 0.5 * sin(t * (0.19 + iD * 0.031) + iD * 1.7))
-                + 0.28 * (0.5 + 0.5 * sin(t * (1.13 + iD * 0.47) + iD * 0.9))
-                + 0.22 * (0.5 + 0.5 * sin(t * (2.61 + iD * 0.21) + iD * 2.3))
-
-            // Quiet floor on most bars; two leads punch to full height.
-            var energy = 0.08 + 0.36 * CGFloat(wander)
-            energy += pulse * (0.06 + 0.22 * bass)
-            energy += isLead ? pulse * 0.72 : 0
-            energy += hat * (isLead ? 0.28 * treble : 0.06 * treble)
-            energy = min(1, max(0.08, energy))
-
-            let rate: CGFloat = energy > levels[i] ? 18 : 5.0
-            levels[i] += (energy - levels[i]) * min(1, CGFloat(step) * rate)
-        }
-        Self.mirror(&levels)
-
+        levels = candles.tick(dt: step, time: time, drive: 1, levels: levels, rng: &rng)
         return levels
     }
 
-    /// Copy the left half onto the right so outer bars always match.
+    /// Copy the left half onto the right (legacy scalar live path only).
     static func mirror(_ levels: inout [CGFloat]) {
         let n = levels.count
         guard n > 1 else { return }
         for i in 0..<(n / 2) {
             levels[n - 1 - i] = levels[i]
         }
-    }
-
-    private mutating func pickLeads() {
-        leadA = Int(rng.next(in: 0...2.999))
-        leadB = min(2, leadA + 1)
     }
 }
 
@@ -120,7 +80,8 @@ final class SimulatedWaveform: ObservableObject {
     private var playing = false
     private var usesLiveCapture = false
     private var liveAmplitude: CGFloat = 0
-    /// Live RMS is used only after the tap has actually heard audio.
+    private var liveBands: [CGFloat]?
+    /// Live feed is used only after the analyser has actually heard audio.
     /// Otherwise bars freeze at ~0 while the tap is silent or permission is pending.
     private var liveArmed = false
     private let frameInterval: TimeInterval = 1.0 / 30.0
@@ -140,15 +101,24 @@ final class SimulatedWaveform: ObservableObject {
         usesLiveCapture = active
         if !active {
             liveAmplitude = 0
+            liveBands = nil
             liveArmed = false
         }
     }
 
     func setLiveAmplitude(_ value: CGFloat) {
         liveAmplitude = min(max(value, 0), 1)
-        if liveAmplitude > 0.06 {
-            liveArmed = true
-        }
+        liveBands = nil
+        // System tap is authoritative once we feed it — arm even at 0 so a
+        // quiet dual video tile sits near idle instead of fake-dancing.
+        liveArmed = true
+    }
+
+    /// Per-source spectrum (7 bands). Drives bars independently of any other tile.
+    func setLiveBands(_ bands: [CGFloat]) {
+        guard bands.count == Self.barCount else { return }
+        liveBands = bands.map { min(max($0, 0), 1) }
+        liveArmed = true
     }
 
     func setPlaying(_ isPlaying: Bool) {
@@ -180,10 +150,12 @@ final class SimulatedWaveform: ObservableObject {
     }
 
     private func step() {
+        let armed = usesLiveCapture && liveArmed
         levels = engine.tick(
             dt: frameInterval,
             playing: playing,
-            liveAmplitude: (usesLiveCapture && liveArmed) ? liveAmplitude : nil
+            liveAmplitude: armed && liveBands == nil ? liveAmplitude : nil,
+            liveBands: armed ? liveBands : nil
         )
         if !playing, levels.allSatisfy({ abs($0 - SimulatedWaveformEngine.idleLevel) < 0.03 }) {
             stopTimer()
@@ -191,19 +163,25 @@ final class SimulatedWaveform: ObservableObject {
     }
 }
 
-/// Maps a single drive value onto the existing 7 bars (same source as the art shadow).
+/// Maps live audio onto the existing 7 bars.
 struct LiveWaveformMapper {
     static let barCount = SimulatedWaveformEngine.barCount
-    /// Symmetric: index 0 == 6, 1 == 5, 2 == 4.
+    /// Symmetric weights used by the scalar (legacy) amplitude path.
     static let weights: [CGFloat] = [0.58, 0.84, 1.0, 0.70, 1.0, 0.84, 0.58]
 
     var levels: [CGFloat]
     private var previous: CGFloat = 0
     private var slow: CGFloat = 0
     private var spike: CGFloat = 0
+    private var time: TimeInterval = 0
+    private var rng: SplitMix64
+    private var candles: IndependentCandles
 
-    init() {
+    init(seed: UInt64 = 0xA11FE) {
         levels = Array(repeating: SimulatedWaveformEngine.idleLevel, count: Self.barCount)
+        let s = seed == 0 ? 1 : seed
+        rng = SplitMix64(state: s)
+        candles = IndependentCandles(seed: s &+ 0xC0FF)
     }
 
     mutating func tick(dt: TimeInterval, amplitude: CGFloat) -> [CGFloat] {
@@ -228,10 +206,132 @@ struct LiveWaveformMapper {
         SimulatedWaveformEngine.mirror(&levels)
         return levels
     }
+
+    /// YouTube-style candles: mix loudness sets how high peaks can go; each bar
+    /// expands/collapses on its own clock. Not a left=bass spectrogram.
+    mutating func tick(dt: TimeInterval, bands: [CGFloat]) -> [CGFloat] {
+        var input = bands
+        if input.count < Self.barCount {
+            input.append(contentsOf: Array(repeating: 0, count: Self.barCount - input.count))
+        } else if input.count > Self.barCount {
+            input = Array(input.prefix(Self.barCount))
+        }
+
+        let step = max(dt, 1.0 / 120.0)
+        time += step
+
+        var sum: CGFloat = 0
+        var peak: CGFloat = 0
+        for v in input {
+            let x = min(1, max(0, v))
+            sum += x
+            peak = max(peak, x)
+        }
+        let mean = sum / CGFloat(Self.barCount)
+        // Overall drive from the mix — not which frequency sits on the left.
+        let raw = min(1, max(0, mean * 0.40 + peak * 0.60))
+        // Lift mid loudness so expansions still reach the old near-full height.
+        let drive = min(1, CGFloat(pow(Double(raw), 0.55)) * 1.08)
+
+        levels = candles.tick(dt: step, time: time, drive: drive, levels: levels, rng: &rng)
+        return levels
+    }
+}
+
+/// Per-candle expand/collapse. Shared by simulated and live-band paths.
+private struct IndependentCandles {
+    private var pulse: [CGFloat]
+    private var nextPulseAt: [TimeInterval]
+    private var pulseDecay: [Double]
+    private var phase: [Double]
+    private var speed: [Double]
+    private var attack: [CGFloat]
+    private var release: [CGFloat]
+
+    init(seed: UInt64) {
+        let n = SimulatedWaveformEngine.barCount
+        pulse = Array(repeating: 0, count: n)
+        nextPulseAt = Array(repeating: 0.05, count: n)
+        pulseDecay = Array(repeating: 3.2, count: n)
+        phase = Array(repeating: 0, count: n)
+        speed = Array(repeating: 1, count: n)
+        attack = Array(repeating: 16, count: n)
+        release = Array(repeating: 5, count: n)
+        var rng = SplitMix64(state: seed == 0 ? 1 : seed)
+        for i in 0..<n {
+            phase[i] = rng.next(in: 0...(2 * Double.pi))
+            speed[i] = rng.next(in: 0.55...1.65)
+            pulseDecay[i] = rng.next(in: 2.6...4.8)
+            attack[i] = CGFloat(rng.next(in: 14...20))
+            release[i] = CGFloat(rng.next(in: 5.0...9.0))
+            nextPulseAt[i] = rng.next(in: 0.02...0.45)
+        }
+    }
+
+    mutating func clearPulses() {
+        for i in 0..<pulse.count { pulse[i] = 0 }
+    }
+
+    mutating func kickstart(at time: TimeInterval, rng: inout SplitMix64) {
+        for i in 0..<pulse.count {
+            pulse[i] = CGFloat(rng.next(in: 0.70...1.0))
+            nextPulseAt[i] = time + rng.next(in: 0.02...0.40)
+        }
+    }
+
+    mutating func tick(
+        dt: TimeInterval,
+        time: TimeInterval,
+        drive: CGFloat,
+        levels: [CGFloat],
+        rng: inout SplitMix64
+    ) -> [CGFloat] {
+        var out = levels
+        let n = SimulatedWaveformEngine.barCount
+        let drive = min(1, max(0, drive))
+
+        for i in 0..<n {
+            if time >= nextPulseAt[i] {
+                firePulse(at: i, time: time, rng: &rng)
+            }
+            pulse[i] *= CGFloat(exp(-dt * pulseDecay[i]))
+
+            let t = time * speed[i]
+            let p = phase[i]
+            let wander =
+                0.40 * (0.5 + 0.5 * sin(t * 1.73 + p))
+                + 0.35 * (0.5 + 0.5 * sin(t * 2.91 + p * 1.35))
+                + 0.25 * (0.5 + 0.5 * sin(t * 4.67 + p * 0.7))
+            let w = CGFloat(wander)
+
+            // Low rest between hits; expansions still punch near full height.
+            var target = 0.05 + drive * (0.04 + 0.12 * w)
+            target += pulse[i] * drive * (0.94 + 0.06 * w)
+            target = min(1, max(0.04, target))
+
+            let rate = target > out[i] ? attack[i] : release[i]
+            out[i] += (target - out[i]) * min(1, CGFloat(dt) * rate)
+        }
+        return out
+    }
+
+    private mutating func firePulse(at i: Int, time: TimeInterval, rng: inout SplitMix64) {
+        let amp = CGFloat(rng.next(in: 0.90...1.0))
+        pulse[i] = amp
+        // Longer gaps so a bar can fully collapse before its next expand.
+        nextPulseAt[i] = time + rng.next(in: 0.20...0.90)
+        // Occasional soft couple so pairs sometimes rise together, not always.
+        if rng.next(in: 0...1) < 0.16 {
+            let j = i + (rng.next(in: 0...1) < 0.5 ? -1 : 1)
+            if j >= 0, j < pulse.count {
+                pulse[j] = max(pulse[j], amp * CGFloat(rng.next(in: 0.45...0.85)))
+            }
+        }
+    }
 }
 
 enum WaveformLayout {
-    /// 7 stored bars, mirrored. A 6-bar row skips the center so the outer pair still matches.
+    /// Maps display index into stored levels. A 6-bar row skips the center slot.
     static func level(at displayIndex: Int, displayCount: Int, stored: [CGFloat]) -> CGFloat {
         guard !stored.isEmpty else { return SimulatedWaveformEngine.idleLevel }
         if displayCount == 6, stored.count == 7 {

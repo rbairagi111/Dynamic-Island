@@ -446,6 +446,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Dynamic Island/Info.plist";
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Dynamic Island needs to control Google Chrome to detect when a Claude reply is ready and to skip YouTube tracks.";
+				INFOPLIST_KEY_NSAudioCaptureUsageDescription = "Dynamic Island listens to system audio so the Now Playing waveform can follow beats and loudness.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -495,6 +496,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "Dynamic Island/Info.plist";
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "Dynamic Island needs to control Google Chrome to detect when a Claude reply is ready and to skip YouTube tracks.";
+				INFOPLIST_KEY_NSAudioCaptureUsageDescription = "Dynamic Island listens to system audio so the Now Playing waveform can follow beats and loudness.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
